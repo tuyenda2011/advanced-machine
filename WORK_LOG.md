@@ -89,6 +89,11 @@
     - `src/training/trainer.py`: Thêm thanh tiến trình cấp epoch (`Training MODEL_NAME`) và cấp mini-batch (`Epoch XX/YY`) hiển thị trực tiếp các giá trị loss (Total Loss, BPR Loss, CL Loss) và metrics validation (Val NDCG@10, Val Recall@10) theo thời gian thực.
     - `src/evaluation/evaluator.py`: Thêm tham số `show_progress=True` và thanh tiến trình `Top-K Inference` khi đánh giá tập test.
     - `scripts/benchmark_all.py`: Thêm thanh tiến trình tổng thể `Benchmark Suite Progress` hiển thị tiến độ chạy ma trận 36 thực nghiệm.
+  - **Tiện ích Xuất Dữ liệu Đa định dạng (`scripts/export_data.py`) [NEW FEATURE]**:
+    - Xây dựng CLI script hỗ trợ chuyển đổi dữ liệu từ `.parquet` sang các định dạng: **`.csv`** (mở trên Excel), **`.xlsx`** (Excel workbook đa sheet), **`.sqlite`** (cơ sở dữ liệu quan hệ), và **`.inter` / `.txt`** (chuẩn RecBole/RecSys).
+    - Hỗ trợ cờ `--with_meta` để tự động ghép (enrich) tên sản phẩm (`product_title`), thương hiệu (`brand`) và ngành hàng (`category`) trực tiếp vào file xuất.
+
+
 
 
 
