@@ -1,0 +1,6 @@
+model_name: "simgcl"
+
+simgcl:
+  contrastive_weight: 0.1
+  temperature: 0.2
+  epsilon: 0.1 # uniform noise scale parameter

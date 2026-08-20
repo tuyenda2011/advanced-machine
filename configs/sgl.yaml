@@ -1,0 +1,7 @@
+model_name: "sgl"
+
+sgl:
+  ssl_weight: 0.1
+  temperature: 0.2
+  drop_ratio: 0.1
+  augmentation_type: "edge_drop" # options: edge_drop
