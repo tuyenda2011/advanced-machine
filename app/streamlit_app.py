@@ -83,9 +83,22 @@ def load_trained_model(
         )
 
     sparsity_tag = f"s{int(sparsity * 100)}"
-    checkpoint_path = os.path.join(
-        "artifacts", "checkpoints", f"{model_name}_{sparsity_tag}_seed{seed}.pt"
+    best_checkpoint_path = os.path.join("results", "checkpoints", f"{model_name}_best.pt")
+    specific_checkpoint_path = os.path.join(
+        "results", "checkpoints", f"{model_name}_{sparsity_tag}_seed{seed}.pt"
     )
+
+    checkpoint_path = (
+        best_checkpoint_path
+        if os.path.exists(best_checkpoint_path)
+        else specific_checkpoint_path
+    )
+
+    if not os.path.exists(checkpoint_path):
+        # Fallback to artifacts/checkpoints if exists
+        fallback_path = os.path.join("artifacts", "checkpoints", f"{model_name}_{sparsity_tag}_seed{seed}.pt")
+        if os.path.exists(fallback_path):
+            checkpoint_path = fallback_path
 
     if os.path.exists(checkpoint_path):
         ckpt = torch.load(checkpoint_path, map_location=device)
@@ -145,11 +158,16 @@ def main() -> None:
         col_select, col_info = st.columns([1, 2])
 
         with col_select:
-            selected_user_id = st.number_input(
-                "Select User ID:", min_value=1, max_value=max(user2id.keys()), value=42, step=1
+            id2user = {v: k for k, v in user2id.items()}
+            u_idx = st.number_input(
+                "Select User Index (0 to 135,995):",
+                min_value=0,
+                max_value=max(0, num_users - 1),
+                value=min(42, num_users - 1),
+                step=1,
             )
-            u_idx = user2id.get(selected_user_id, 0)
-            st.info(f"Mapped Internal User Index: `{u_idx}`")
+            reviewer_id = id2user.get(u_idx, f"User_{u_idx}")
+            st.info(f"👤 **Reviewer ID**: `{reviewer_id}` (Index: `{u_idx}`)")
 
         with col_info:
             user_history = train_df[train_df["u_idx"] == u_idx]

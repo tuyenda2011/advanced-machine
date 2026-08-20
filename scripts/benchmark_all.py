@@ -218,6 +218,14 @@ def main():
     agg_df.to_csv(agg_csv, index=False)
     logger.info(f"Saved aggregated benchmark summary to {agg_csv}")
 
+    # Save per-model summary files
+    for m_name in models:
+        m_df = agg_df[agg_df["model"] == m_name]
+        if not m_df.empty:
+            m_csv = os.path.join(agg_dir, f"{m_name}_summary.csv")
+            m_df.to_csv(m_csv, index=False)
+            logger.info(f"Saved dedicated summary for {m_name.upper()} to {m_csv}")
+
     # Statistical Significance Testing (SimGCL vs LightGCN, SGL vs LightGCN)
     sig_results = []
     for sp in sorted(df["sparsity"].unique(), reverse=True):
@@ -297,6 +305,14 @@ def main():
         drop_csv = os.path.join(agg_dir, "sparsity_drop25_summary.csv")
         drop_df.to_csv(drop_csv, index=False)
         logger.info(f"Saved sparsity performance drop table to {drop_csv}")
+
+    # Automatically generate all publication figures
+    try:
+        from scripts.generate_plots import main as generate_all_figures
+        logger.info("Automatically generating research publication figures...")
+        generate_all_figures()
+    except Exception as e:
+        logger.warning(f"Could not automatically generate figures: {e}")
 
     logger.info("Comprehensive benchmark suite completed successfully!")
 

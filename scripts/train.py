@@ -1,4 +1,5 @@
 import argparse
+from datetime import datetime
 import json
 import os
 import sys
@@ -24,12 +25,75 @@ from src.utils.seed import set_seed
 logger = setup_logger("train_script")
 
 
+def append_to_model_results_csv(results: dict, model_name: str, sparsity: float, seed: int):
+    """Save or append run results to dedicated per-model CSV file (results/aggregated/{model}_results.csv)."""
+    agg_dir = os.path.join("results", "aggregated")
+    os.makedirs(agg_dir, exist_ok=True)
+    model_csv = os.path.join(agg_dir, f"{model_name}_results.csv")
+
+    test_m = results.get("test_metrics", {})
+    val_m = results.get("val_metrics", {})
+    rep_m = results.get("representation_metrics", {})
+    svd_m = results.get("svd_metrics", {})
+    sub_m = results.get("subgroup_metrics", {})
+    tail_m = sub_m.get("Tail (Cold-Start)", {})
+    head_m = sub_m.get("Head (Active)", {})
+
+    row = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "model": model_name,
+        "sparsity": sparsity,
+        "seed": seed,
+        "best_epoch": results.get("best_epoch", 0),
+        "total_epochs": results.get("total_epochs", 0),
+        "train_time_sec": round(results.get("total_train_time", 0.0), 2),
+        "inference_latency_ms": round(results.get("inference_latency_ms_per_user", 0.0), 3),
+        # Accuracy Metrics
+        "Recall@10": round(test_m.get("Recall@10", 0.0), 4),
+        "NDCG@10": round(test_m.get("NDCG@10", 0.0), 4),
+        "MRR@10": round(test_m.get("MRR@10", 0.0), 4),
+        "Recall@20": round(test_m.get("Recall@20", 0.0), 4),
+        "NDCG@20": round(test_m.get("NDCG@20", 0.0), 4),
+        # Beyond-Accuracy Metrics
+        "Diversity@10": round(test_m.get("Diversity@10", 0.0), 4),
+        "Novelty@10": round(test_m.get("Novelty@10", 0.0), 4),
+        "Coverage@10": round(test_m.get("Coverage@10", 0.0), 4),
+        "Gini@10": round(test_m.get("Gini@10", 0.0), 4),
+        # Representation Geometry
+        "Alignment": round(rep_m.get("alignment", 0.0), 4),
+        "Mean_Uniformity": round(rep_m.get("mean_uniformity", 0.0), 4),
+        "User_Effective_Rank": round(svd_m.get("user_effective_rank", 0.0), 2),
+        "Item_Effective_Rank": round(svd_m.get("item_effective_rank", 0.0), 2),
+        # Subgroup
+        "Tail_Recall@10": round(tail_m.get("Recall@10", 0.0), 4),
+        "Tail_NDCG@10": round(tail_m.get("NDCG@10", 0.0), 4),
+        "Head_Recall@10": round(head_m.get("Recall@10", 0.0), 4),
+        "Head_NDCG@10": round(head_m.get("NDCG@10", 0.0), 4),
+        "Val_NDCG@10": round(val_m.get("NDCG@10", 0.0), 4),
+    }
+
+    new_df = pd.DataFrame([row])
+    if os.path.exists(model_csv):
+        existing_df = pd.read_csv(model_csv)
+        # Update row if exact same model, sparsity, seed exists, else append
+        mask = (existing_df["sparsity"] == sparsity) & (existing_df["seed"] == seed)
+        if mask.any():
+            existing_df = existing_df[~mask]
+        combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+    else:
+        combined_df = new_df
+
+    combined_df.to_csv(model_csv, index=False)
+    logger.info(f"Updated dedicated model results file: {model_csv}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train Graph Recommendation Models (LightGCN, SGL, SimGCL)")
     parser.add_argument("--model", type=str, required=True, choices=["lightgcn", "sgl", "simgcl"], help="Model name")
     parser.add_argument("--sparsity", type=float, default=1.0, help="Sparsity ratio for training edges (0.25 to 1.0)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--epochs", type=int, default=None, help="Override number of training epochs")
+    parser.add_argument("--resume", action="store_true", help="Resume training from latest saved checkpoint")
     parser.add_argument("--config_dir", type=str, default="configs", help="Config directory")
     args = parser.parse_args()
 
@@ -105,12 +169,12 @@ def main():
 
     # 8. Train model
     sparsity_tag = f"s{int(args.sparsity * 100)}"
-    checkpoint_dir = os.path.join("artifacts", "checkpoints")
+    checkpoint_dir = os.path.join("results", "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_path = os.path.join(checkpoint_dir, f"{args.model}_{sparsity_tag}_seed{args.seed}.pt")
 
     trainer = Trainer(model, train_df_sparse, val_evaluator, test_evaluator, config, device)
-    results = trainer.train(checkpoint_path)
+    results = trainer.train(checkpoint_path, resume=args.resume)
 
     # 9. Save run results to JSON
     results["sparsity_level"] = args.sparsity
@@ -124,6 +188,42 @@ def main():
         json.dump(results, f, indent=2)
 
     logger.info(f"Saved run results to {run_file}")
+
+    # 10. Save / append to dedicated per-model CSV file (results/aggregated/{model}_results.csv)
+    append_to_model_results_csv(results, args.model, args.sparsity, args.seed)
+
+    # 11. Update Global Best Model if this run achieved the highest test NDCG@10
+    global_best_meta_path = os.path.join(checkpoint_dir, f"{args.model}_best_meta.json")
+    global_best_pt_path = os.path.join(checkpoint_dir, f"{args.model}_best.pt")
+    
+    current_test_ndcg = results.get("test_metrics", {}).get("NDCG@10", 0.0)
+    is_new_global_best = True
+
+    if os.path.exists(global_best_meta_path):
+        try:
+            with open(global_best_meta_path, "r", encoding="utf-8") as f:
+                prev_best = json.load(f)
+            if prev_best.get("NDCG@10", 0.0) >= current_test_ndcg:
+                is_new_global_best = False
+        except Exception:
+            is_new_global_best = True
+
+    if is_new_global_best and os.path.exists(checkpoint_path):
+        import shutil
+        shutil.copyfile(checkpoint_path, global_best_pt_path)
+        with open(global_best_meta_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "model": args.model,
+                "sparsity": args.sparsity,
+                "seed": args.seed,
+                "best_epoch": results.get("best_epoch", 0),
+                "NDCG@10": current_test_ndcg,
+                "Recall@10": results.get("test_metrics", {}).get("Recall@10", 0.0),
+                "Diversity@10": results.get("test_metrics", {}).get("Diversity@10", 0.0),
+                "Novelty@10": results.get("test_metrics", {}).get("Novelty@10", 0.0),
+                "source_checkpoint": checkpoint_path,
+            }, f, indent=2)
+        logger.info(f"🏆 Updated GLOBAL BEST MODEL for {args.model.upper()} -> {global_best_pt_path} (Test NDCG@10: {current_test_ndcg:.4f})")
 
 
 if __name__ == "__main__":

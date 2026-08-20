@@ -1,8 +1,55 @@
 import logging
 import os
+from typing import Any, Dict, Optional, Tuple
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+def save_checkpoint(
+    checkpoint_path: str,
+    model: torch.nn.Module,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    epoch: int = 0,
+    best_score: float = 0.0,
+    val_metrics: Optional[Dict[str, float]] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Save full training checkpoint with model weights, optimizer state, metrics, and config."""
+    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+    state = {
+        "epoch": epoch,
+        "best_score": best_score,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
+        "val_metrics": val_metrics or {},
+        "config": config or {},
+    }
+    torch.save(state, checkpoint_path)
+    logger.info(f"Saved complete model checkpoint to {checkpoint_path}")
+
+
+def load_checkpoint(
+    checkpoint_path: str,
+    model: torch.nn.Module,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    device: torch.device = torch.device("cpu"),
+) -> Tuple[int, float, Dict[str, Any]]:
+    """Load model weights and optimizer state from checkpoint."""
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+
+    if optimizer is not None and checkpoint.get("optimizer_state_dict") is not None:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+    epoch = checkpoint.get("epoch", 0)
+    best_score = checkpoint.get("best_score", 0.0)
+    logger.info(f"Loaded checkpoint from {checkpoint_path} (epoch {epoch}, best score: {best_score:.4f})")
+
+    return epoch, best_score, checkpoint
 
 
 class EarlyStopping:
@@ -18,7 +65,14 @@ class EarlyStopping:
         self.early_stop = False
 
     def __call__(
-        self, score: float, epoch: int, model: torch.nn.Module, checkpoint_path: str
+        self,
+        score: float,
+        epoch: int,
+        model: torch.nn.Module,
+        checkpoint_path: str,
+        optimizer: Optional[torch.optim.Optimizer] = None,
+        val_metrics: Optional[Dict[str, float]] = None,
+        config: Optional[Dict[str, Any]] = None,
     ) -> bool:
         improved = (
             score > self.best_score if self.mode == "max" else score < self.best_score
@@ -29,18 +83,18 @@ class EarlyStopping:
             self.best_epoch = epoch
             self.counter = 0
 
-            # Save checkpoint
-            os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "best_score": score,
-                },
+            # Save best checkpoint
+            save_checkpoint(
                 checkpoint_path,
+                model=model,
+                optimizer=optimizer,
+                epoch=epoch,
+                best_score=score,
+                val_metrics=val_metrics,
+                config=config,
             )
             logger.info(
-                f"Epoch {epoch}: Validation {self.monitor} improved to {score:.4f}. Saved checkpoint to {checkpoint_path}"
+                f"Epoch {epoch}: Validation {self.monitor} improved to {score:.4f}."
             )
         else:
             self.counter += 1

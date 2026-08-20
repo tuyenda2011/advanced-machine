@@ -95,21 +95,61 @@ def plot_radar_chart(df100: pd.DataFrame, fig_dir: str):
 
 
 def main():
-    agg_csv = os.path.join("results", "aggregated", "benchmark_summary.csv")
-    if not os.path.exists(agg_csv):
-        logger.error(f"Aggregated benchmark file {agg_csv} not found. Run benchmark_all.py first.")
-        return
-
-    df = pd.read_csv(agg_csv)
     fig_dir = os.path.join("results", "figures")
     os.makedirs(fig_dir, exist_ok=True)
 
     colors = {"lightgcn": "#1f77b4", "sgl": "#ff7f0e", "simgcl": "#2ca02c"}
     labels = {"lightgcn": "LightGCN", "sgl": "SGL", "simgcl": "SimGCL"}
 
-    # 1. Bar Plot: Accuracy & Beyond-Accuracy at 100% data
+    # 1. Always generate Training Learning Curves if history records exist
+    history_dir = os.path.join("results", "history")
+    if os.path.exists(history_dir):
+        history_files = [f for f in os.listdir(history_dir) if f.endswith("_history.csv")]
+        if history_files:
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+            for h_file in history_files:
+                h_path = os.path.join(history_dir, h_file)
+                h_df = pd.read_csv(h_path)
+                if h_df.empty:
+                    continue
+
+                m_name = h_file.split("_")[0]
+                lbl = labels.get(m_name, m_name.upper()) + f" ({h_file.replace('_history.csv', '')})"
+                c = colors.get(m_name, "#333333")
+
+                ax1.plot(h_df["epoch"], h_df["train_loss"], label=lbl, color=c, linewidth=2.0)
+                ax2.plot(h_df["epoch"], h_df["val_ndcg_10"], label=lbl, color=c, linewidth=2.0)
+
+            ax1.set_title("Training Loss Convergence Curve", fontsize=12, fontweight="bold", pad=10)
+            ax1.set_xlabel("Epoch", fontsize=11)
+            ax1.set_ylabel("Total Loss", fontsize=11)
+            ax1.legend(frameon=True)
+            ax1.grid(True, linestyle="--", alpha=0.6)
+
+            ax2.set_title("Validation NDCG@10 Progression", fontsize=12, fontweight="bold", pad=10)
+            ax2.set_xlabel("Epoch", fontsize=11)
+            ax2.set_ylabel("Validation NDCG@10", fontsize=11)
+            ax2.legend(frameon=True)
+            ax2.grid(True, linestyle="--", alpha=0.6)
+
+            plt.tight_layout()
+            filename = "training_learning_curves.png"
+            fig.savefig(os.path.join(fig_dir, filename), dpi=300)
+            plt.close(fig)
+            logger.info(f"Saved figure: {filename}")
+
+    # 2. Benchmark Summary Figures (if benchmark summary exists)
+    agg_csv = os.path.join("results", "aggregated", "benchmark_summary.csv")
+    if not os.path.exists(agg_csv):
+        logger.info(f"Full benchmark summary {agg_csv} not found yet (will be generated when running benchmark_all.py).")
+        return
+
+    df = pd.read_csv(agg_csv)
+
+    # 3. Bar Plot: Accuracy & Beyond-Accuracy at 100% data
     df100 = df[df["sparsity"] == 1.0].copy()
     if not df100.empty:
+
         plot_metrics = ["Recall@10", "NDCG@10", "MRR@10", "Diversity@10", "Novelty@10", "Coverage@10"]
         for metric in plot_metrics:
             if f"{metric}_mean" not in df100.columns:
@@ -263,3 +303,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

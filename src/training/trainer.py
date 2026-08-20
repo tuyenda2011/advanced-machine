@@ -20,7 +20,7 @@ from src.losses.contrastive import InfoNCELoss
 from src.models.base import BaseRecommender
 from src.models.sgl import SGL
 from src.models.simgcl import SimGCL
-from src.training.early_stopping import EarlyStopping
+from src.training.early_stopping import EarlyStopping, load_checkpoint, save_checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ def sample_negative_items(
 
 
 class Trainer:
-    """Generic PyTorch trainer for LightGCN, SGL, and SimGCL recommendation models with visual progress bars."""
+    """Generic PyTorch trainer for LightGCN, SGL, and SimGCL recommendation models with visual progress bars and robust checkpointing."""
 
     def __init__(
         self,
@@ -99,11 +99,23 @@ class Trainer:
             mode="max",
         )
 
-    def train(self, checkpoint_path: str) -> Dict[str, Any]:
+    def train(self, checkpoint_path: str, resume: bool = False) -> Dict[str, Any]:
         """Execute full model training loop with tqdm visual progress bars, early stopping, and scientific metrics."""
         logger.info(
             f"Starting training for {self.model_name.upper()} on device {self.device}..."
         )
+
+        latest_checkpoint_path = checkpoint_path.replace(".pt", "_latest.pt")
+        start_epoch = 1
+
+        if resume and os.path.exists(latest_checkpoint_path):
+            loaded_epoch, best_sc, ckpt = load_checkpoint(
+                latest_checkpoint_path, self.model, self.optimizer, device=self.device
+            )
+            start_epoch = loaded_epoch + 1
+            self.early_stopping.best_score = best_sc
+            self.early_stopping.best_epoch = loaded_epoch
+            logger.info(f"Resuming training from epoch {start_epoch}/{self.epochs}")
 
         user_array = self.train_df["u_idx"].values
         pos_item_array = self.train_df["i_idx"].values
@@ -113,16 +125,18 @@ class Trainer:
         epoch_times = []
 
         best_val_metrics = {}
-        best_epoch = 0
+        best_epoch = self.early_stopping.best_epoch
 
-        epoch_pbar = tqdm(
-            range(1, self.epochs + 1),
-            desc=f"Training {self.model_name.upper()}",
-            unit="epoch",
-            dynamic_ncols=True,
-        )
+        history_dir = os.path.join("results", "history")
+        os.makedirs(history_dir, exist_ok=True)
+        history_csv_name = os.path.basename(checkpoint_path).replace(".pt", "_history.csv")
+        history_csv_path = os.path.join(history_dir, history_csv_name)
 
-        for epoch in epoch_pbar:
+        history_records = []
+        if resume and os.path.exists(history_csv_path):
+            history_records = pd.read_csv(history_csv_path).to_dict(orient="records")
+
+        for epoch in range(start_epoch, self.epochs + 1):
             epoch_start = time.perf_counter()
             self.model.train()
 
@@ -153,10 +167,10 @@ class Trainer:
 
             batch_pbar = tqdm(
                 range(0, num_samples, self.batch_size),
-                desc=f"Epoch {epoch:02d}/{self.epochs:02d}",
-                leave=False,
+                desc=f"[{self.model_name.upper()}] Epoch {epoch:02d}/{self.epochs:02d}",
                 unit="batch",
                 dynamic_ncols=True,
+                leave=False,
             )
 
             for i in batch_pbar:
@@ -219,8 +233,8 @@ class Trainer:
                 num_batches += 1
 
                 batch_pbar.set_postfix({
-                    "loss": f"{total_loss.item():.4f}",
-                    "bpr": f"{bpr_loss.item():.4f}",
+                    "Loss": f"{total_loss.item():.4f}",
+                    "BPR": f"{bpr_loss.item():.4f}",
                 })
 
             batch_pbar.close()
@@ -240,22 +254,57 @@ class Trainer:
                 )
 
             val_ndcg10 = val_metrics["NDCG@10"]
-            epoch_pbar.set_postfix({
-                "Loss": f"{total_loss_accum/max(1, num_batches):.4f}",
-                "Val NDCG@10": f"{val_ndcg10:.4f}",
-                "Val Rec@10": f"{val_metrics['Recall@10']:.4f}",
-            })
-
-            logger.info(
-                f"Epoch {epoch:03d}/{self.epochs:03d} [{epoch_time:.2f}s] - Total Loss: {total_loss_accum/num_batches:.4f} | BPR: {bpr_loss_accum/num_batches:.4f} | CL: {cl_loss_accum/num_batches:.4f} | Val Recall@10: {val_metrics['Recall@10']:.4f} | Val NDCG@10: {val_ndcg10:.4f}"
-            )
+            val_rec10 = val_metrics["Recall@10"]
+            avg_loss = total_loss_accum / max(1, num_batches)
 
             is_improved = self.early_stopping(
-                val_ndcg10, epoch, self.model, checkpoint_path
+                val_ndcg10,
+                epoch,
+                self.model,
+                checkpoint_path,
+                optimizer=self.optimizer,
+                val_metrics=val_metrics,
+                config=self.config,
             )
             if is_improved:
                 best_val_metrics = val_metrics
                 best_epoch = epoch
+
+            best_tag = " 🌟 [BEST]" if is_improved else ""
+            tqdm.write(
+                f"Epoch {epoch:02d}/{self.epochs:02d} [{epoch_time:4.1f}s] | Loss: {avg_loss:.4f} | Val Recall@10: {val_rec10:.4f} | Val NDCG@10: {val_ndcg10:.4f}{best_tag}"
+            )
+
+            # Save latest checkpoint at end of each epoch for resuming
+            save_checkpoint(
+                latest_checkpoint_path,
+                model=self.model,
+                optimizer=self.optimizer,
+                epoch=epoch,
+                best_score=self.early_stopping.best_score,
+                val_metrics=val_metrics,
+                config=self.config,
+            )
+
+            # Record epoch training history
+            history_records.append({
+                "epoch": epoch,
+                "train_loss": round(total_loss_accum / max(1, num_batches), 4),
+                "bpr_loss": round(bpr_loss_accum / max(1, num_batches), 4),
+                "cl_loss": round(cl_loss_accum / max(1, num_batches), 4),
+                "val_ndcg_10": round(val_ndcg10, 4),
+                "val_recall_10": round(val_metrics.get("Recall@10", 0.0), 4),
+                "val_mrr_10": round(val_metrics.get("MRR@10", 0.0), 4),
+                "epoch_time_sec": round(epoch_time, 2),
+                "is_best": bool(is_improved),
+            })
+
+            # Save epoch history CSV
+            history_dir = os.path.join("results", "history")
+            os.makedirs(history_dir, exist_ok=True)
+            history_csv_name = os.path.basename(checkpoint_path).replace(".pt", "_history.csv")
+            history_csv_path = os.path.join(history_dir, history_csv_name)
+            pd.DataFrame(history_records).to_csv(history_csv_path, index=False)
 
             if self.early_stopping.early_stop:
                 logger.info(f"Stopping early at epoch {epoch}")
@@ -268,9 +317,8 @@ class Trainer:
 
         # Load best checkpoint for final evaluation
         if os.path.exists(checkpoint_path):
-            checkpoint = torch.load(checkpoint_path, map_location=self.device)
-            self.model.load_state_dict(checkpoint["model_state_dict"])
-            logger.info(f"Loaded best checkpoint from epoch {checkpoint['epoch']}")
+            load_checkpoint(checkpoint_path, self.model, device=self.device)
+            logger.info(f"Loaded best checkpoint for final evaluation: {checkpoint_path}")
 
         self.model.eval()
         with torch.no_grad():
