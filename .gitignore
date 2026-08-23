@@ -56,3 +56,7 @@ results/
 
 # Agents
 .agents/
+
+# Documentation
+docs/
+docs/*.md
