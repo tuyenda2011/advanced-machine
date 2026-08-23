@@ -9,6 +9,12 @@ import time
 # Ensure project root is in sys.path when script is executed directly
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+# Force UTF-8 encoding for Windows Command Prompt/PowerShell
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import pandas as pd
 from tabulate import tabulate
 
@@ -117,7 +123,10 @@ def main():
             continue
 
         # Load run result JSON
-        run_file = os.path.join(results_dir, f"{model_name}_{sparsity_tag}_seed{args.seed}.json")
+        run_file = os.path.join(results_dir, model_name, f"{model_name}_{sparsity_tag}_seed{args.seed}.json")
+        if not os.path.exists(run_file):
+            run_file = os.path.join(results_dir, f"{model_name}_{sparsity_tag}_seed{args.seed}.json")
+
         if os.path.exists(run_file):
             try:
                 with open(run_file, "r", encoding="utf-8") as f:

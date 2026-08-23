@@ -1,0 +1,8 @@
+model_name: "semantic_gcl"
+
+semantic_gcl:
+  text_dim: 384
+  ssl_temp: 0.2
+  ssl_reg: 0.1
+  hard_neg_alpha: 0.2
+  hard_neg_margin: 0.5

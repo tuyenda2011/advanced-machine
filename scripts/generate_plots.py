@@ -4,10 +4,17 @@ import sys
 # Ensure project root is in sys.path when script is executed directly
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+# Force UTF-8 encoding for Windows Command Prompt/PowerShell
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+
 
 from src.utils.logging import setup_logger
 
@@ -41,12 +48,24 @@ def plot_radar_chart(df100: pd.DataFrame, fig_dir: str):
 
     fig, ax = plt.subplots(figsize=(7, 7), subplot_kw=dict(polar=True))
 
-    colors = {"lightgcn": "#1f77b4", "sgl": "#ff7f0e", "simgcl": "#2ca02c"}
-    labels = {"lightgcn": "LightGCN", "sgl": "SGL", "simgcl": "SimGCL"}
+    colors = {
+        "lightgcn": "#1f77b4",
+        "sgl": "#ff7f0e",
+        "simgcl": "#2ca02c",
+        "xsimgcl": "#9467bd",
+        "directau": "#d62728",
+    }
+    labels = {
+        "lightgcn": "LightGCN",
+        "sgl": "SGL",
+        "simgcl": "SimGCL",
+        "xsimgcl": "XSimGCL",
+        "directau": "DirectAU",
+    }
 
     # Min-max normalization for radar balance
     raw_vals = {}
-    for model in ["lightgcn", "sgl", "simgcl"]:
+    for model in df100["model"].unique():
         m_df = df100[df100["model"] == model]
         if not m_df.empty:
             raw_vals[model] = [
@@ -76,7 +95,7 @@ def plot_radar_chart(df100: pd.DataFrame, fig_dir: str):
                 plot_vals,
                 color=colors.get(model, "#333333"),
                 linewidth=2.2,
-                label=labels.get(model, model),
+                label=labels.get(model, model.upper()),
             )
             ax.fill(angles, plot_vals, color=colors.get(model, "#333333"), alpha=0.15)
 
@@ -98,20 +117,38 @@ def main():
     fig_dir = os.path.join("results", "figures")
     os.makedirs(fig_dir, exist_ok=True)
 
-    colors = {"lightgcn": "#1f77b4", "sgl": "#ff7f0e", "simgcl": "#2ca02c"}
-    labels = {"lightgcn": "LightGCN", "sgl": "SGL", "simgcl": "SimGCL"}
+    colors = {
+        "lightgcn": "#1f77b4",
+        "sgl": "#ff7f0e",
+        "simgcl": "#2ca02c",
+        "xsimgcl": "#9467bd",
+        "directau": "#d62728",
+    }
+    labels = {
+        "lightgcn": "LightGCN",
+        "sgl": "SGL",
+        "simgcl": "SimGCL",
+        "xsimgcl": "XSimGCL",
+        "directau": "DirectAU",
+    }
 
     # 1. Always generate Training Learning Curves if history records exist
     history_dir = os.path.join("results", "history")
     if os.path.exists(history_dir):
-        history_files = [f for f in os.listdir(history_dir) if f.endswith("_history.csv")]
-        if history_files:
+        history_paths = []
+        for root, _, files in os.walk(history_dir):
+            for f in files:
+                if f.endswith("_history.csv"):
+                    history_paths.append(os.path.join(root, f))
+
+        if history_paths:
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-            for h_file in history_files:
-                h_path = os.path.join(history_dir, h_file)
+            for h_path in history_paths:
+                h_file = os.path.basename(h_path)
                 h_df = pd.read_csv(h_path)
                 if h_df.empty:
                     continue
+
 
                 m_name = h_file.split("_")[0]
                 lbl = labels.get(m_name, m_name.upper()) + f" ({h_file.replace('_history.csv', '')})"
@@ -194,7 +231,7 @@ def main():
     # 2. Alignment vs Uniformity Scatter Plot (Pareto Representation Space)
     if "Alignment_mean" in df.columns and "Mean_Uniformity_mean" in df.columns:
         fig, ax = plt.subplots(figsize=(8, 6))
-        for model in ["lightgcn", "sgl", "simgcl"]:
+        for model in df["model"].unique():
             m_df = df[(df["model"] == model) & (df["sparsity"] == 1.0)]
             if m_df.empty:
                 continue
@@ -207,12 +244,12 @@ def main():
                 align,
                 color=colors.get(model, "#333333"),
                 s=250,
-                label=labels.get(model, model),
+                label=labels.get(model, model.upper()),
                 edgecolor="black",
                 zorder=5,
             )
             ax.annotate(
-                f"{labels.get(model, model)}\n(Align: {align:.3f}, Unif: {unif:.3f})",
+                f"{labels.get(model, model.upper())}\n(Align: {align:.3f}, Unif: {unif:.3f})",
                 xy=(unif, align),
                 xytext=(10, 5),
                 textcoords="offset points",
@@ -238,20 +275,20 @@ def main():
 
         fig, ax = plt.subplots(figsize=(8, 5))
 
-        for model in ["lightgcn", "sgl", "simgcl"]:
+        for model in df["model"].unique():
             m_df = df[df["model"] == model].sort_values(by="sparsity")
             if m_df.empty:
                 continue
 
             x = (m_df["sparsity"] * 100).values
             y = m_df[f"{metric}_mean"].values
-            y_err = m_df[f"{metric}_std"].values if f"{metric}_std" in m_df.columns else np.zeros_like(y)
+            y_err = m_df[f"{metric}_std"].values if f"{metric}_std" in df.columns else np.zeros_like(y)
 
             ax.errorbar(
                 x,
                 y,
                 yerr=y_err,
-                label=labels.get(model, model),
+                label=labels.get(model, model.upper()),
                 color=colors.get(model, "#333333"),
                 marker="o",
                 linewidth=2.5,
@@ -276,21 +313,21 @@ def main():
         fig, ax = plt.subplots(figsize=(8, 5))
         df100 = df[df["sparsity"] == 1.0]
 
-        models = ["lightgcn", "sgl", "simgcl"]
+        models = [m for m in df100["model"].unique()]
         tail_means = [df100[df100["model"] == m]["Tail_Recall@10_mean"].values[0] if not df100[df100["model"] == m].empty else 0.0 for m in models]
         head_means = [df100[df100["model"] == m]["Head_Recall@10_mean"].values[0] if not df100[df100["model"] == m].empty else 0.0 for m in models]
 
         x = np.arange(len(models))
         width = 0.35
 
-        ax.bar(x - width/2, tail_means, width, label="Tail (Cold-Start Users)", color="#d62728", alpha=0.85)
-        ax.bar(x + width/2, head_means, width, label="Head (Active Users)", color="#1f77b4", alpha=0.85)
+        ax.bar(x - width / 2, tail_means, width, label="Tail Users (≤ 5 interactions)", color="#d62728", alpha=0.85)
+        ax.bar(x + width / 2, head_means, width, label="Head Users (> 5 interactions)", color="#2ca02c", alpha=0.85)
 
-        ax.set_xticks(x)
-        ax.set_xticklabels([labels[m] for m in models], fontweight="bold")
+        ax.set_title("Subgroup Performance: Cold-Start Tail vs Active Head Users (Recall@10)", fontsize=12, fontweight="bold", pad=12)
         ax.set_ylabel("Recall@10", fontsize=11)
-        ax.set_title("Performance Stratified by User Degree (Tail vs Head)", fontsize=12, fontweight="bold", pad=12)
-        ax.legend()
+        ax.set_xticks(x)
+        ax.set_xticklabels([labels.get(m, m.upper()) for m in models], fontweight="bold")
+        ax.legend(frameon=True, facecolor="white", framealpha=0.9)
         plt.tight_layout()
 
         filename = "subgroup_tail_vs_head.png"
@@ -303,4 +340,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

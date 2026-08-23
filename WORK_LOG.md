@@ -134,6 +134,14 @@
   - **Dọn Sạch Toàn Bộ Kết Quả & Checkpoint Cũ [MAINTENANCE]**:
     - Xóa sạch toàn bộ các tệp tin chạy thử nghiệm cũ trong `results/checkpoints/`, `results/history/`, `results/aggregated/`, `results/raw/`, `results/figures/` và `artifacts/checkpoints/`.
     - Chuẩn bị sẵn sàng cấu trúc thư mục sạch 100% cho đợt huấn luyện chính thức (Official 50 Epochs Run).
+  - **Tổ Chức Thư Mục Con Riêng Biệt Cho Từng Mô Hình [ARCHITECTURE & REFACTOR]**:
+    - Phân bổ riêng biệt theo thư mục con cho từng mô hình (`lightgcn/`, `sgl/`, `simgcl/`) bên trong các thư mục đầu ra:
+      - `results/checkpoints/{model}/`: Lưu checkpoints `.pt` và `{model}_best.pt` của riêng mô hình đó.
+      - `results/history/{model}/`: Lưu file tiến trình `_history.csv` từng epoch của riêng mô hình đó.
+      - `results/raw/{model}/`: Lưu file JSON chi tiết từng lần chạy của riêng mô hình đó.
+      - `results/aggregated/`: Chứa các bảng CSV tổng kết và bảng LaTeX so sánh đa mô hình.
+      - `results/figures/`: Chứa các ảnh biểu đồ nghiên cứu và learning curves.
+    - Cập nhật toàn bộ các script (`train.py`, `trainer.py`, `train_all_models.py`, `benchmark_all.py`, `generate_plots.py`, `streamlit_app.py`) tương thích 100% với cấu trúc thư mục con mới.
 
 
 

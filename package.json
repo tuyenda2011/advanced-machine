@@ -1,0 +1,24 @@
+{
+  "name": "advanced-machine",
+  "version": "1.0.0",
+  "description": "[![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11-blue.svg)](https://www.python.org/) [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-orange.svg)](https://pytorch.org/) [![Streamlit](https://img.shields.io/badge/Streamlit-1.25%2B-FF4B4B.svg)](https://streamlit.io/) [![Tests](https://img.shields.io/badge/pytest-19%2F19%20Passing-brightgreen.svg)](https://docs.pytest.org/) [![License](https://img.shields.io/badge/License-Academic%20Research-green.svg)]()",
+  "main": "index.js",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tuyenda2011/advanced-machine.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/tuyenda2011/advanced-machine/issues"
+  },
+  "homepage": "https://github.com/tuyenda2011/advanced-machine#readme"
+}

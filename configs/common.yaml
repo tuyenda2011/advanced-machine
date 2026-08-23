@@ -6,6 +6,7 @@ dataset:
   processed_dir: "data/processed"
   positive_rating_threshold: 4.0
   min_user_interactions: 5
+  min_item_interactions: 5
   split_ratios: [0.8, 0.1, 0.1] # train, val, test chronological per-user
 
 model:

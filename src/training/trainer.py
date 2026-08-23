@@ -1,12 +1,21 @@
 import logging
 import os
+import sys
 import time
 from typing import Any, Dict, Set, Tuple
+
+# Force UTF-8 encoding for Windows Command Prompt/PowerShell
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import numpy as np
 import pandas as pd
 import torch
 import torch.optim as optim
 from tqdm import tqdm
+
 
 from src.data.graph import create_edge_dropout_views, get_norm_adj_tensor
 from src.evaluation.evaluator import Evaluator
@@ -17,12 +26,19 @@ from src.evaluation.representation import (
 from src.evaluation.subgroup import evaluate_degree_subgroups
 from src.losses.bpr import BPRLoss
 from src.losses.contrastive import InfoNCELoss
+from src.losses.directau import DirectAULoss
+from src.losses.hard_bpr import HardNegativeBPRLoss
 from src.models.base import BaseRecommender
+from src.models.directau import DirectAU
+from src.models.lightgcn import LightGCN
+from src.models.semantic_gcl import SemanticGCL
 from src.models.sgl import SGL
 from src.models.simgcl import SimGCL
+from src.models.xsimgcl import XSimGCL
 from src.training.early_stopping import EarlyStopping, load_checkpoint, save_checkpoint
 
 logger = logging.getLogger(__name__)
+
 
 
 def sample_negative_items(
@@ -30,17 +46,19 @@ def sample_negative_items(
     num_items: int,
     train_history: Dict[int, Set[int]],
 ) -> np.ndarray:
-    """Uniform random negative sampling for an array of user indices."""
+    """Fast uniform random negative sampling with collision rejection."""
     neg_items = np.random.randint(0, num_items, size=len(users))
-    for idx, u in enumerate(users):
-        user_history = train_history.get(u, set())
-        while neg_items[idx] in user_history:
-            neg_items[idx] = np.random.randint(0, num_items)
+    for idx in range(len(users)):
+        u = users[idx]
+        hist = train_history.get(u)
+        if hist and neg_items[idx] in hist:
+            while neg_items[idx] in hist:
+                neg_items[idx] = np.random.randint(0, num_items)
     return neg_items
 
 
 class Trainer:
-    """Generic PyTorch trainer for LightGCN, SGL, and SimGCL recommendation models with visual progress bars and robust checkpointing."""
+    """Generic PyTorch trainer for LightGCN, SGL, SimGCL, XSimGCL, and DirectAU recommendation models with visual progress bars and robust checkpointing."""
 
     def __init__(
         self,
@@ -74,6 +92,13 @@ class Trainer:
         self.cl_loss_fn = InfoNCELoss(
             temperature=config.get(self.model_name, {}).get("temperature", 0.2)
         )
+        if self.model_name == "directau":
+            d_cfg = config.get("directau", {})
+            self.directau_loss_fn = DirectAULoss(
+                gamma=d_cfg.get("gamma", 1.0),
+                t=d_cfg.get("t", 2.0),
+                weight_decay=self.weight_decay,
+            )
 
         # Precompute train history mapping for negative sampling
         self.train_history: Dict[int, Set[int]] = (
@@ -127,7 +152,7 @@ class Trainer:
         best_val_metrics = {}
         best_epoch = self.early_stopping.best_epoch
 
-        history_dir = os.path.join("results", "history")
+        history_dir = os.path.join("results", "history", self.model_name)
         os.makedirs(history_dir, exist_ok=True)
         history_csv_name = os.path.basename(checkpoint_path).replace(".pt", "_history.csv")
         history_csv_path = os.path.join(history_dir, history_csv_name)
@@ -140,10 +165,13 @@ class Trainer:
             epoch_start = time.perf_counter()
             self.model.train()
 
-            # 1. Random negative sampling per epoch
-            neg_item_array = sample_negative_items(
-                user_array, self.num_items, self.train_history
-            )
+            # 1. Random negative sampling per epoch (only needed if model uses negative sampling)
+            if self.model_name != "directau":
+                neg_item_array = sample_negative_items(
+                    user_array, self.num_items, self.train_history
+                )
+            else:
+                neg_item_array = None
 
             # Shuffle mini-batches
             indices = np.arange(num_samples)
@@ -165,15 +193,7 @@ class Trainer:
             cl_loss_accum = 0.0
             num_batches = 0
 
-            batch_pbar = tqdm(
-                range(0, num_samples, self.batch_size),
-                desc=f"[{self.model_name.upper()}] Epoch {epoch:02d}/{self.epochs:02d}",
-                unit="batch",
-                dynamic_ncols=True,
-                leave=False,
-            )
-
-            for i in batch_pbar:
+            for i in range(0, num_samples, self.batch_size):
                 batch_idx = indices[i : i + self.batch_size]
                 u_batch = torch.tensor(
                     user_array[batch_idx], dtype=torch.long, device=self.device
@@ -181,63 +201,91 @@ class Trainer:
                 pos_batch = torch.tensor(
                     pos_item_array[batch_idx], dtype=torch.long, device=self.device
                 )
-                neg_batch = torch.tensor(
-                    neg_item_array[batch_idx], dtype=torch.long, device=self.device
-                )
 
                 self.optimizer.zero_grad()
 
-                # Main Graph Propagation
-                u_embeds, i_embeds = self.model(self.norm_adj)
+                if self.model_name == "directau":
+                    u_embeds, i_embeds = self.model(self.norm_adj)
+                    u_emb0 = self.model.user_embedding(u_batch)
+                    pos_emb0 = self.model.item_embedding(pos_batch)
 
-                pos_scores = (u_embeds[u_batch] * i_embeds[pos_batch]).sum(dim=-1)
-                neg_scores = (u_embeds[u_batch] * i_embeds[neg_batch]).sum(dim=-1)
-
-                # Initial embeddings for regularization
-                u_emb0 = self.model.user_embedding(u_batch)
-                pos_emb0 = self.model.item_embedding(pos_batch)
-                neg_emb0 = self.model.item_embedding(neg_batch)
-
-                total_loss, bpr_loss = self.bpr_loss_fn(
-                    pos_scores, neg_scores, u_emb0, pos_emb0, neg_emb0
-                )
-
-                cl_loss = torch.tensor(0.0, device=self.device)
-
-                if self.model_name == "sgl":
-                    ssl_weight = self.config["sgl"]["ssl_weight"]
-                    u_v1, i_v1 = self.model.forward_view(norm_adj1)
-                    u_v2, i_v2 = self.model.forward_view(norm_adj2)
-
-                    cl_loss = self.cl_loss_fn(
-                        u_v1[u_batch], u_v2[u_batch], i_v1[pos_batch], i_v2[pos_batch]
+                    total_loss, align_loss, unif_loss = self.directau_loss_fn(
+                        u_embeds[u_batch], i_embeds[pos_batch], u_emb0, pos_emb0
                     )
-                    total_loss = total_loss + ssl_weight * cl_loss
-
-                elif self.model_name == "simgcl":
-                    cl_weight = self.config["simgcl"]["contrastive_weight"]
-                    u_p1, i_p1 = self.model.forward_perturbed(self.norm_adj)
-                    u_p2, i_p2 = self.model.forward_perturbed(self.norm_adj)
-
-                    cl_loss = self.cl_loss_fn(
-                        u_p1[u_batch], u_p2[u_batch], i_p1[pos_batch], i_p2[pos_batch]
+                    bpr_loss_accum += align_loss.item()
+                    cl_loss_accum += unif_loss.item()
+                else:
+                    neg_batch = torch.tensor(
+                        neg_item_array[batch_idx], dtype=torch.long, device=self.device
                     )
-                    total_loss = total_loss + cl_weight * cl_loss
+
+                    u_embeds, i_embeds = self.model(self.norm_adj)
+
+                    pos_scores = (u_embeds[u_batch] * i_embeds[pos_batch]).sum(dim=-1)
+                    neg_scores = (u_embeds[u_batch] * i_embeds[neg_batch]).sum(dim=-1)
+
+                    # Initial embeddings for regularization
+                    u_emb0 = self.model.user_embedding(u_batch)
+                    pos_emb0 = self.model.item_embedding(pos_batch)
+                    neg_emb0 = self.model.item_embedding(neg_batch)
+
+                    total_loss, bpr_loss = self.bpr_loss_fn(
+                        pos_scores, neg_scores, u_emb0, pos_emb0, neg_emb0
+                    )
+
+                    cl_loss = torch.tensor(0.0, device=self.device)
+
+                    if self.model_name == "sgl":
+                        ssl_weight = self.config["sgl"]["ssl_weight"]
+                        u_v1, i_v1 = self.model.forward_view(norm_adj1)
+                        u_v2, i_v2 = self.model.forward_view(norm_adj2)
+
+                        cl_loss = self.cl_loss_fn(
+                            u_v1[u_batch], u_v2[u_batch], i_v1[pos_batch], i_v2[pos_batch]
+                        )
+                        total_loss = total_loss + ssl_weight * cl_loss
+
+                    elif self.model_name == "simgcl":
+                        cl_weight = self.config["simgcl"]["contrastive_weight"]
+                        u_p1, i_p1 = self.model.forward_perturbed(self.norm_adj)
+                        u_p2, i_p2 = self.model.forward_perturbed(self.norm_adj)
+
+                        cl_loss = self.cl_loss_fn(
+                            u_p1[u_batch], u_p2[u_batch], i_p1[pos_batch], i_p2[pos_batch]
+                        )
+                        total_loss = total_loss + cl_weight * cl_loss
+
+                    elif self.model_name == "xsimgcl":
+                        cl_weight = self.config["xsimgcl"]["contrastive_weight"]
+                        u_p1, i_p1 = self.model.forward_perturbed(u_embeds, i_embeds)
+                        u_p2, i_p2 = self.model.forward_perturbed(u_embeds, i_embeds)
+
+                        cl_loss = self.cl_loss_fn(
+                            u_p1[u_batch], u_p2[u_batch], i_p1[pos_batch], i_p2[pos_batch]
+                        )
+                        total_loss = total_loss + cl_weight * cl_loss
+
+                    elif self.model_name == "semantic_gcl":
+                        cl_loss = self.model.compute_semantic_ssl_loss(pos_batch, i_embeds)
+                        total_loss = total_loss + cl_loss
+
+                    bpr_loss_accum += bpr_loss.item()
+                    cl_loss_accum += cl_loss.item()
+
 
                 total_loss.backward()
                 self.optimizer.step()
 
                 total_loss_accum += total_loss.item()
-                bpr_loss_accum += bpr_loss.item()
-                cl_loss_accum += cl_loss.item()
                 num_batches += 1
 
-                batch_pbar.set_postfix({
-                    "Loss": f"{total_loss.item():.4f}",
-                    "BPR": f"{bpr_loss.item():.4f}",
-                })
-
-            batch_pbar.close()
+                # Live in-place batch progress
+                curr_sample = min(i + self.batch_size, num_samples)
+                pct = int(curr_sample / num_samples * 100)
+                sys.stdout.write(
+                    f"\r[{self.model_name.upper()}] Epoch {epoch:02d}/{self.epochs:02d} | Batch {num_batches:>3d}/{(num_samples + self.batch_size - 1)//self.batch_size} ({pct:>3d}%) | Loss: {total_loss.item():.4f} "
+                )
+                sys.stdout.flush()
 
             if self.device.type == "cuda":
                 torch.cuda.synchronize()
@@ -271,9 +319,13 @@ class Trainer:
                 best_epoch = epoch
 
             best_tag = " 🌟 [BEST]" if is_improved else ""
-            tqdm.write(
-                f"Epoch {epoch:02d}/{self.epochs:02d} [{epoch_time:4.1f}s] | Loss: {avg_loss:.4f} | Val Recall@10: {val_rec10:.4f} | Val NDCG@10: {val_ndcg10:.4f}{best_tag}"
+
+            # Erase in-place line and print clean final epoch summary
+            sys.stdout.write("\r" + " " * 80 + "\r")
+            sys.stdout.write(
+                f"Epoch {epoch:02d}/{self.epochs:02d} [{epoch_time:4.1f}s] | Loss: {avg_loss:.4f} | Val Recall@10: {val_rec10:.4f} | Val NDCG@10: {val_ndcg10:.4f}{best_tag}\n"
             )
+            sys.stdout.flush()
 
             # Save latest checkpoint at end of each epoch for resuming
             save_checkpoint(
@@ -300,17 +352,16 @@ class Trainer:
             })
 
             # Save epoch history CSV
-            history_dir = os.path.join("results", "history")
+            history_dir = os.path.join("results", "history", self.model_name)
             os.makedirs(history_dir, exist_ok=True)
             history_csv_name = os.path.basename(checkpoint_path).replace(".pt", "_history.csv")
             history_csv_path = os.path.join(history_dir, history_csv_name)
             pd.DataFrame(history_records).to_csv(history_csv_path, index=False)
 
+
             if self.early_stopping.early_stop:
                 logger.info(f"Stopping early at epoch {epoch}")
                 break
-
-        epoch_pbar.close()
 
         total_train_time = time.perf_counter() - start_train_time
         avg_epoch_time = float(np.mean(epoch_times)) if epoch_times else 0.0

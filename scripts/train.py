@@ -7,15 +7,23 @@ import sys
 # Ensure project root is in sys.path when script is executed directly
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+# Force UTF-8 encoding for Windows Command Prompt/PowerShell
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import pickle
 import pandas as pd
 import torch
 
 from src.data.sparsity import create_sparse_train_set
 from src.evaluation.evaluator import Evaluator
+from src.models.directau import DirectAU
 from src.models.lightgcn import LightGCN
 from src.models.sgl import SGL
 from src.models.simgcl import SimGCL
+from src.models.xsimgcl import XSimGCL
 from src.training.trainer import Trainer
 from src.utils.config import load_config
 from src.utils.device import get_device
@@ -88,8 +96,8 @@ def append_to_model_results_csv(results: dict, model_name: str, sparsity: float,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Graph Recommendation Models (LightGCN, SGL, SimGCL)")
-    parser.add_argument("--model", type=str, required=True, choices=["lightgcn", "sgl", "simgcl"], help="Model name")
+    parser = argparse.ArgumentParser(description="Train Graph Recommendation Models (LightGCN, SGL, SimGCL, XSimGCL, DirectAU, SemanticGCL)")
+    parser.add_argument("--model", type=str, required=True, choices=["lightgcn", "sgl", "simgcl", "xsimgcl", "directau", "semantic_gcl"], help="Model name")
     parser.add_argument("--sparsity", type=float, default=1.0, help="Sparsity ratio for training edges (0.25 to 1.0)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--epochs", type=int, default=None, help="Override number of training epochs")
@@ -166,10 +174,55 @@ def main():
             temperature=sim_cfg["temperature"],
             epsilon=sim_cfg["epsilon"],
         )
+    elif args.model == "xsimgcl":
+        xsim_cfg = config["xsimgcl"]
+        model = XSimGCL(
+            num_users,
+            num_items,
+            embedding_dim=emb_dim,
+            num_layers=num_layers,
+            contrastive_weight=xsim_cfg["contrastive_weight"],
+            temperature=xsim_cfg["temperature"],
+            epsilon=xsim_cfg["epsilon"],
+        )
+    elif args.model == "directau":
+        dau_cfg = config["directau"]
+        model = DirectAU(
+            num_users,
+            num_items,
+            embedding_dim=emb_dim,
+            num_layers=num_layers,
+            gamma=dau_cfg["gamma"],
+            t=dau_cfg["t"],
+        )
+    elif args.model == "semantic_gcl":
+        from src.models.semantic_gcl import SemanticGCL
+        sem_cfg = config["semantic_gcl"]
+        text_emb_path = os.path.join(processed_dir, "item_text_embeddings.pt")
+        text_features = None
+        if os.path.exists(text_emb_path):
+            logger.info(f"Loading item text features from {text_emb_path}...")
+            text_features = torch.load(text_emb_path, map_location="cpu", weights_only=False)
+            text_dim = text_features.shape[1]
+        else:
+            text_dim = sem_cfg.get("text_dim", 384)
+            logger.warning(f"Item text features not found at {text_emb_path}. Using fallback zero tensor.")
+
+        model = SemanticGCL(
+            num_users,
+            num_items,
+            embedding_dim=emb_dim,
+            num_layers=num_layers,
+            text_dim=text_dim,
+            text_features=text_features,
+            ssl_temp=sem_cfg.get("ssl_temp", 0.2),
+            ssl_reg=sem_cfg.get("ssl_reg", 0.1),
+        )
+
 
     # 8. Train model
     sparsity_tag = f"s{int(args.sparsity * 100)}"
-    checkpoint_dir = os.path.join("results", "checkpoints")
+    checkpoint_dir = os.path.join("results", "checkpoints", args.model)
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_path = os.path.join(checkpoint_dir, f"{args.model}_{sparsity_tag}_seed{args.seed}.pt")
 
@@ -180,7 +233,7 @@ def main():
     results["sparsity_level"] = args.sparsity
     results["seed"] = args.seed
 
-    results_dir = os.path.join("results", "raw")
+    results_dir = os.path.join("results", "raw", args.model)
     os.makedirs(results_dir, exist_ok=True)
     run_file = os.path.join(results_dir, f"{args.model}_{sparsity_tag}_seed{args.seed}.json")
 

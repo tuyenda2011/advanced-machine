@@ -6,6 +6,12 @@ import sys
 # Ensure project root is in sys.path when script is executed directly
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+# Force UTF-8 encoding for Windows Command Prompt/PowerShell
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import subprocess
 import numpy as np
 import pandas as pd
@@ -22,7 +28,10 @@ logger = setup_logger("benchmark_all")
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Comprehensive Academic Benchmark Suite for LightGCN, SGL, SimGCL under Sparsity"
+        description="Comprehensive Academic Benchmark Suite for LightGCN, SGL, SimGCL, XSimGCL, DirectAU under Sparsity"
+    )
+    parser.add_argument(
+        "--models", nargs="+", default=["lightgcn", "sgl", "simgcl", "xsimgcl", "directau"], help="List of models to benchmark"
     )
     parser.add_argument(
         "--quick", action="store_true", help="Quick mode: 1 seed, 5 epochs, 100% data only"
@@ -32,7 +41,7 @@ def main():
     )
     args = parser.parse_args()
 
-    models = ["lightgcn", "sgl", "simgcl"]
+    models = args.models
     if args.quick:
         sparsity_levels = [1.0]
         seeds = [42]
@@ -65,8 +74,12 @@ def main():
         pbar.set_postfix({"Model": model.upper(), "Sparsity": f"{sparsity_pct}%", "Seed": seed})
 
         run_file = os.path.join(
-            results_dir, f"{model}_{sparsity_tag}_seed{seed}.json"
+            results_dir, model, f"{model}_{sparsity_tag}_seed{seed}.json"
         )
+        if not os.path.exists(run_file):
+            run_file = os.path.join(
+                results_dir, f"{model}_{sparsity_tag}_seed{seed}.json"
+            )
 
         # Check if run file exists and contains new metrics
         if os.path.exists(run_file):
@@ -76,6 +89,7 @@ def main():
                 logger.info(f"Skipping existing completed run: {run_file}")
                 all_runs.append(data)
                 continue
+
 
         logger.info(
             f"Executing run: model={model}, sparsity={sparsity}, seed={seed}, epochs={epochs}..."
@@ -226,32 +240,24 @@ def main():
             m_df.to_csv(m_csv, index=False)
             logger.info(f"Saved dedicated summary for {m_name.upper()} to {m_csv}")
 
-    # Statistical Significance Testing (SimGCL vs LightGCN, SGL vs LightGCN)
+    # Statistical Significance Testing (Any model vs LightGCN)
     sig_results = []
     for sp in sorted(df["sparsity"].unique(), reverse=True):
         sp_df = df[df["sparsity"] == sp]
         for m_name in ["Recall@10", "NDCG@10", "Diversity@10", "Novelty@10"]:
             lgcn_scores = sp_df[sp_df["model"] == "lightgcn"][m_name].values
-            sgl_scores = sp_df[sp_df["model"] == "sgl"][m_name].values
-            simgcl_scores = sp_df[sp_df["model"] == "simgcl"][m_name].values
-
-            if len(lgcn_scores) > 0 and len(sgl_scores) > 0:
-                sgl_vs_lgcn = compute_statistical_significance(sgl_scores, lgcn_scores)
-                sig_results.append({
-                    "sparsity": sp,
-                    "metric": m_name,
-                    "comparison": "SGL vs LightGCN",
-                    **sgl_vs_lgcn,
-                })
-
-            if len(lgcn_scores) > 0 and len(simgcl_scores) > 0:
-                sim_vs_lgcn = compute_statistical_significance(simgcl_scores, lgcn_scores)
-                sig_results.append({
-                    "sparsity": sp,
-                    "metric": m_name,
-                    "comparison": "SimGCL vs LightGCN",
-                    **sim_vs_lgcn,
-                })
+            if len(lgcn_scores) == 0:
+                continue
+            for other_model in [m for m in models if m != "lightgcn"]:
+                other_scores = sp_df[sp_df["model"] == other_model][m_name].values
+                if len(other_scores) > 0:
+                    sig_res = compute_statistical_significance(other_scores, lgcn_scores)
+                    sig_results.append({
+                        "sparsity": sp,
+                        "metric": m_name,
+                        "comparison": f"{other_model.upper()} vs LightGCN",
+                        **sig_res,
+                    })
 
     if sig_results:
         sig_df = pd.DataFrame(sig_results)

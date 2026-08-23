@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "graph-rec-sparsity"
 version = "0.1.0"
-description = "Comparative Study of Graph Contrastive Learning Methods for Top-K Movie Recommendation under Data Sparsity"
+description = "Comparative Study of Graph Contrastive Learning Methods for Top-K Electronics Recommendation under Data Sparsity"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -25,3 +25,4 @@ dependencies = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+pythonpath = ["."]

@@ -1,0 +1,5 @@
+model_name: "directau"
+
+directau:
+  gamma: 1.0 # weight of uniformity loss
+  t: 2.0 # temperature factor in uniformity loss

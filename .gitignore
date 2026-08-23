@@ -29,10 +29,23 @@ wheels/
 htmlcov/
 tests/
 
-# Data & Artifacts
-data/
-artifacts/checkpoints/*.pt
-results/raw/*.json
+# Data & Artifacts (track manifest.json, ignore large data)
+data/raw/
+data/cache/
+data/processed/
+data/source/
+!data/manifest.json
+artifacts/checkpoints/
+results/
+*.pt
+*.pth
+*.parquet
+*.pkl
+
+# DVC
+.dvc/cache
+.dvc/tmp
+.dvc/plots
 
 # IDEs
 .vscode/
@@ -40,3 +53,6 @@ results/raw/*.json
 *.swp
 *.swo
 .DS_Store
+
+# Agents
+.agents/

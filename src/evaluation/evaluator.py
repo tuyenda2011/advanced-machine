@@ -93,11 +93,17 @@ class Evaluator:
         if device.type == "cuda":
             torch.cuda.synchronize()
 
+        if show_progress:
+            import sys
+            sys.stdout.write("\r" + " " * 80 + "\r")
+            sys.stdout.flush()
+
         total_inference_time = time.perf_counter() - start_time
         avg_user_latency_ms = (total_inference_time / max(1, num_eval_users)) * 1000.0
 
         topk_preds_tensor = torch.cat(all_topk_preds, dim=0) if all_topk_preds else torch.empty(0, max_k)
         return topk_preds_tensor, avg_user_latency_ms
+
 
     @torch.no_grad()
     def evaluate(
