@@ -58,7 +58,7 @@ def sample_negative_items(
 
 
 class Trainer:
-    """Generic PyTorch trainer for LightGCN, SGL, SimGCL, XSimGCL, and DirectAU recommendation models with visual progress bars and robust checkpointing."""
+    """Generic PyTorch trainer for 4 SOTA recommendation models (LightGCN, XSimGCL, DirectAU, AdaptiveGCL) with visual progress bars and robust checkpointing."""
 
     def __init__(
         self,
@@ -177,17 +177,6 @@ class Trainer:
             indices = np.arange(num_samples)
             np.random.shuffle(indices)
 
-            # SGL Edge Dropout graph view generation
-            if self.model_name == "sgl":
-                drop_ratio = self.config["sgl"]["drop_ratio"]
-                norm_adj1, norm_adj2 = create_edge_dropout_views(
-                    self.train_df,
-                    self.num_users,
-                    self.num_items,
-                    drop_ratio,
-                    self.device,
-                )
-
             total_loss_accum = 0.0
             bpr_loss_accum = 0.0
             cl_loss_accum = 0.0
@@ -235,27 +224,7 @@ class Trainer:
 
                     cl_loss = torch.tensor(0.0, device=self.device)
 
-                    if self.model_name == "sgl":
-                        ssl_weight = self.config["sgl"]["ssl_weight"]
-                        u_v1, i_v1 = self.model.forward_view(norm_adj1)
-                        u_v2, i_v2 = self.model.forward_view(norm_adj2)
-
-                        cl_loss = self.cl_loss_fn(
-                            u_v1[u_batch], u_v2[u_batch], i_v1[pos_batch], i_v2[pos_batch]
-                        )
-                        total_loss = total_loss + ssl_weight * cl_loss
-
-                    elif self.model_name == "simgcl":
-                        cl_weight = self.config["simgcl"]["contrastive_weight"]
-                        u_p1, i_p1 = self.model.forward_perturbed(self.norm_adj)
-                        u_p2, i_p2 = self.model.forward_perturbed(self.norm_adj)
-
-                        cl_loss = self.cl_loss_fn(
-                            u_p1[u_batch], u_p2[u_batch], i_p1[pos_batch], i_p2[pos_batch]
-                        )
-                        total_loss = total_loss + cl_weight * cl_loss
-
-                    elif self.model_name == "xsimgcl":
+                    if self.model_name == "xsimgcl":
                         cl_weight = self.config["xsimgcl"]["contrastive_weight"]
                         u_p1, i_p1 = self.model.forward_perturbed(u_embeds, i_embeds)
                         u_p2, i_p2 = self.model.forward_perturbed(u_embeds, i_embeds)
@@ -265,9 +234,15 @@ class Trainer:
                         )
                         total_loss = total_loss + cl_weight * cl_loss
 
-                    elif self.model_name == "semantic_gcl":
+                    elif self.model_name == "adaptive_gcl":
                         cl_loss = self.model.compute_semantic_ssl_loss(pos_batch, i_embeds)
                         total_loss = total_loss + cl_loss
+                        if hasattr(self.model, "dirichlet_reg") and self.model.dirichlet_reg > 0:
+                            all_final = torch.cat([u_embeds, i_embeds], dim=0)
+                            dir_energy = self.model.compute_dirichlet_energy(self.norm_adj, all_final)
+                            # Regularize to keep Dirichlet energy non-zero and stable
+                            dir_loss = self.model.dirichlet_reg * torch.clamp(1.0 - dir_energy, min=0.0)
+                            total_loss = total_loss + dir_loss
 
                     bpr_loss_accum += bpr_loss.item()
                     cl_loss_accum += cl_loss.item()

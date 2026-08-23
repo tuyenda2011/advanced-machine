@@ -30,9 +30,9 @@ def main():
     parser.add_argument(
         "--models",
         nargs="+",
-        default=["lightgcn", "sgl", "simgcl"],
-        choices=["lightgcn", "sgl", "simgcl"],
-        help="List of models to train sequentially (default: all 3 models)",
+        default=["lightgcn", "xsimgcl", "directau", "adaptive_gcl"],
+        choices=["lightgcn", "sgl", "simgcl", "xsimgcl", "directau", "semantic_gcl", "adaptive_gcl"],
+        help="List of models to train sequentially (default: 4 SOTA models: LightGCN, XSimGCL, DirectAU, AdaptiveGCL)",
     )
     parser.add_argument(
         "--sparsity",

@@ -1,0 +1,10 @@
+model_name: "adaptive_gcl"
+
+adaptive_gcl:
+  text_dim: 384
+  ssl_temp: 0.2
+  ssl_reg: 0.1
+  dirichlet_reg: 0.01
+  node_dropout: 0.05
+  tau_plus: 0.1
+  hard_neg_alpha: 0.2

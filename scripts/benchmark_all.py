@@ -31,7 +31,10 @@ def main():
         description="Comprehensive Academic Benchmark Suite for LightGCN, SGL, SimGCL, XSimGCL, DirectAU under Sparsity"
     )
     parser.add_argument(
-        "--models", nargs="+", default=["lightgcn", "sgl", "simgcl", "xsimgcl", "directau"], help="List of models to benchmark"
+        "--models",
+        nargs="+",
+        default=["lightgcn", "xsimgcl", "directau", "adaptive_gcl"],
+        help="List of models to benchmark (default: 4 SOTA models: LightGCN, XSimGCL, DirectAU, AdaptiveGCL)",
     )
     parser.add_argument(
         "--quick", action="store_true", help="Quick mode: 1 seed, 5 epochs, 100% data only"

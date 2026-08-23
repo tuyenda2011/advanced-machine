@@ -19,10 +19,9 @@ import torch
 
 from src.data.sparsity import create_sparse_train_set
 from src.evaluation.evaluator import Evaluator
+from src.models.adaptive_gcl import AdaptiveGCL
 from src.models.directau import DirectAU
 from src.models.lightgcn import LightGCN
-from src.models.sgl import SGL
-from src.models.simgcl import SimGCL
 from src.models.xsimgcl import XSimGCL
 from src.training.trainer import Trainer
 from src.utils.config import load_config
@@ -96,8 +95,8 @@ def append_to_model_results_csv(results: dict, model_name: str, sparsity: float,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Graph Recommendation Models (LightGCN, SGL, SimGCL, XSimGCL, DirectAU, SemanticGCL)")
-    parser.add_argument("--model", type=str, required=True, choices=["lightgcn", "sgl", "simgcl", "xsimgcl", "directau", "semantic_gcl"], help="Model name")
+    parser = argparse.ArgumentParser(description="Train Graph Recommendation Models (LightGCN, XSimGCL, DirectAU, AdaptiveGCL)")
+    parser.add_argument("--model", type=str, required=True, choices=["lightgcn", "xsimgcl", "directau", "adaptive_gcl"], help="Model name (4 SOTA models)")
     parser.add_argument("--sparsity", type=float, default=1.0, help="Sparsity ratio for training edges (0.25 to 1.0)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--epochs", type=int, default=None, help="Override number of training epochs")
@@ -152,28 +151,6 @@ def main():
 
     if args.model == "lightgcn":
         model = LightGCN(num_users, num_items, embedding_dim=emb_dim, num_layers=num_layers)
-    elif args.model == "sgl":
-        sgl_cfg = config["sgl"]
-        model = SGL(
-            num_users,
-            num_items,
-            embedding_dim=emb_dim,
-            num_layers=num_layers,
-            ssl_weight=sgl_cfg["ssl_weight"],
-            temperature=sgl_cfg["temperature"],
-            drop_ratio=sgl_cfg["drop_ratio"],
-        )
-    elif args.model == "simgcl":
-        sim_cfg = config["simgcl"]
-        model = SimGCL(
-            num_users,
-            num_items,
-            embedding_dim=emb_dim,
-            num_layers=num_layers,
-            contrastive_weight=sim_cfg["contrastive_weight"],
-            temperature=sim_cfg["temperature"],
-            epsilon=sim_cfg["epsilon"],
-        )
     elif args.model == "xsimgcl":
         xsim_cfg = config["xsimgcl"]
         model = XSimGCL(
@@ -195,28 +172,29 @@ def main():
             gamma=dau_cfg["gamma"],
             t=dau_cfg["t"],
         )
-    elif args.model == "semantic_gcl":
-        from src.models.semantic_gcl import SemanticGCL
-        sem_cfg = config["semantic_gcl"]
+    elif args.model == "adaptive_gcl":
+        ada_cfg = config.get("adaptive_gcl", {})
         text_emb_path = os.path.join(processed_dir, "item_text_embeddings.pt")
         text_features = None
         if os.path.exists(text_emb_path):
-            logger.info(f"Loading item text features from {text_emb_path}...")
+            logger.info(f"Loading item text features from {text_emb_path} for AdaptiveGCL...")
             text_features = torch.load(text_emb_path, map_location="cpu", weights_only=False)
             text_dim = text_features.shape[1]
         else:
-            text_dim = sem_cfg.get("text_dim", 384)
+            text_dim = ada_cfg.get("text_dim", 384)
             logger.warning(f"Item text features not found at {text_emb_path}. Using fallback zero tensor.")
 
-        model = SemanticGCL(
+        model = AdaptiveGCL(
             num_users,
             num_items,
             embedding_dim=emb_dim,
             num_layers=num_layers,
             text_dim=text_dim,
             text_features=text_features,
-            ssl_temp=sem_cfg.get("ssl_temp", 0.2),
-            ssl_reg=sem_cfg.get("ssl_reg", 0.1),
+            ssl_temp=ada_cfg.get("ssl_temp", 0.2),
+            ssl_reg=ada_cfg.get("ssl_reg", 0.1),
+            dirichlet_reg=ada_cfg.get("dirichlet_reg", 0.01),
+            node_dropout=ada_cfg.get("node_dropout", 0.0),
         )
 
 
