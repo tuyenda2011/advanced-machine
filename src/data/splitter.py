@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -176,29 +176,53 @@ def chronological_per_user_split(
 
 
 def verify_no_leakage(
-    train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame
-) -> bool:
-    """Verify that train, validation, and test edge sets have zero intersection."""
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    raise_on_error: bool = True,
+) -> Tuple[bool, Dict[str, int]]:
+    """Verify that train, validation, and test edge sets have zero intersection.
+
+    Args:
+        train_df: Training DataFrame
+        val_df: Validation DataFrame
+        test_df: Test DataFrame
+        raise_on_error: Whether to raise assertion error on leakage (default: True)
+
+    Returns:
+        Tuple of (is_valid, leakage_counts) where leakage_counts shows number of overlapping edges
+    """
     train_pairs: Set[Tuple[int, int]] = set(zip(train_df["u_idx"], train_df["i_idx"]))
     val_pairs: Set[Tuple[int, int]] = set(zip(val_df["u_idx"], val_df["i_idx"]))
     test_pairs: Set[Tuple[int, int]] = set(zip(test_df["u_idx"], test_df["i_idx"]))
 
-    intersection_train_val = train_pairs.intersection(val_pairs)
-    intersection_train_test = train_pairs.intersection(test_pairs)
-    intersection_val_test = val_pairs.intersection(test_pairs)
+    intersection_train_val = len(train_pairs.intersection(val_pairs))
+    intersection_train_test = len(train_pairs.intersection(test_pairs))
+    intersection_val_test = len(val_pairs.intersection(test_pairs))
 
-    assert (
-        len(intersection_train_val) == 0
-    ), f"DATA LEAKAGE DETECTED! Train and Val share {len(intersection_train_val)} interaction edges!"
-    assert (
-        len(intersection_train_test) == 0
-    ), f"DATA LEAKAGE DETECTED! Train and Test share {len(intersection_train_test)} interaction edges!"
-    assert (
-        len(intersection_val_test) == 0
-    ), f"DATA LEAKAGE DETECTED! Val and Test share {len(intersection_val_test)} interaction edges!"
+    leakage_counts = {
+        "train_val": intersection_train_val,
+        "train_test": intersection_train_test,
+        "val_test": intersection_val_test,
+    }
 
-    logger.info("PASSED DATA LEAKAGE CHECK: Train ∩ Val = ∅, Train ∩ Test = ∅, Val ∩ Test = ∅.")
-    return True
+    is_valid = all(count == 0 for count in leakage_counts.values())
+
+    if not is_valid:
+        msg = (
+            f"DATA LEAKAGE DETECTED! "
+            f"Train∩Val={intersection_train_val}, "
+            f"Train∩Test={intersection_train_test}, "
+            f"Val∩Test={intersection_val_test}"
+        )
+        if raise_on_error:
+            raise AssertionError(msg)
+        else:
+            logger.error(msg)
+    else:
+        logger.info("PASSED DATA LEAKAGE CHECK: Train ∩ Val = ∅, Train ∩ Test = ∅, Val ∩ Test = ∅.")
+
+    return is_valid, leakage_counts
 
 
 def global_temporal_split(

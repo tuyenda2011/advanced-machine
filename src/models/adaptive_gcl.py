@@ -144,28 +144,26 @@ class AdaptiveGCL(BaseRecommender):
         indices = adj.indices()
         values = adj.values()
         device = indices.device
+        num_total_nodes = self.num_users + self.num_items
 
-        drop_u = torch.rand(self.num_users, device=device) < self.node_dropout
-        drop_i = torch.rand(self.num_items, device=device) < self.node_dropout
+        # Unified node dropout mask across all user + item nodes
+        drop_nodes = torch.rand(num_total_nodes, device=device) < self.node_dropout
 
         row, col = indices[0], indices[1]
-        row_is_user = row < self.num_users
-        col_is_user = col < self.num_users
-        row_off = (row - self.num_users).clamp(min=0)
-        col_off = (col - self.num_users).clamp(min=0)
-        drop_row = torch.where(row_is_user, drop_u[row.clamp(min=0)], drop_i[row_off])
-        drop_col = torch.where(col_is_user, drop_u[col.clamp(min=0)], drop_i[col_off])
-        keep = ~(drop_row | drop_col)
+        keep = ~(drop_nodes[row] | drop_nodes[col])
 
         return torch.sparse_coo_tensor(
             indices[:, keep], values[keep], adj.size(), device=device, dtype=values.dtype
         ).coalesce()
 
     def _get_propagation_adj(self, norm_adj: torch.Tensor) -> torch.Tensor:
-        """Resolve cached adjacency matrix."""
-        if self._adj_cache_key is not norm_adj:
+        """Resolve cached adjacency matrix with proper identity tracking.
+
+        Uses object id() for cache key to prevent unnecessary coalesce operations.
+        """
+        if self._adj_cache_key != id(norm_adj):
             self._cached_norm_adj = norm_adj.coalesce()
-            self._adj_cache_key = norm_adj
+            self._adj_cache_key = id(norm_adj)
         adj = self._cached_norm_adj
         if self.training and self.node_dropout > 0:
             adj = self._apply_node_dropout(adj)

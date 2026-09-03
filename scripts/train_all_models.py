@@ -25,13 +25,13 @@ logger = setup_logger("train_all_models")
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run training and evaluation for all 3 Graph Recommendation Models (LightGCN, SGL, SimGCL) under specific or all sparsity levels."
+        description="Run training and evaluation for all 4 SOTA Graph Recommendation Models (LightGCN, XSimGCL, DirectAU, AdaptiveGCL) under specific or all sparsity levels."
     )
     parser.add_argument(
         "--models",
         nargs="+",
         default=["lightgcn", "xsimgcl", "directau", "adaptive_gcl"],
-        choices=["lightgcn", "sgl", "simgcl", "xsimgcl", "directau", "semantic_gcl", "adaptive_gcl"],
+        choices=["lightgcn", "xsimgcl", "directau", "adaptive_gcl"],
         help="List of models to train sequentially (default: 4 SOTA models: LightGCN, XSimGCL, DirectAU, AdaptiveGCL)",
     )
     parser.add_argument(
@@ -55,8 +55,8 @@ def main():
     parser.add_argument(
         "--epochs",
         type=int,
-        default=50,
-        help="Number of training epochs per model (default: 50 epochs)",
+        default=100,
+        help="Number of training epochs per model (default: 100 epochs)",
     )
     parser.add_argument(
         "--resume",

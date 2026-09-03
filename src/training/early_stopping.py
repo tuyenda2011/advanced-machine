@@ -15,7 +15,10 @@ def save_checkpoint(
     val_metrics: Optional[Dict[str, float]] = None,
     config: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Save full training checkpoint with model weights, optimizer state, metrics, and config."""
+    """Save full training checkpoint with model weights, optimizer state, metrics, and config.
+
+    Uses atomic write (temp file + rename) to prevent corruption on interruption.
+    """
     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
     state = {
         "epoch": epoch,
@@ -25,7 +28,11 @@ def save_checkpoint(
         "val_metrics": val_metrics or {},
         "config": config or {},
     }
-    torch.save(state, checkpoint_path)
+
+    # Atomic write: save to temp file first, then rename
+    temp_path = checkpoint_path + ".tmp"
+    torch.save(state, temp_path)
+    os.replace(temp_path, checkpoint_path)  # Atomic on POSIX, semi-atomic on Windows
     logger.info(f"Saved complete model checkpoint to {checkpoint_path}")
 
 
@@ -35,11 +42,16 @@ def load_checkpoint(
     optimizer: Optional[torch.optim.Optimizer] = None,
     device: torch.device = torch.device("cpu"),
 ) -> Tuple[int, float, Dict[str, Any]]:
-    """Load model weights and optimizer state from checkpoint."""
+    """Load model weights and optimizer state from checkpoint with validation."""
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    # Validate checkpoint integrity
+    if "model_state_dict" not in checkpoint:
+        raise ValueError(f"Invalid checkpoint format at {checkpoint_path}: missing 'model_state_dict' key")
+
     model.load_state_dict(checkpoint["model_state_dict"])
 
     if optimizer is not None and checkpoint.get("optimizer_state_dict") is not None:

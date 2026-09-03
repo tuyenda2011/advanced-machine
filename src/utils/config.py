@@ -2,9 +2,24 @@ import os
 from typing import Any, Dict
 import yaml
 
+from src.utils.config_schemas import validate_config, validate_model_config
 
-def load_config(model_name: str = "lightgcn", config_dir: str = "configs") -> Dict[str, Any]:
-    """Load and merge common.yaml with model specific configuration file."""
+
+def load_config(
+    model_name: str = "lightgcn",
+    config_dir: str = "configs",
+    validate: bool = True,
+) -> Dict[str, Any]:
+    """Load and merge common.yaml with model specific configuration file.
+
+    Args:
+        model_name: Name of the model to load specific config
+        config_dir: Directory containing config files
+        validate: Whether to validate config values (default: True)
+
+    Returns:
+        Validated config dictionary
+    """
     common_path = os.path.join(config_dir, "common.yaml")
     if not os.path.exists(common_path):
         raise FileNotFoundError(f"Common config file not found at {common_path}")
@@ -20,4 +35,10 @@ def load_config(model_name: str = "lightgcn", config_dir: str = "configs") -> Di
                 config.update(model_cfg)
 
     config["model_name"] = model_name
+
+    # Apply validation
+    if validate:
+        config = validate_config(config)
+        config = validate_model_config(config, model_name)
+
     return config

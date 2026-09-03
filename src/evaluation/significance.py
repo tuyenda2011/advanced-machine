@@ -60,7 +60,7 @@ def compute_statistical_significance(
 
 def generate_latex_table(
     summary_df: pd.DataFrame,
-    caption: str = "Performance comparison of LightGCN, SGL, and SimGCL across data sparsity levels.",
+    caption: str = "Performance comparison of LightGCN, XSimGCL, DirectAU, and AdaptiveGCL across data sparsity levels.",
     label: str = "tab:benchmark_results",
 ) -> str:
     """Generate publication-ready LaTeX table formatted according to ACM/IEEE guidelines.

@@ -28,32 +28,74 @@ from src.losses.bpr import BPRLoss
 from src.losses.contrastive import InfoNCELoss
 from src.losses.directau import DirectAULoss
 from src.losses.hard_bpr import HardNegativeBPRLoss
+from src.models.adaptive_gcl import AdaptiveGCL
 from src.models.base import BaseRecommender
 from src.models.directau import DirectAU
 from src.models.lightgcn import LightGCN
-from src.models.semantic_gcl import SemanticGCL
-from src.models.sgl import SGL
-from src.models.simgcl import SimGCL
 from src.models.xsimgcl import XSimGCL
 from src.training.early_stopping import EarlyStopping, load_checkpoint, save_checkpoint
 
 logger = logging.getLogger(__name__)
 
+# Try to import AMP (mixed precision training)
+try:
+    from torch.cuda.amp import autocast, GradScaler
+    AMP_AVAILABLE = True
+except ImportError:
+    AMP_AVAILABLE = False
+
+
+# =============================================================================
+# Constants for training configuration
+# =============================================================================
+MASK_VALUE: float = -1e9  # Mask value for filtering seen items
+GRADIENT_CLIP_VALUE: float = 1.0  # Gradient clipping max norm
+DEFAULT_TERMINAL_WIDTH: int = 80  # Default terminal width for progress display
+SYNC_CUDA: bool = False  # Whether to synchronize CUDA after each epoch (for accurate timing)
 
 
 def sample_negative_items(
     users: np.ndarray,
     num_items: int,
     train_history: Dict[int, Set[int]],
+    max_attempts: int = 100,
 ) -> np.ndarray:
-    """Fast uniform random negative sampling with collision rejection."""
-    neg_items = np.random.randint(0, num_items, size=len(users))
-    for idx in range(len(users)):
-        u = users[idx]
-        hist = train_history.get(u)
-        if hist and neg_items[idx] in hist:
-            while neg_items[idx] in hist:
-                neg_items[idx] = np.random.randint(0, num_items)
+    """Fast uniform random negative sampling with vectorized collision rejection.
+
+    Optimized implementation that batches operations and minimizes Python loops.
+
+    Args:
+        users: Array of user indices
+        num_items: Total number of items
+        train_history: Dictionary mapping user to set of positive items
+        max_attempts: Maximum retry attempts per negative sample to prevent infinite loops
+
+    Returns:
+        Array of negative item indices
+    """
+    n = len(users)
+    neg_items = np.random.randint(0, num_items, size=n)
+
+    # Pre-compute history sets for faster lookup
+    user_histories = [train_history.get(u, set()) for u in users]
+
+    # Vectorized collision detection using numpy
+    collisions = np.array([
+        neg_items[i] in user_histories[i]
+        for i in range(n)
+    ], dtype=bool)
+
+    # Retry collisions with limit
+    attempts = np.zeros(n, dtype=np.int32)
+    while collisions.any() and (attempts < max_attempts).any():
+        retry_mask = collisions & (attempts < max_attempts)
+        neg_items[retry_mask] = np.random.randint(0, num_items, size=retry_mask.sum())
+
+        # Update collision status
+        for i in np.where(retry_mask)[0]:
+            attempts[i] += 1
+            collisions[i] = neg_items[i] in user_histories[i]
+
     return neg_items
 
 
@@ -124,6 +166,12 @@ class Trainer:
             mode="max",
         )
 
+        # Mixed precision training (AMP)
+        self.use_amp = AMP_AVAILABLE and device.type == "cuda"
+        self.scaler = GradScaler() if self.use_amp else None
+        if self.use_amp:
+            logger.info("Mixed precision training (AMP) enabled for CUDA device")
+
     def train(self, checkpoint_path: str, resume: bool = False) -> Dict[str, Any]:
         """Execute full model training loop with tqdm visual progress bars, early stopping, and scientific metrics."""
         logger.info(
@@ -134,13 +182,19 @@ class Trainer:
         start_epoch = 1
 
         if resume and os.path.exists(latest_checkpoint_path):
-            loaded_epoch, best_sc, ckpt = load_checkpoint(
-                latest_checkpoint_path, self.model, self.optimizer, device=self.device
-            )
-            start_epoch = loaded_epoch + 1
-            self.early_stopping.best_score = best_sc
-            self.early_stopping.best_epoch = loaded_epoch
-            logger.info(f"Resuming training from epoch {start_epoch}/{self.epochs}")
+            try:
+                loaded_epoch, best_sc, ckpt = load_checkpoint(
+                    latest_checkpoint_path, self.model, self.optimizer, device=self.device
+                )
+                start_epoch = loaded_epoch + 1
+                self.early_stopping.best_score = best_sc
+                self.early_stopping.best_epoch = ckpt.get("best_epoch", loaded_epoch)
+                print(
+                    f"🔄 [RESUME CHECKPOINT] Đã khôi phục trọng số! Tiếp tục train từ Epoch {start_epoch:02d}/{self.epochs:02d} (Val NDCG@10 đỉnh hiện tại: {best_sc:.4f})\n",
+                    flush=True,
+                )
+            except Exception as ex:
+                logger.warning(f"Error loading checkpoint for resume: {ex}. Starting from epoch 1.")
 
         user_array = self.train_df["u_idx"].values
         pos_item_array = self.train_df["i_idx"].values
@@ -249,7 +303,15 @@ class Trainer:
 
 
                 total_loss.backward()
-                self.optimizer.step()
+                # Gradient clipping to prevent gradient explosion
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
+                # Use mixed precision training if enabled
+                if self.use_amp and self.scaler is not None:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    self.optimizer.step()
 
                 total_loss_accum += total_loss.item()
                 num_batches += 1
@@ -257,12 +319,12 @@ class Trainer:
                 # Live in-place batch progress
                 curr_sample = min(i + self.batch_size, num_samples)
                 pct = int(curr_sample / num_samples * 100)
-                sys.stdout.write(
-                    f"\r[{self.model_name.upper()}] Epoch {epoch:02d}/{self.epochs:02d} | Batch {num_batches:>3d}/{(num_samples + self.batch_size - 1)//self.batch_size} ({pct:>3d}%) | Loss: {total_loss.item():.4f} "
-                )
+                total_batches = (num_samples + self.batch_size - 1) // self.batch_size
+                batch_status = f"[{self.model_name.upper()}] Epoch {epoch:02d}/{self.epochs:02d} | Batch {num_batches:>3d}/{total_batches} ({pct:>3d}%) | Loss: {total_loss.item():.4f}"
+                sys.stdout.write(f"\r{batch_status:<70}")
                 sys.stdout.flush()
 
-            if self.device.type == "cuda":
+            if SYNC_CUDA and self.device.type == "cuda":
                 torch.cuda.synchronize()
 
             epoch_time = time.perf_counter() - epoch_start
@@ -295,11 +357,9 @@ class Trainer:
 
             best_tag = " 🌟 [BEST]" if is_improved else ""
 
-            # Erase in-place line and print clean final epoch summary
-            sys.stdout.write("\r" + " " * 80 + "\r")
-            sys.stdout.write(
-                f"Epoch {epoch:02d}/{self.epochs:02d} [{epoch_time:4.1f}s] | Loss: {avg_loss:.4f} | Val Recall@10: {val_rec10:.4f} | Val NDCG@10: {val_ndcg10:.4f}{best_tag}\n"
-            )
+            # Overwrite line atomically without excessive spaces to prevent terminal wrapping
+            epoch_summary = f"Epoch {epoch:02d}/{self.epochs:02d} [{epoch_time:4.1f}s] | Loss: {avg_loss:.4f} | Val Recall@10: {val_rec10:.4f} | Val NDCG@10: {val_ndcg10:.4f}{best_tag}"
+            sys.stdout.write(f"\r{epoch_summary:<85}\n")
             sys.stdout.flush()
 
             # Save latest checkpoint at end of each epoch for resuming

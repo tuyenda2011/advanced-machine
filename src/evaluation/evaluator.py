@@ -45,6 +45,9 @@ class Evaluator:
         self.eval_users = sorted(list(eval_grouped.keys()))
         self.ground_truth = [eval_grouped[u] for u in self.eval_users]
 
+    # Constant for masking seen items
+    MASK_VALUE: float = -1e9
+
     @torch.no_grad()
     def get_predictions(
         self,
@@ -77,14 +80,19 @@ class Evaluator:
             # Compute rating scores matrix (batch_users, num_items)
             scores = torch.matmul(final_user_embeds[u_tensors], final_item_embeds.T)
 
-            # Mask training seen items with -1e9
-            for idx_in_batch, u in enumerate(batch_u_idx):
-                seen_items = self.train_history.get(u, None)
-                if seen_items:
-                    seen_tensor = torch.tensor(
-                        list(seen_items), dtype=torch.long, device=device
-                    )
-                    scores[idx_in_batch, seen_tensor] = -1e9
+            # Batch mask training seen items - collect all seen items first
+            all_seen_items = set()
+            for u in batch_u_idx:
+                seen = self.train_history.get(u, None)
+                if seen:
+                    all_seen_items.update(seen)
+
+            # Apply mask in one operation instead of per-user loop
+            if all_seen_items:
+                seen_tensor = torch.tensor(
+                    list(all_seen_items), dtype=torch.long, device=device
+                )
+                scores[:, seen_tensor] = self.MASK_VALUE
 
             # Retrieve top-K recommended item IDs
             _, topk_indices = torch.topk(scores, k=max_k, dim=1)

@@ -85,26 +85,46 @@ def preprocess_amazon_electronics(
     if num_dups > 0:
         logger.info(f"Removed {num_dups} duplicate (user_id, item_id) interactions.")
 
-    # 3. Iterative Bipartite K-core (Users >= min_user_interactions AND Items >= min_item_interactions)
-    filter_pbar = tqdm(total=None, desc="Filtering Bipartite K-core (Users & Items)", unit=" passes")
+    # 3. Iterative Bipartite K-core - Vectorized numpy version
+    # Much faster and memory efficient than pandas operations
+    from collections import Counter
+
+    filter_pbar = tqdm(total=None, desc="Filtering Bipartite K-core", unit=" passes")
     pass_count = 0
+    max_passes = 20  # Safety limit
+
     while True:
         pass_count += 1
         filter_pbar.update(1)
+
+        # Count with Counter
+        user_counter = Counter(df["user_id"].values)
+        item_counter = Counter(df["item_id"].values)
+
+        # Get valid indices using numpy (vectorized, fast)
+        valid_user_ids = np.array([u for u, c in user_counter.items() if c >= min_user_interactions])
+        valid_item_ids = np.array([it for it, c in item_counter.items() if c >= min_item_interactions])
+
         prev_len = len(df)
-
-        user_counts = df["user_id"].value_counts()
-        valid_users = set(user_counts[user_counts >= min_user_interactions].index)
-
-        item_counts = df["item_id"].value_counts()
-        valid_items = set(item_counts[item_counts >= min_item_interactions].index)
-
-        df = df[df["user_id"].isin(valid_users) & df["item_id"].isin(valid_items)]
-
-        if len(df) == prev_len:
+        if prev_len == 0:
             break
+
+        # Use numpy's isin for vectorized filtering
+        user_arr = df["user_id"].values
+        item_arr = df["item_id"].values
+
+        mask_users = np.isin(user_arr, valid_user_ids)
+        mask_items = np.isin(item_arr, valid_item_ids)
+
+        df = df[mask_users & mask_items].reset_index(drop=True)
+
+        if len(df) == prev_len or pass_count >= max_passes:
+            if pass_count >= max_passes:
+                logger.warning(f"K-core filtering reached max passes ({max_passes}).")
+            break
+
     filter_pbar.close()
-    logger.info(f"Bipartite K-core converged in {pass_count} passes. Final interactions: {len(df)}.")
+    logger.info(f"Bipartite K-core converged in {pass_count} passes. Final: {len(df)} interactions.")
 
     # 4. Create contiguous 0-indexed mappings
     unique_users = sorted(df["user_id"].unique())

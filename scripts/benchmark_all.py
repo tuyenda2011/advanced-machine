@@ -28,7 +28,7 @@ logger = setup_logger("benchmark_all")
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Comprehensive Academic Benchmark Suite for LightGCN, SGL, SimGCL, XSimGCL, DirectAU under Sparsity"
+        description="Comprehensive Academic Benchmark Suite for 4 SOTA Graph Models (LightGCN, XSimGCL, DirectAU, AdaptiveGCL) under Sparsity"
     )
     parser.add_argument(
         "--models",
@@ -37,7 +37,7 @@ def main():
         help="List of models to benchmark (default: 4 SOTA models: LightGCN, XSimGCL, DirectAU, AdaptiveGCL)",
     )
     parser.add_argument(
-        "--quick", action="store_true", help="Quick mode: 1 seed, 5 epochs, 100% data only"
+        "--quick", action="store_true", help="Quick mode: 1 seed, 5 epochs, 100%% data only"
     )
     parser.add_argument(
         "--epochs", type=int, default=None, help="Override epochs for all benchmark runs"
@@ -53,7 +53,7 @@ def main():
     else:
         sparsity_levels = [1.0, 0.75, 0.50, 0.25]
         seeds = [42, 2025, 3407]
-        epochs = args.epochs if args.epochs is not None else 50
+        epochs = args.epochs if args.epochs is not None else 100
         logger.info(
             f"Running FULL BENCHMARK SUITE ({len(models)} models x {len(sparsity_levels)} sparsity levels x {len(seeds)} seeds = {len(models)*len(sparsity_levels)*len(seeds)} runs)..."
         )
@@ -69,12 +69,11 @@ def main():
     ]
 
     all_runs = []
-    pbar = tqdm(experiments, desc="Benchmark Suite Progress", unit="exp", dynamic_ncols=True)
+    total_experiments = len(experiments)
 
-    for model, sparsity, seed in pbar:
+    for idx, (model, sparsity, seed) in enumerate(experiments, start=1):
         sparsity_pct = int(sparsity * 100)
         sparsity_tag = f"s{sparsity_pct}"
-        pbar.set_postfix({"Model": model.upper(), "Sparsity": f"{sparsity_pct}%", "Seed": seed})
 
         run_file = os.path.join(
             results_dir, model, f"{model}_{sparsity_tag}_seed{seed}.json"
@@ -89,14 +88,22 @@ def main():
             with open(run_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if "representation_metrics" in data and "subgroup_metrics" in data:
-                logger.info(f"Skipping existing completed run: {run_file}")
+                test_ndcg = data.get("test_metrics", {}).get("NDCG@10", 0.0)
+                test_recall = data.get("test_metrics", {}).get("Recall@10", 0.0)
+                print(
+                    f"[{idx:02d}/{total_experiments:02d}] ⏩ [ĐÃ CÓ KẾT QUẢ] Bỏ qua {model.upper():<12} | Sparsity: {sparsity_pct:>3}% | Seed: {seed:>4} | Test NDCG@10: {test_ndcg:.4f} | Recall@10: {test_recall:.4f}",
+                    flush=True,
+                )
                 all_runs.append(data)
                 continue
 
-
-        logger.info(
-            f"Executing run: model={model}, sparsity={sparsity}, seed={seed}, epochs={epochs}..."
+        print("\n" + "=" * 85, flush=True)
+        print(
+            f"[{idx:02d}/{total_experiments:02d}] 🚀 BẮT ĐẦU HUẤN LUYỆN: {model.upper()} | SPARSITY: {sparsity_pct}% | SEED: {seed} | MAX EPOCHS: {epochs}",
+            flush=True,
         )
+        print("=" * 85, flush=True)
+
         cmd = [
             sys.executable,
             "scripts/train.py",
@@ -108,26 +115,35 @@ def main():
             str(seed),
             "--epochs",
             str(epochs),
+            "--resume",
         ]
 
-        # Run train script as subprocess
+        # Run train script as subprocess with live streaming to terminal
         env = os.environ.copy()
         env["PYTHONPATH"] = "."
-        res = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        res = subprocess.run(cmd, env=env)
 
         if res.returncode != 0:
-            logger.error(
-                f"Error executing run {model} {sparsity_tag} seed {seed}:"
+            print(
+                f"[{idx:02d}/{total_experiments:02d}] ❌ [LỖI LƯỢT CHẠY] {model.upper():<12} | Sparsity: {sparsity_pct:>3}% | Seed: {seed:>4}",
+                flush=True,
             )
-            logger.error(res.stderr)
+            logger.error(
+                f"Error executing run {model} {sparsity_tag} seed {seed} (exit code: {res.returncode})"
+            )
             continue
 
         if os.path.exists(run_file):
             with open(run_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 all_runs.append(data)
-
-    pbar.close()
+                test_ndcg = data.get("test_metrics", {}).get("NDCG@10", 0.0)
+                test_recall = data.get("test_metrics", {}).get("Recall@10", 0.0)
+                best_epoch = data.get("best_epoch", 0)
+                print(
+                    f"[{idx:02d}/{total_experiments:02d}] ✅ [HOÀN THÀNH TRAIN] {model.upper():<12} | Sparsity: {sparsity_pct:>3}% | Seed: {seed:>4} | Best Epoch: {best_epoch:>2} | NDCG@10: {test_ndcg:.4f} | Recall@10: {test_recall:.4f}\n",
+                    flush=True,
+                )
 
     if not all_runs:
         logger.warning("No benchmark run results found.")

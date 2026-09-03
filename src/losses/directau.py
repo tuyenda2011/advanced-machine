@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.utils.geometry import batch_pairwise_uniformity
+
 
 class DirectAULoss(nn.Module):
     """Direct Alignment and Uniformity (DirectAU) Loss (KDD '22).
@@ -28,20 +30,16 @@ class DirectAULoss(nn.Module):
         return (u_norm - i_norm).norm(p=2, dim=-1).pow(2).mean()
 
     def compute_uniformity_loss(self, embeds_norm: torch.Tensor) -> torch.Tensor:
-        """Compute uniformity loss: log E_{x,y} [ exp(-t * ||x - y||^2) ]."""
+        """Compute uniformity loss: log E_{x,y} [ exp(-t * ||x - y||^2) ].
+
+        Uses batch-optimized pairwise uniformity computation.
+        """
         batch_size = embeds_norm.size(0)
         if batch_size <= 1:
             return torch.tensor(0.0, device=embeds_norm.device)
 
-        # Pairwise distance: ||x - y||^2 = 2 - 2 * <x, y>
-        sim_matrix = torch.matmul(embeds_norm, embeds_norm.T)
-        dist_sq = 2.0 - 2.0 * sim_matrix.clamp(min=-1.0, max=1.0)
-
-        # Exclude self-distances (diagonal elements)
-        mask = ~torch.eye(batch_size, dtype=torch.bool, device=embeds_norm.device)
-        exp_dist = torch.exp(-self.t * dist_sq[mask])
-
-        return torch.log(exp_dist.mean() + 1e-12)
+        uniformity = batch_pairwise_uniformity(embeds_norm, t=self.t)
+        return torch.tensor(uniformity, device=embeds_norm.device)
 
     def forward(
         self,

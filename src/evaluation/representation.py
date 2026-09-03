@@ -121,12 +121,8 @@ def compute_svd_spectrum(
     # Center embeddings
     centered_emb = embeddings - embeddings.mean(dim=0, keepdim=True)
 
-    # Compute SVD singular values
-    try:
-        singular_vals = torch.linalg.svdvals(centered_emb)
-        s_np = singular_vals.detach().cpu().numpy()
-    except Exception:
-        _, s_np, _ = np.linalg.svd(centered_emb.detach().cpu().numpy(), full_matrices=False)
+    # Compute SVD singular values with proper error handling
+    s_np = _compute_svd_singular_values(centered_emb)
 
     total_energy = np.sum(s_np ** 2) + 1e-12
     norm_s = s_np / (np.sum(s_np) + 1e-12)
@@ -138,13 +134,57 @@ def compute_svd_spectrum(
 
     cum_energy = np.cumsum(s_np ** 2) / total_energy
 
+    # Compute spectral decay rate with safe indexing
+    s_len = len(s_np)
+    if s_len > 1:
+        spectral_decay = float(s_np[0] / (s_np[min(s_len - 1, 9)] + 1e-12))
+    else:
+        spectral_decay = 1.0
+
     return {
         "singular_values": s_np[:top_k].tolist(),
         "normalized_singular_values": norm_s[:top_k].tolist(),
         "cumulative_energy": cum_energy[:top_k].tolist(),
         "effective_rank": effective_rank,
-        "spectral_decay_rate": float(s_np[0] / (s_np[min(len(s_np) - 1, 9)] + 1e-12)),
+        "spectral_decay_rate": spectral_decay,
     }
+
+
+def _compute_svd_singular_values(centered_emb: torch.Tensor) -> np.ndarray:
+    """Compute SVD singular values with fallback handling.
+
+    Args:
+        centered_emb: Centered embedding tensor
+
+    Returns:
+        NumPy array of singular values
+
+    Raises:
+        RuntimeError: If both PyTorch and NumPy SVD fail
+    """
+    # Try PyTorch's optimized SVD first
+    try:
+        singular_vals = torch.linalg.svdvals(centered_emb)
+        return singular_vals.detach().cpu().numpy()
+    except (RuntimeError, AttributeError) as pytorch_err:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.debug(f"PyTorch SVD failed ({pytorch_err}), falling back to NumPy SVD")
+
+    # Fallback to NumPy SVD
+    try:
+        _, s_np, _ = np.linalg.svd(
+            centered_emb.detach().cpu().numpy(),
+            full_matrices=False
+        )
+        return s_np
+    except Exception as numpy_err:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"Both PyTorch and NumPy SVD failed: {numpy_err}")
+        raise RuntimeError(
+            f"Failed to compute SVD: PyTorch error={pytorch_err}, NumPy error={numpy_err}"
+        ) from numpy_err
 
 
 def compute_oversmoothing_analysis(
@@ -158,7 +198,7 @@ def compute_oversmoothing_analysis(
     Computes Dirichlet Energy / Mean Cosine Distance across layers l in [0, max_layers].
 
     Args:
-        model: Trained recommendation model (LightGCN, SGL, or SimGCL)
+        model: Trained recommendation model (LightGCN, XSimGCL, DirectAU, or AdaptiveGCL)
         norm_adj: Normalized bipartite adjacency sparse tensor
         max_layers: Maximum layer depth to evaluate
         sample_nodes: Number of nodes sampled to compute pairwise cosine distance
