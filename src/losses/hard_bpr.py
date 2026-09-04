@@ -39,10 +39,20 @@ class HardNegativeBPRLoss(nn.Module):
 
         # Margin penalty against explicit disliked items (if available)
         if hard_neg_emb is not None and self.alpha > 0.0:
-            hard_neg_scores = torch.sum(user_emb * hard_neg_emb, dim=-1)
-            # Penalize if hard_neg_score > pos_score - margin
-            hard_penalty = F.relu(hard_neg_scores - pos_scores + self.margin)
-            hard_loss = torch.mean(hard_penalty)
-            return bpr_loss + self.alpha * hard_loss
+            return bpr_loss + self.compute_hard_penalty(
+                user_emb, pos_item_emb, hard_neg_emb
+            )
 
         return bpr_loss
+
+    def compute_hard_penalty(
+        self,
+        user_emb: torch.Tensor,
+        pos_item_emb: torch.Tensor,
+        hard_neg_emb: torch.Tensor,
+    ) -> torch.Tensor:
+        """Penalize explicit dislikes that outrank a user's positive item."""
+        pos_scores = torch.sum(user_emb * pos_item_emb, dim=-1)
+        hard_neg_scores = torch.sum(user_emb * hard_neg_emb, dim=-1)
+        margin_loss = F.relu(hard_neg_scores - pos_scores + self.margin).mean()
+        return self.alpha * margin_loss

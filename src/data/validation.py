@@ -12,6 +12,13 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+RAW_COLUMN_ALIASES = {
+    "reviewerID": "user_id",
+    "asin": "item_id",
+    "overall": "rating",
+    "unixReviewTime": "timestamp",
+}
+
 try:  # pragma: no cover - exercised only when GE is installed
     import great_expectations as gx
 
@@ -33,6 +40,7 @@ def _format_violations(violations: list[str]) -> str:
 
 def _fallback_validate_interactions(df: pd.DataFrame) -> list[str]:
     """Pandas-assertion mirror of the interaction schema expectations."""
+    df = df.rename(columns=RAW_COLUMN_ALIASES)
     violations = []
 
     required = {"user_id", "item_id", "rating", "timestamp"}
@@ -41,31 +49,29 @@ def _fallback_validate_interactions(df: pd.DataFrame) -> list[str]:
         violations.append(f"missing required columns: {sorted(missing)}")
         return violations
 
-    tracked_cols = set()
-    for col in ("user_id", "item_id", "timestamp"):
+    for col in ("user_id", "item_id"):
         n_null = int(df[col].isna().sum())
         if n_null:
             violations.append(f"{col}: {n_null} null values (expected 0)")
-            tracked_cols.add(col)
-        non_numeric = df[~df[col].apply(lambda v: isinstance(v, (int, float)) and not pd.isna(v))]
-        if len(non_numeric):
-            violations.append(f"{col}: {len(non_numeric)} non-numeric values")
-            tracked_cols.add(col)
+        empty = df[col].notna() & df[col].astype(str).str.strip().eq("")
+        if empty.any():
+            violations.append(f"{col}: {int(empty.sum())} empty values")
+        numeric_ids = pd.to_numeric(df[col], errors="coerce")
+        numeric_values = numeric_ids[df[col].notna() & numeric_ids.notna()]
+        if (numeric_values <= 0).any():
+            violations.append(f"{col}: {int((numeric_values <= 0).sum())} values <= 0")
 
-    for col in ("user_id", "item_id"):
-        if col in tracked_cols:
-            continue  # type/null issues already reported; skip follow-up range check
-        bad = df[(df[col] <= 0) & df[col].notna()]
-        if len(bad):
-            violations.append(f"{col}: {len(bad)} values <= 0")
-
-    bad_rating = df[~df["rating"].between(1, 5, inclusive="both")]
+    rating = pd.to_numeric(df["rating"], errors="coerce")
+    bad_rating = rating.isna() | ~rating.between(1, 5, inclusive="both")
     if len(bad_rating):
-        violations.append(f"rating: {len(bad_rating)} values outside [1, 5]")
+        bad_count = int(bad_rating.sum())
+        if bad_count:
+            violations.append(f"rating: {bad_count} invalid values or outside [1, 5]")
 
-    bad_ts = df[df["timestamp"].notna() & (df["timestamp"] < 0)]
-    if len(bad_ts):
-        violations.append(f"timestamp: {len(bad_ts)} negative values")
+    timestamp = pd.to_numeric(df["timestamp"], errors="coerce")
+    bad_ts = timestamp.isna() | (timestamp < 0)
+    if bad_ts.any():
+        violations.append(f"timestamp: {int(bad_ts.sum())} invalid or negative values")
 
     return violations
 
@@ -147,14 +153,7 @@ def validate_interactions(
     """
     logger.info("Validating interactions table (%d rows)...", len(df))
 
-    if GE_AVAILABLE:
-        try:
-            violations = _ge_validate(df, INTERACTION_EXPECTATIONS, "interactions", html_report_dir)
-        except Exception as exc:  # pragma: no cover - depends on GE runtime quirks
-            logger.warning("Great Expectations failed (%s); falling back to pandas validator.", exc)
-            violations = _fallback_validate_interactions(df)
-    else:
-        violations = _fallback_validate_interactions(df)
+    violations = _fallback_validate_interactions(df)
 
     if violations:
         detail = _format_violations(violations)
@@ -164,6 +163,38 @@ def validate_interactions(
     else:
         logger.info("Interactions validation PASSED.")
 
+    return violations
+
+
+def validate_processed_interactions(
+    df: pd.DataFrame,
+    raise_on_error: bool = True,
+) -> list[str]:
+    """Validate mapped interaction data used by training and evaluation."""
+    violations = []
+    required = {"u_idx", "i_idx", "timestamp"}
+    missing = required - set(df.columns)
+    if missing:
+        violations.append(f"missing required columns: {sorted(missing)}")
+    else:
+        for column in ("u_idx", "i_idx", "timestamp"):
+            values = pd.to_numeric(df[column], errors="coerce")
+            invalid = values.isna() | (values < 0)
+            if invalid.any():
+                violations.append(
+                    f"{column}: {int(invalid.sum())} invalid or negative values"
+                )
+        duplicates = int(df.duplicated(["u_idx", "i_idx"]).sum())
+        if duplicates:
+            violations.append(f"interactions: {duplicates} duplicate user-item pairs")
+
+    if violations:
+        detail = _format_violations(violations)
+        if raise_on_error:
+            raise ValidationError(detail)
+        logger.error("Processed interaction validation issues:\n%s", detail)
+    else:
+        logger.info("Processed interactions validation PASSED.")
     return violations
 
 

@@ -130,24 +130,29 @@ class XSimGCLStrategy(LossStrategy):
         if neg_batch is None:
             raise ValueError("XSimGCLStrategy requires negative samples")
 
-        u_embeds, i_embeds = model(norm_adj)
+        u_embeds, i_embeds, cl_u_embeds, cl_i_embeds = model(
+            norm_adj, perturbed=True
+        )
         pos_scores = (u_embeds[u_batch] * i_embeds[pos_batch]).sum(dim=-1)
         neg_scores = (u_embeds[u_batch] * i_embeds[neg_batch]).sum(dim=-1)
 
-        u_emb0 = model.user_embedding(u_batch)
-        pos_emb0 = model.item_embedding(pos_batch)
-        neg_emb0 = model.item_embedding(neg_batch)
+        u_emb0 = u_embeds[u_batch]
+        pos_emb0 = i_embeds[pos_batch]
+        neg_emb0 = None
 
         total_loss, bpr_loss = self.bpr_loss_fn(
             pos_scores, neg_scores, u_emb0, pos_emb0, neg_emb0
         )
 
-        # Contrastive SSL loss
-        u_p1, i_p1 = model.forward_perturbed(u_embeds, i_embeds)
-        u_p2, i_p2 = model.forward_perturbed(u_embeds, i_embeds)
-
-        cl_loss = self.cl_loss_fn(
-            u_p1[u_batch], u_p2[u_batch], i_p1[pos_batch], i_p2[pos_batch]
+        unique_users = torch.unique(u_batch)
+        unique_items = torch.unique(pos_batch)
+        cl_loss = (
+            self.cl_loss_fn.compute_view_loss(
+                u_embeds[unique_users], cl_u_embeds[unique_users]
+            )
+            + self.cl_loss_fn.compute_view_loss(
+                i_embeds[unique_items], cl_i_embeds[unique_items]
+            )
         )
         total_loss = total_loss + self.contrastive_weight * cl_loss
 
@@ -252,8 +257,7 @@ class AdaptiveGCLStrategy(LossStrategy):
         extra_losses = {"cl_loss": cl_loss}
         if hasattr(model, "dirichlet_reg") and model.dirichlet_reg > 0:
             all_final = torch.cat([u_embeds, i_embeds], dim=0)
-            dir_energy = model.compute_dirichlet_energy(norm_adj, all_final)
-            dir_loss = model.dirichlet_reg * torch.clamp(1.0 - dir_energy, min=0.0)
+            dir_loss = model.compute_dirichlet_regularization(norm_adj, all_final)
             total_loss = total_loss + dir_loss
             extra_losses["dir_loss"] = dir_loss
 

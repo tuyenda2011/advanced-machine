@@ -24,6 +24,8 @@ class Evaluator:
         num_items: int,
         k_list: List[int] = [10, 20],
         batch_size: int = 1024,
+        candidate_items: Optional[Set[int]] = None,
+        popularity_df: Optional[pd.DataFrame] = None,
     ):
         self.num_users = num_users
         self.num_items = num_items
@@ -36,14 +38,21 @@ class Evaluator:
         )
 
         # Precompute item popularity for Novelty metric
+        popularity_source = popularity_df if popularity_df is not None else train_df
         self.item_popularity: Dict[int, int] = (
-            train_df["i_idx"].value_counts().to_dict()
+            popularity_source["i_idx"].value_counts().to_dict()
         )
 
         # Build ground truth target list for eval set users
         eval_grouped = eval_df.groupby("u_idx")["i_idx"].apply(list).to_dict()
         self.eval_users = sorted(list(eval_grouped.keys()))
         self.ground_truth = [eval_grouped[u] for u in self.eval_users]
+        if candidate_items is None:
+            self.excluded_candidates: List[int] = []
+        else:
+            self.excluded_candidates = sorted(
+                set(range(num_items)) - set(candidate_items)
+            )
 
     # Constant for masking seen items
     MASK_VALUE: float = -1e9
@@ -80,19 +89,26 @@ class Evaluator:
             # Compute rating scores matrix (batch_users, num_items)
             scores = torch.matmul(final_user_embeds[u_tensors], final_item_embeds.T)
 
-            # Batch mask training seen items - collect all seen items first
-            all_seen_items = set()
-            for u in batch_u_idx:
-                seen = self.train_history.get(u, None)
-                if seen:
-                    all_seen_items.update(seen)
-
-            # Apply mask in one operation instead of per-user loop
-            if all_seen_items:
-                seen_tensor = torch.tensor(
-                    list(all_seen_items), dtype=torch.long, device=device
+            if self.excluded_candidates:
+                excluded_tensor = torch.tensor(
+                    self.excluded_candidates, dtype=torch.long, device=device
                 )
-                scores[:, seen_tensor] = self.MASK_VALUE
+                scores[:, excluded_tensor] = self.MASK_VALUE
+
+            # Mask each user's own history. A batch-wide union would hide valid
+            # targets whenever another user happened to have seen the same item.
+            seen_rows = []
+            seen_items = []
+            for row, u in enumerate(batch_u_idx):
+                seen = self.train_history.get(u)
+                if seen:
+                    seen_rows.extend([row] * len(seen))
+                    seen_items.extend(seen)
+
+            if seen_rows:
+                row_tensor = torch.tensor(seen_rows, dtype=torch.long, device=device)
+                item_tensor = torch.tensor(seen_items, dtype=torch.long, device=device)
+                scores[row_tensor, item_tensor] = self.MASK_VALUE
 
             # Retrieve top-K recommended item IDs
             _, topk_indices = torch.topk(scores, k=max_k, dim=1)

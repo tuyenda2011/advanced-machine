@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,7 +18,7 @@ class BPRLoss(nn.Module):
         neg_scores: torch.Tensor,
         u_emb0: torch.Tensor,
         pos_emb0: torch.Tensor,
-        neg_emb0: torch.Tensor,
+        neg_emb0: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute BPR Loss and L2 Regularization Loss.
 
@@ -25,7 +27,7 @@ class BPRLoss(nn.Module):
             neg_scores: Inner product scores for negative user-item pairs (batch_size,)
             u_emb0: Initial user embeddings (batch_size, dim)
             pos_emb0: Initial positive item embeddings (batch_size, dim)
-            neg_emb0: Initial negative item embeddings (batch_size, dim)
+            neg_emb0: Optional negative item embeddings for L2 regularization
 
         Returns:
             total_loss: BPR loss + L2 regularization loss
@@ -35,11 +37,10 @@ class BPRLoss(nn.Module):
         bpr_loss = torch.mean(F.softplus(neg_scores - pos_scores))
 
         # L2 Regularization on initial embeddings (e0)
-        reg_loss = (
-            u_emb0.norm(2).pow(2)
-            + pos_emb0.norm(2).pow(2)
-            + neg_emb0.norm(2).pow(2)
-        ) / (2.0 * pos_scores.shape[0])
+        reg_sum = u_emb0.norm(2).pow(2) + pos_emb0.norm(2).pow(2)
+        if neg_emb0 is not None:
+            reg_sum = reg_sum + neg_emb0.norm(2).pow(2)
+        reg_loss = reg_sum / (2.0 * pos_scores.shape[0])
 
         total_loss = bpr_loss + self.weight_decay * reg_loss
         return total_loss, bpr_loss

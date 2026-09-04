@@ -87,6 +87,7 @@ if PYDANTIC_AVAILABLE:
         min_user_interactions: int = Field(default=5, ge=1)
         min_item_interactions: int = Field(default=5, ge=1)
         split_ratios: List[float] = Field(default=[0.8, 0.1, 0.1])
+        split_seed: int = Field(default=42, ge=0)
 
         @field_validator("split_ratios")
         @classmethod
@@ -110,6 +111,7 @@ if PYDANTIC_AVAILABLE:
         epochs: int = Field(default=100, ge=1, le=10000)
         early_stopping_patience: int = Field(default=20, ge=1)
         seed: int = Field(default=42, ge=0)
+        num_workers: int = Field(default=0, ge=0)
 
     class AdaptiveGCLConfig(BaseModel):
         """AdaptiveGCL-specific configuration schema."""
@@ -117,6 +119,10 @@ if PYDANTIC_AVAILABLE:
         ssl_temp: float = Field(default=0.2, gt=0, le=2.0)
         ssl_reg: float = Field(default=0.1, ge=0, le=10.0)
         dirichlet_reg: float = Field(default=0.01, ge=0, le=1.0)
+        node_dropout: float = Field(default=0.0, ge=0, lt=1.0)
+        tau_plus: float = Field(default=0.1, ge=0, lt=1.0)
+        hard_neg_alpha: float = Field(default=0.2, ge=0)
+        hard_neg_margin: float = Field(default=0.5, ge=0)
 
 
 def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:

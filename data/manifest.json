@@ -1,15 +1,57 @@
 {
-  "run_id": "test_unit_run",
-  "created_at": "2026-08-23T10:54:35.536704+00:00",
-  "source": "D:\\advanced-machine\\temp_test_ingest\\source",
-  "mode": "copy",
-  "num_files": 1,
-  "files": [
+  "dataset": "amazon-electronics",
+  "created_at": "2026-09-04T06:23:54.595067+00:00",
+  "source_files": [
     {
-      "path": "raw/test_unit_run/test1.txt",
-      "sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
-      "size_bytes": 11,
-      "original_name": "test1.txt"
+      "path": "data/raw/amazon-electronics/reviews_Electronics_5.json.gz",
+      "size_bytes": 495854086
+    },
+    {
+      "path": "data/raw/amazon-electronics/meta_Electronics.json.gz",
+      "size_bytes": 186594679
     }
-  ]
+  ],
+  "preprocessing": {
+    "positive_rating_threshold": 4.0,
+    "min_user_interactions": 5,
+    "min_item_interactions": 5,
+    "requested_split_ratios": [
+      0.8,
+      0.1,
+      0.1
+    ],
+    "split_seed": 42,
+    "split_protocol": "exact_chronological_selected_users"
+  },
+  "statistics": {
+    "num_users": 124895,
+    "num_items": 44843,
+    "num_interactions": 1072740,
+    "density": 0.00019153791836615673,
+    "mean_user_interactions": 8.589134873293567,
+    "median_user_interactions": 6.0,
+    "min_user_interactions": 5,
+    "max_user_interactions": 354,
+    "mean_item_interactions": 23.922128314341144,
+    "min_item_interactions": 5,
+    "train_interactions": 858192,
+    "validation_interactions": 107274,
+    "test_interactions": 107274,
+    "actual_split_ratios": [
+      0.8,
+      0.1,
+      0.1
+    ],
+    "validation_cold_start_targets": 114,
+    "test_cold_start_targets": 316,
+    "hard_negative_interactions": 65854
+  },
+  "text_features": {
+    "encoder": "sentence-transformers/all-MiniLM-L6-v2",
+    "shape": [
+      44843,
+      384
+    ],
+    "normalized": true
+  }
 }

@@ -36,10 +36,9 @@ class DirectAULoss(nn.Module):
         """
         batch_size = embeds_norm.size(0)
         if batch_size <= 1:
-            return torch.tensor(0.0, device=embeds_norm.device)
+            return embeds_norm.sum() * 0.0
 
-        uniformity = batch_pairwise_uniformity(embeds_norm, t=self.t)
-        return torch.tensor(uniformity, device=embeds_norm.device)
+        return batch_pairwise_uniformity(embeds_norm, t=self.t)
 
     def forward(
         self,

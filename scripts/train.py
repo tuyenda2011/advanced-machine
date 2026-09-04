@@ -18,12 +18,14 @@ import pandas as pd
 import torch
 
 from src.data.sparsity import create_sparse_train_set
+from src.data.text_encoder import build_user_history_features
 from src.evaluation.evaluator import Evaluator
 from src.models.adaptive_gcl import AdaptiveGCL
 from src.models.directau import DirectAU
 from src.models.lightgcn import LightGCN
 from src.models.xsimgcl import XSimGCL
 from src.training.trainer import Trainer
+from src.utils.checkpoints import get_experiment_fingerprint
 from src.utils.config import load_config
 from src.utils.device import get_device
 from src.utils.logging import setup_logger
@@ -96,7 +98,7 @@ def append_to_model_results_csv(results: dict, model_name: str, sparsity: float,
 
 def main():
     parser = argparse.ArgumentParser(description="Train Graph Recommendation Models (LightGCN, XSimGCL, DirectAU, AdaptiveGCL)")
-    parser.add_argument("--model", type=str, required=True, choices=["lightgcn", "xsimgcl", "directau", "adaptive_gcl"], help="Model name (4 SOTA models)")
+    parser.add_argument("--model", type=str, required=True, choices=["lightgcn", "xsimgcl", "directau", "adaptive_gcl"], help="Model name")
     parser.add_argument("--sparsity", type=float, default=1.0, help="Sparsity ratio for training edges (0.25 to 1.0)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--epochs", type=int, default=None, help="Override number of training epochs")
@@ -113,6 +115,9 @@ def main():
     # 3. Load config
     config = load_config(args.model, args.config_dir)
     config["training"]["seed"] = args.seed
+    config["experiment_fingerprint"] = get_experiment_fingerprint(
+        args.model, args.config_dir
+    )
     if args.epochs is not None:
         config["training"]["epochs"] = args.epochs
 
@@ -140,10 +145,36 @@ def main():
     # 5. Apply sparsity sampling to training set (Validation & Test stay 100% fixed)
     train_df_sparse = create_sparse_train_set(train_df, sparsity_ratio=args.sparsity, seed=args.seed)
 
-    # 6. Initialize evaluators
+    # 6. Initialize warm-start evaluators. Models learn from sparse train data,
+    # while all known positives remain excluded from recommendation candidates.
     top_k_list = config["evaluation"]["top_k"]
-    val_evaluator = Evaluator(train_df_sparse, val_df, num_users, num_items, k_list=top_k_list)
-    test_evaluator = Evaluator(train_df_sparse, test_df, num_users, num_items, k_list=top_k_list)
+    candidate_items = set(train_df_sparse["i_idx"].unique())
+    val_warm = val_df[val_df["i_idx"].isin(candidate_items)].reset_index(drop=True)
+    test_warm = test_df[test_df["i_idx"].isin(candidate_items)].reset_index(drop=True)
+    logger.info(
+        f"Warm-start evaluation targets: val={len(val_warm):,}/{len(val_df):,}, "
+        f"test={len(test_warm):,}/{len(test_df):,}"
+    )
+
+    val_evaluator = Evaluator(
+        train_df,
+        val_warm,
+        num_users,
+        num_items,
+        k_list=top_k_list,
+        candidate_items=candidate_items,
+        popularity_df=train_df_sparse,
+    )
+    test_history = pd.concat([train_df, val_df], ignore_index=True)
+    test_evaluator = Evaluator(
+        test_history,
+        test_warm,
+        num_users,
+        num_items,
+        k_list=top_k_list,
+        candidate_items=candidate_items,
+        popularity_df=train_df_sparse,
+    )
 
     # 7. Instantiate model
     emb_dim = config["model"]["embedding_dim"]
@@ -161,6 +192,7 @@ def main():
             contrastive_weight=xsim_cfg["contrastive_weight"],
             temperature=xsim_cfg["temperature"],
             epsilon=xsim_cfg["epsilon"],
+            contrastive_layer=xsim_cfg.get("contrastive_layer", 1),
         )
     elif args.model == "directau":
         dau_cfg = config["directau"]
@@ -181,8 +213,17 @@ def main():
             text_features = torch.load(text_emb_path, map_location="cpu", weights_only=False)
             text_dim = text_features.shape[1]
         else:
-            text_dim = ada_cfg.get("text_dim", 384)
-            logger.warning(f"Item text features not found at {text_emb_path}. Using fallback zero tensor.")
+            raise FileNotFoundError(
+                f"AdaptiveGCL requires item text features at {text_emb_path}. "
+                "Run scripts/prepare_data.py first."
+            )
+
+        user_history_features = None
+        if text_features is not None:
+            logger.info("Building user semantic profiles from sparse training history...")
+            user_history_features = build_user_history_features(
+                train_df_sparse, text_features, num_users
+            )
 
         model = AdaptiveGCL(
             num_users,
@@ -195,6 +236,8 @@ def main():
             ssl_reg=ada_cfg.get("ssl_reg", 0.1),
             dirichlet_reg=ada_cfg.get("dirichlet_reg", 0.01),
             node_dropout=ada_cfg.get("node_dropout", 0.0),
+            tau_plus=ada_cfg.get("tau_plus", 0.1),
+            user_history_features=user_history_features,
         )
 
 
@@ -204,12 +247,22 @@ def main():
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_path = os.path.join(checkpoint_dir, f"{args.model}_{sparsity_tag}_seed{args.seed}.pt")
 
-    trainer = Trainer(model, train_df_sparse, val_evaluator, test_evaluator, config, device)
+    trainer = Trainer(
+        model,
+        train_df_sparse,
+        val_evaluator,
+        test_evaluator,
+        config,
+        device,
+        user_disliked_items=mappings.get("user_disliked_items", {}),
+    )
     results = trainer.train(checkpoint_path, resume=args.resume)
 
     # 9. Save run results to JSON
     results["sparsity_level"] = args.sparsity
     results["seed"] = args.seed
+    results["max_epochs"] = config["training"]["epochs"]
+    results["experiment_fingerprint"] = config["experiment_fingerprint"]
 
     results_dir = os.path.join("results", "raw", args.model)
     os.makedirs(results_dir, exist_ok=True)
@@ -227,6 +280,7 @@ def main():
     global_best_meta_path = os.path.join(checkpoint_dir, f"{args.model}_best_meta.json")
     global_best_pt_path = os.path.join(checkpoint_dir, f"{args.model}_best.pt")
     
+    current_val_ndcg = results.get("val_metrics", {}).get("NDCG@10", 0.0)
     current_test_ndcg = results.get("test_metrics", {}).get("NDCG@10", 0.0)
     is_new_global_best = True
 
@@ -234,7 +288,7 @@ def main():
         try:
             with open(global_best_meta_path, "r", encoding="utf-8") as f:
                 prev_best = json.load(f)
-            if prev_best.get("NDCG@10", 0.0) >= current_test_ndcg:
+            if prev_best.get("Val_NDCG@10", float("-inf")) >= current_val_ndcg:
                 is_new_global_best = False
         except Exception:
             is_new_global_best = True
@@ -248,13 +302,17 @@ def main():
                 "sparsity": args.sparsity,
                 "seed": args.seed,
                 "best_epoch": results.get("best_epoch", 0),
+                "Val_NDCG@10": current_val_ndcg,
                 "NDCG@10": current_test_ndcg,
                 "Recall@10": results.get("test_metrics", {}).get("Recall@10", 0.0),
                 "Diversity@10": results.get("test_metrics", {}).get("Diversity@10", 0.0),
                 "Novelty@10": results.get("test_metrics", {}).get("Novelty@10", 0.0),
                 "source_checkpoint": checkpoint_path,
             }, f, indent=2)
-        logger.info(f"🏆 Updated GLOBAL BEST MODEL for {args.model.upper()} -> {global_best_pt_path} (Test NDCG@10: {current_test_ndcg:.4f})")
+        logger.info(
+            f"🏆 Updated GLOBAL BEST MODEL for {args.model.upper()} -> "
+            f"{global_best_pt_path} (Val NDCG@10: {current_val_ndcg:.4f})"
+        )
 
 
 if __name__ == "__main__":

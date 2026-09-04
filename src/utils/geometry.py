@@ -87,7 +87,7 @@ def compute_uniformity(
 def batch_pairwise_uniformity(
     embeds: torch.Tensor,
     t: float = 2.0,
-) -> float:
+) -> torch.Tensor:
     """Compute uniformity loss for a batch of embeddings (used in DirectAU loss).
 
     Optimized version for mini-batch computations without sampling.
@@ -97,11 +97,11 @@ def batch_pairwise_uniformity(
         t: Temperature scale factor
 
     Returns:
-        float: Uniformity score
+        Differentiable scalar uniformity loss.
     """
     batch_size = embeds.size(0)
     if batch_size <= 1:
-        return 0.0
+        return embeds.sum() * 0.0
 
     norm_embeds = F.normalize(embeds, dim=-1)
     sim_matrix = torch.matmul(norm_embeds, norm_embeds.T)
@@ -111,4 +111,4 @@ def batch_pairwise_uniformity(
     mask = ~torch.eye(batch_size, dtype=torch.bool, device=embeds.device)
     exp_dist = torch.exp(-t * dist_sq[mask])
 
-    return torch.log(exp_dist.mean() + 1e-12).item()
+    return torch.log(exp_dist.mean() + 1e-12)

@@ -1,53 +1,134 @@
+"""Audit processed recommendation data and fail on invalid benchmark inputs."""
+
+import json
 import pickle
-import torch
+import sys
+from pathlib import Path
+
 import pandas as pd
-import numpy as np
+import torch
 
-with open("data/processed/mappings.pkl", "rb") as f:
-    mappings = pickle.load(f)
-stats = mappings["stats"]
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
 
-train_df = pd.read_parquet("data/processed/train.parquet")
-val_df = pd.read_parquet("data/processed/val.parquet")
-test_df = pd.read_parquet("data/processed/test.parquet")
-disliked_df = pd.read_parquet("data/processed/disliked_interactions.parquet")
-text_emb = torch.load("data/processed/item_text_embeddings.pt", weights_only=False)
+from src.data.splitter import verify_no_leakage
+from src.data.validation import validate_processed_interactions
 
-u_cnt = train_df.groupby("u_idx").size()
-i_cnt = train_df.groupby("i_idx").size()
 
-train_u, train_i = set(train_df["u_idx"]), set(train_df["i_idx"])
-val_u, val_i = set(val_df["u_idx"]), set(val_df["i_idx"])
-test_u, test_i = set(test_df["u_idx"]), set(test_df["i_idx"])
-tot = len(train_df) + len(val_df) + len(test_df)
+PROCESSED_DIR = REPO_ROOT / "data" / "processed"
+EXPECTED_RATIOS = {"train": 0.8, "validation": 0.1, "test": 0.1}
 
-print("=== DATASET OVERVIEW ===")
-print(f"Users: {stats['num_users']:,}")
-print(f"Items: {stats['num_items']:,}")
-print(f"Total 5-core interactions: {stats['num_interactions']:,}")
-print(f"Density: {stats['density']:.6%}")
 
-print("\n=== SPLIT PROPORTIONS ===")
-print(f"Train: {len(train_df):,} ({len(train_df)/tot*100:.2f}%)")
-print(f"Val:   {len(val_df):,} ({len(val_df)/tot*100:.2f}%)")
-print(f"Test:  {len(test_df):,} ({len(test_df)/tot*100:.2f}%)")
-print(f"Disliked Pool (1-2 stars): {len(disliked_df):,}")
+def main() -> int:
+    errors = []
+    warnings = []
 
-print("\n=== GRAPH CONNECTIVITY (ZERO LEAKAGE) ===")
-print(f"Disconnected Val Users: {len(val_u - train_u)}")
-print(f"Disconnected Val Items: {len(val_i - train_i)}")
-print(f"Disconnected Test Users: {len(test_u - train_u)}")
-print(f"Disconnected Test Items: {len(test_i - train_i)}")
+    required = {
+        "train": PROCESSED_DIR / "train.parquet",
+        "validation": PROCESSED_DIR / "val.parquet",
+        "test": PROCESSED_DIR / "test.parquet",
+        "mappings": PROCESSED_DIR / "mappings.pkl",
+        "text": PROCESSED_DIR / "item_text_embeddings.pt",
+    }
+    missing = [str(path) for path in required.values() if not path.exists()]
+    if missing:
+        print(f"AUDIT FAILED: missing artifacts: {missing}")
+        return 1
 
-print("\n=== USER DEGREE IN TRAIN SET ===")
-print(f"Min: {u_cnt.min()}, 25%: {u_cnt.quantile(0.25)}, Median: {u_cnt.median()}, Mean: {u_cnt.mean():.2f}, 75%: {u_cnt.quantile(0.75)}, Max: {u_cnt.max()}")
+    frames = {
+        "train": pd.read_parquet(required["train"]),
+        "validation": pd.read_parquet(required["validation"]),
+        "test": pd.read_parquet(required["test"]),
+    }
+    with open(required["mappings"], "rb") as file:
+        mappings = pickle.load(file)
 
-print("\n=== ITEM DEGREE IN TRAIN SET ===")
-print(f"Min: {i_cnt.min()}, 25%: {i_cnt.quantile(0.25)}, Median: {i_cnt.median()}, Mean: {i_cnt.mean():.2f}, 75%: {i_cnt.quantile(0.75)}, Max: {i_cnt.max()}")
+    for name, frame in frames.items():
+        violations = validate_processed_interactions(frame, raise_on_error=False)
+        errors.extend(f"{name}: {violation}" for violation in violations)
 
-norms = torch.norm(text_emb, dim=-1)
-print("\n=== TEXT EMBEDDINGS TENSOR ===")
-print(f"Shape: {text_emb.shape}")
-print(f"Has NaN: {torch.isnan(text_emb).any().item()}")
-print(f"Has Inf: {torch.isinf(text_emb).any().item()}")
-print(f"L2 Norm Min: {norms.min().item():.4f}, Max: {norms.max().item():.4f}, Mean: {norms.mean().item():.4f}")
+    _, leakage = verify_no_leakage(
+        frames["train"], frames["validation"], frames["test"], raise_on_error=False
+    )
+    if any(leakage.values()):
+        errors.append(f"split overlap detected: {leakage}")
+
+    total = sum(len(frame) for frame in frames.values())
+    actual_ratios = {name: len(frame) / total for name, frame in frames.items()}
+    for name, expected in EXPECTED_RATIOS.items():
+        if abs(actual_ratios[name] - expected) > 1 / total:
+            errors.append(
+                f"{name} ratio is {actual_ratios[name]:.6f}, expected {expected:.6f}"
+            )
+
+    train = frames["train"]
+    train_users = set(train["u_idx"])
+    train_items = set(train["i_idx"])
+    for name in ("validation", "test"):
+        frame = frames[name]
+        unseen_users = set(frame["u_idx"]) - train_users
+        if unseen_users:
+            errors.append(f"{name}: {len(unseen_users)} users absent from train")
+        cold_targets = int((~frame["i_idx"].isin(train_items)).sum())
+        if cold_targets:
+            warnings.append(
+                f"{name}: {cold_targets} cold-start targets excluded from warm-start metrics"
+            )
+
+    train_max = train.groupby("u_idx")["timestamp"].max()
+    for name in ("validation", "test"):
+        eval_min = frames[name].groupby("u_idx")["timestamp"].min()
+        violations = int((train_max.loc[eval_min.index] > eval_min).sum())
+        if violations:
+            errors.append(f"{name}: {violations} users violate chronological ordering")
+
+    num_users = len(mappings["user2id"])
+    num_items = len(mappings["item2id"])
+    all_rows = pd.concat(frames.values(), ignore_index=True)
+    if set(all_rows["u_idx"].unique()) != set(range(num_users)):
+        errors.append("user indices are not contiguous")
+    if set(all_rows["i_idx"].unique()) != set(range(num_items)):
+        errors.append("item indices are not contiguous")
+
+    text_embeddings = torch.load(required["text"], map_location="cpu", weights_only=False)
+    if not isinstance(text_embeddings, torch.Tensor):
+        errors.append("text embedding artifact is not a tensor")
+        text_shape = None
+    else:
+        text_shape = list(text_embeddings.shape)
+        if text_embeddings.ndim != 2 or text_embeddings.shape[0] != num_items:
+            errors.append(
+                f"text embedding shape {text_shape} does not match {num_items} items"
+            )
+        if not torch.isfinite(text_embeddings).all():
+            errors.append("text embeddings contain NaN or Inf")
+
+    negative_path = PROCESSED_DIR / "disliked_interactions.parquet"
+    if negative_path.exists():
+        negatives = pd.read_parquet(negative_path)
+        cutoffs = negatives["u_idx"].map(train_max)
+        future_negatives = int((cutoffs.isna() | (negatives["timestamp"] > cutoffs)).sum())
+        if future_negatives:
+            errors.append(f"hard negatives contain {future_negatives} future interactions")
+
+    report = {
+        "status": "PASS" if not errors else "FAIL",
+        "counts": {name: len(frame) for name, frame in frames.items()},
+        "ratios": actual_ratios,
+        "num_users": num_users,
+        "num_items": num_items,
+        "text_embedding_shape": text_shape,
+        "errors": errors,
+        "warnings": warnings,
+    }
+    report_path = PROCESSED_DIR / "audit_report.json"
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    print("=== DATA AUDIT ===")
+    print(json.dumps(report, indent=2))
+    print(f"Audit report: {report_path}")
+    return 0 if not errors else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

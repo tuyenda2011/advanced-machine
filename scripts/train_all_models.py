@@ -25,14 +25,14 @@ logger = setup_logger("train_all_models")
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run training and evaluation for all 4 SOTA Graph Recommendation Models (LightGCN, XSimGCL, DirectAU, AdaptiveGCL) under specific or all sparsity levels."
+        description="Train and evaluate LightGCN, XSimGCL, DirectAU, and AdaptiveGCL under one or all sparsity levels."
     )
     parser.add_argument(
         "--models",
         nargs="+",
         default=["lightgcn", "xsimgcl", "directau", "adaptive_gcl"],
         choices=["lightgcn", "xsimgcl", "directau", "adaptive_gcl"],
-        help="List of models to train sequentially (default: 4 SOTA models: LightGCN, XSimGCL, DirectAU, AdaptiveGCL)",
+        help="Models to train sequentially (default: LightGCN, XSimGCL, DirectAU, AdaptiveGCL)",
     )
     parser.add_argument(
         "--sparsity",
@@ -74,7 +74,7 @@ def main():
     start_total_time = time.perf_counter()
 
     print("=" * 85)
-    print("🚀 GRAPH CONTRASTIVE RECSYS SUITE: SEQUENTIAL 3-MODEL MULTI-SPARSITY RUNNER")
+    print("🚀 GRAPH RECSYS SUITE: SEQUENTIAL 4-MODEL MULTI-SPARSITY RUNNER")
     print(f"📅 Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"🎯 Target Models: {', '.join([m.upper() for m in args.models])}")
     print(f"📊 Sparsity Levels: {', '.join([f'{int(s*100)}%' for s in sparsity_list])} | Seed: {args.seed}")
@@ -142,7 +142,7 @@ def main():
     # Display comparison table
     if completed_runs:
         print("\n" + "=" * 105)
-        print("🏆 3-MODEL BENCHMARK RESULTS COMPARISON")
+        print("🏆 4-MODEL BENCHMARK RESULTS COMPARISON")
         print("=" * 105)
 
         summary_rows = []
@@ -179,7 +179,7 @@ def main():
         comparison_filename = (
             f"models_all_sparsity_seed{args.seed}.csv"
             if len(sparsity_list) > 1
-            else f"three_models_comparison_s{int(sparsity_list[0]*100)}_seed{args.seed}.csv"
+            else f"four_models_comparison_s{int(sparsity_list[0]*100)}_seed{args.seed}.csv"
         )
         all_models_csv = os.path.join(agg_dir, comparison_filename)
         summary_df.to_csv(all_models_csv, index=False)

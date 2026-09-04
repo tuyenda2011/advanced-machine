@@ -2,7 +2,7 @@ import logging
 import os
 import sys
 import time
-from typing import Any, Dict, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # Force UTF-8 encoding for Windows Command Prompt/PowerShell
 if hasattr(sys.stdout, "reconfigure"):
@@ -37,12 +37,19 @@ from src.training.early_stopping import EarlyStopping, load_checkpoint, save_che
 
 logger = logging.getLogger(__name__)
 
-# Try to import AMP (mixed precision training)
+# Prefer the current AMP API while retaining compatibility with older PyTorch.
 try:
-    from torch.cuda.amp import autocast, GradScaler
+    from torch.amp import GradScaler
+    MODERN_AMP_API = True
     AMP_AVAILABLE = True
 except ImportError:
-    AMP_AVAILABLE = False
+    try:
+        from torch.cuda.amp import GradScaler
+        MODERN_AMP_API = False
+        AMP_AVAILABLE = True
+    except ImportError:
+        MODERN_AMP_API = False
+        AMP_AVAILABLE = False
 
 
 # =============================================================================
@@ -99,8 +106,34 @@ def sample_negative_items(
     return neg_items
 
 
+def sample_hard_negative_items(
+    users: np.ndarray,
+    user_disliked_items: Dict[int, List[int]],
+    train_history: Dict[int, Set[int]],
+    num_items: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Sample one valid explicit dislike per user when available."""
+    if len(users) == 0:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=bool)
+
+    selected_by_user = np.full(int(users.max()) + 1, -1, dtype=np.int64)
+    for user in np.unique(users):
+        positives = train_history.get(int(user), set())
+        candidates = [
+            item
+            for item in user_disliked_items.get(int(user), [])
+            if 0 <= item < num_items and item not in positives
+        ]
+        if candidates:
+            selected_by_user[int(user)] = candidates[np.random.randint(len(candidates))]
+
+    hard_items = selected_by_user[users.astype(np.int64)]
+    available = hard_items >= 0
+    return hard_items, available
+
+
 class Trainer:
-    """Generic PyTorch trainer for 4 SOTA recommendation models (LightGCN, XSimGCL, DirectAU, AdaptiveGCL) with visual progress bars and robust checkpointing."""
+    """Trainer for the four recommendation models used in this project."""
 
     def __init__(
         self,
@@ -110,6 +143,7 @@ class Trainer:
         test_evaluator: Evaluator,
         config: Dict[str, Any],
         device: torch.device,
+        user_disliked_items: Optional[Dict[int, List[int]]] = None,
     ):
         self.model = model.to(device)
         self.train_df = train_df
@@ -117,6 +151,7 @@ class Trainer:
         self.test_evaluator = test_evaluator
         self.config = config
         self.device = device
+        self.user_disliked_items = user_disliked_items or {}
 
         self.model_name = config["model_name"]
         self.num_users = model.num_users
@@ -140,6 +175,12 @@ class Trainer:
                 gamma=d_cfg.get("gamma", 1.0),
                 t=d_cfg.get("t", 2.0),
                 weight_decay=self.weight_decay,
+            )
+        elif self.model_name == "adaptive_gcl":
+            adaptive_cfg = config.get("adaptive_gcl", {})
+            self.hard_bpr_loss_fn = HardNegativeBPRLoss(
+                alpha=adaptive_cfg.get("hard_neg_alpha", 0.2),
+                margin=adaptive_cfg.get("hard_neg_margin", 0.5),
             )
 
         # Precompute train history mapping for negative sampling
@@ -168,9 +209,29 @@ class Trainer:
 
         # Mixed precision training (AMP)
         self.use_amp = AMP_AVAILABLE and device.type == "cuda"
-        self.scaler = GradScaler() if self.use_amp else None
         if self.use_amp:
-            logger.info("Mixed precision training (AMP) enabled for CUDA device")
+            self.scaler = GradScaler("cuda") if MODERN_AMP_API else GradScaler()
+            logger.info("AMP gradient scaling enabled for CUDA device")
+        else:
+            self.scaler = None
+
+    def _backward_and_step(self, total_loss: torch.Tensor) -> None:
+        """Backpropagate, clip gradients, and update model parameters."""
+        if self.use_amp and self.scaler is not None:
+            self.scaler.scale(total_loss).backward()
+            # Gradients must be unscaled before their norm is clipped.
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), max_norm=GRADIENT_CLIP_VALUE
+            )
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), max_norm=GRADIENT_CLIP_VALUE
+            )
+            self.optimizer.step()
 
     def train(self, checkpoint_path: str, resume: bool = False) -> Dict[str, Any]:
         """Execute full model training loop with tqdm visual progress bars, early stopping, and scientific metrics."""
@@ -184,7 +245,11 @@ class Trainer:
         if resume and os.path.exists(latest_checkpoint_path):
             try:
                 loaded_epoch, best_sc, ckpt = load_checkpoint(
-                    latest_checkpoint_path, self.model, self.optimizer, device=self.device
+                    latest_checkpoint_path,
+                    self.model,
+                    self.optimizer,
+                    device=self.device,
+                    expected_fingerprint=self.config.get("experiment_fingerprint"),
                 )
                 start_epoch = loaded_epoch + 1
                 self.early_stopping.best_score = best_sc
@@ -227,6 +292,17 @@ class Trainer:
             else:
                 neg_item_array = None
 
+            if self.model_name == "adaptive_gcl" and self.user_disliked_items:
+                hard_item_array, hard_item_available = sample_hard_negative_items(
+                    user_array,
+                    self.user_disliked_items,
+                    self.train_history,
+                    self.num_items,
+                )
+            else:
+                hard_item_array = None
+                hard_item_available = None
+
             # Shuffle mini-batches
             indices = np.arange(num_samples)
             np.random.shuffle(indices)
@@ -262,15 +338,26 @@ class Trainer:
                         neg_item_array[batch_idx], dtype=torch.long, device=self.device
                     )
 
-                    u_embeds, i_embeds = self.model(self.norm_adj)
+                    if self.model_name == "xsimgcl":
+                        u_embeds, i_embeds, cl_u_embeds, cl_i_embeds = self.model(
+                            self.norm_adj, perturbed=True
+                        )
+                    else:
+                        u_embeds, i_embeds = self.model(self.norm_adj)
 
                     pos_scores = (u_embeds[u_batch] * i_embeds[pos_batch]).sum(dim=-1)
                     neg_scores = (u_embeds[u_batch] * i_embeds[neg_batch]).sum(dim=-1)
 
-                    # Initial embeddings for regularization
-                    u_emb0 = self.model.user_embedding(u_batch)
-                    pos_emb0 = self.model.item_embedding(pos_batch)
-                    neg_emb0 = self.model.item_embedding(neg_batch)
+                    if self.model_name == "xsimgcl":
+                        u_emb0 = u_embeds[u_batch]
+                        pos_emb0 = i_embeds[pos_batch]
+                        # Match the official SELFRec implementation, which
+                        # regularizes the propagated user and positive item only.
+                        neg_emb0 = None
+                    else:
+                        u_emb0 = self.model.user_embedding(u_batch)
+                        pos_emb0 = self.model.item_embedding(pos_batch)
+                        neg_emb0 = self.model.item_embedding(neg_batch)
 
                     total_loss, bpr_loss = self.bpr_loss_fn(
                         pos_scores, neg_scores, u_emb0, pos_emb0, neg_emb0
@@ -280,38 +367,50 @@ class Trainer:
 
                     if self.model_name == "xsimgcl":
                         cl_weight = self.config["xsimgcl"]["contrastive_weight"]
-                        u_p1, i_p1 = self.model.forward_perturbed(u_embeds, i_embeds)
-                        u_p2, i_p2 = self.model.forward_perturbed(u_embeds, i_embeds)
-
-                        cl_loss = self.cl_loss_fn(
-                            u_p1[u_batch], u_p2[u_batch], i_p1[pos_batch], i_p2[pos_batch]
+                        unique_users = torch.unique(u_batch)
+                        unique_items = torch.unique(pos_batch)
+                        cl_loss = (
+                            self.cl_loss_fn.compute_view_loss(
+                                u_embeds[unique_users], cl_u_embeds[unique_users]
+                            )
+                            + self.cl_loss_fn.compute_view_loss(
+                                i_embeds[unique_items], cl_i_embeds[unique_items]
+                            )
                         )
                         total_loss = total_loss + cl_weight * cl_loss
 
                     elif self.model_name == "adaptive_gcl":
                         cl_loss = self.model.compute_semantic_ssl_loss(pos_batch, i_embeds)
                         total_loss = total_loss + cl_loss
-                        if hasattr(self.model, "dirichlet_reg") and self.model.dirichlet_reg > 0:
+
+                        if hard_item_array is not None and hard_item_available is not None:
+                            batch_hard_mask = hard_item_available[batch_idx]
+                            if batch_hard_mask.any():
+                                hard_mask = torch.tensor(
+                                    batch_hard_mask, dtype=torch.bool, device=self.device
+                                )
+                                hard_batch = torch.tensor(
+                                    hard_item_array[batch_idx][batch_hard_mask],
+                                    dtype=torch.long,
+                                    device=self.device,
+                                )
+                                total_loss = total_loss + self.hard_bpr_loss_fn.compute_hard_penalty(
+                                    u_embeds[u_batch[hard_mask]],
+                                    i_embeds[pos_batch[hard_mask]],
+                                    i_embeds[hard_batch],
+                                )
+
+                        if self.model.dirichlet_reg > 0:
                             all_final = torch.cat([u_embeds, i_embeds], dim=0)
-                            dir_energy = self.model.compute_dirichlet_energy(self.norm_adj, all_final)
-                            # Regularize to keep Dirichlet energy non-zero and stable
-                            dir_loss = self.model.dirichlet_reg * torch.clamp(1.0 - dir_energy, min=0.0)
-                            total_loss = total_loss + dir_loss
+                            total_loss = total_loss + self.model.compute_dirichlet_regularization(
+                                self.norm_adj, all_final
+                            )
 
                     bpr_loss_accum += bpr_loss.item()
                     cl_loss_accum += cl_loss.item()
 
 
-                total_loss.backward()
-                # Gradient clipping to prevent gradient explosion
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
-                # Use mixed precision training if enabled
-                if self.use_amp and self.scaler is not None:
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                else:
-                    self.optimizer.step()
+                self._backward_and_step(total_loss)
 
                 total_loss_accum += total_loss.item()
                 num_batches += 1

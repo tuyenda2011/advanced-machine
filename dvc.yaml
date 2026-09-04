@@ -1,47 +1,33 @@
-# DVC Data Preprocessing & Versioning Pipeline
-# Reproducible stages: ingest -> validate -> clean -> graph -> cache
-
 stages:
-  ingest:
-    cmd: python scripts/ingest_raw.py --source data/source
-    deps:
-      - scripts/ingest_raw.py
-    outs:
-      - data/manifest.json:
-          cache: false
-
-  validate:
-    cmd: python -c "import pandas as pd; from src.data.validation import validate_interactions, validate_metadata; validate_interactions(pd.read_parquet('data/processed/train.parquet'))"
-    deps:
-      - src/data/validation.py
-      - data/manifest.json
-
-  clean:
-    cmd: python scripts/prepare_data.py
+  prepare:
+    cmd: python scripts/prepare_data.py --no-export_csv
     deps:
       - scripts/prepare_data.py
+      - src/data/loader.py
       - src/data/preprocessing.py
       - src/data/splitter.py
       - src/data/text_encoder.py
-      - configs/lightgcn.yaml
+      - src/data/negative_collector.py
+      - src/data/validation.py
+      - configs/common.yaml
     outs:
       - data/processed/train.parquet
       - data/processed/val.parquet
       - data/processed/test.parquet
       - data/processed/mappings.pkl
       - data/processed/item_text_embeddings.pt
+      - data/processed/disliked_interactions.parquet
 
-  graph:
-    cmd: python -c "import pandas as pd, pickle, torch; from src.data.graph import get_norm_adj_tensor; df = pd.read_parquet('data/processed/train.parquet'); with open('data/processed/mappings.pkl', 'rb') as f: m = pickle.load(f); adj = get_norm_adj_tensor(df, len(m['user2id']), len(m['item2id']), torch.device('cpu')); print('Graph adj nnz:', adj._nnz())"
+  audit:
+    cmd: python scripts/audit_data.py
     deps:
-      - src/data/graph.py
+      - scripts/audit_data.py
       - data/processed/train.parquet
+      - data/processed/val.parquet
+      - data/processed/test.parquet
       - data/processed/mappings.pkl
-
-  cache:
-    cmd: python scripts/cache_text_proj.py --text-features data/processed/item_text_embeddings.pt --out data/cache/item_proj.pt
-    deps:
-      - scripts/cache_text_proj.py
       - data/processed/item_text_embeddings.pt
+      - data/processed/disliked_interactions.parquet
     outs:
-      - data/cache/item_proj.pt
+      - data/processed/audit_report.json:
+          cache: false

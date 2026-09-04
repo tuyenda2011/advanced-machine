@@ -41,16 +41,23 @@ def load_checkpoint(
     model: torch.nn.Module,
     optimizer: Optional[torch.optim.Optimizer] = None,
     device: torch.device = torch.device("cpu"),
+    expected_fingerprint: Optional[str] = None,
 ) -> Tuple[int, float, Dict[str, Any]]:
     """Load model weights and optimizer state from checkpoint with validation."""
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     # Validate checkpoint integrity
     if "model_state_dict" not in checkpoint:
         raise ValueError(f"Invalid checkpoint format at {checkpoint_path}: missing 'model_state_dict' key")
+
+    stored_fingerprint = checkpoint.get("config", {}).get("experiment_fingerprint")
+    if expected_fingerprint and stored_fingerprint != expected_fingerprint:
+        raise ValueError(
+            "Checkpoint fingerprint does not match the current data/config/code"
+        )
 
     model.load_state_dict(checkpoint["model_state_dict"])
 

@@ -7,7 +7,8 @@ dataset:
   positive_rating_threshold: 4.0
   min_user_interactions: 5
   min_item_interactions: 5
-  split_ratios: [0.8, 0.1, 0.1] # train, val, test chronological per-user
+  split_ratios: [0.8, 0.1, 0.1] # exact global counts, chronological within selected users
+  split_seed: 42
 
 model:
   embedding_dim: 64

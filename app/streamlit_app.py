@@ -18,13 +18,18 @@ import streamlit as st
 import torch
 import torch.nn.functional as F
 
+from src.data.sparsity import create_sparse_train_set
+from src.data.text_encoder import build_user_history_features
 from src.models.adaptive_gcl import AdaptiveGCL
 from src.models.directau import DirectAU
 from src.models.lightgcn import LightGCN
 from src.models.xsimgcl import XSimGCL
 from src.serving.ann_indexer import VectorIndexer
 from src.utils.config import load_config
-from src.utils.checkpoints import find_checkpoint
+from src.utils.checkpoints import (
+    get_checkpoint_path,
+    get_experiment_fingerprint,
+)
 
 
 # Custom CSS
@@ -103,6 +108,8 @@ def load_trained_model(model_name: str, num_users: int, num_items: int, sparsity
     config = load_config(model_name, "configs")
     emb_dim = config["model"]["embedding_dim"]
     num_layers = config["model"]["num_layers"]
+    train_df, _, _, _ = load_processed_data()
+    train_df_sparse = create_sparse_train_set(train_df, sparsity, seed)
 
     if model_name == "lightgcn":
         model = LightGCN(num_users, num_items, embedding_dim=emb_dim, num_layers=num_layers)
@@ -111,6 +118,9 @@ def load_trained_model(model_name: str, num_users: int, num_items: int, sparsity
         model = XSimGCL(
             num_users, num_items, embedding_dim=emb_dim, num_layers=num_layers,
             contrastive_weight=xsim_cfg.get("contrastive_weight", 0.1),
+            temperature=xsim_cfg.get("temperature", 0.2),
+            epsilon=xsim_cfg.get("epsilon", 0.1),
+            contrastive_layer=xsim_cfg.get("contrastive_layer", 1),
         )
     elif model_name == "directau":
         dau_cfg = config.get("directau", {})
@@ -126,28 +136,45 @@ def load_trained_model(model_name: str, num_users: int, num_items: int, sparsity
             text_features = torch.load(text_emb_path, map_location="cpu", weights_only=False)
             text_dim = text_features.shape[1]
         else:
-            text_dim = ada_cfg.get("text_dim", 384)
+            raise FileNotFoundError(
+                f"AdaptiveGCL requires item text features at {text_emb_path}"
+            )
+        user_history_features = build_user_history_features(
+            train_df_sparse, text_features, num_users
+        )
         model = AdaptiveGCL(
             num_users, num_items, embedding_dim=emb_dim, num_layers=num_layers,
             text_dim=text_dim, text_features=text_features,
             ssl_temp=ada_cfg.get("ssl_temp", 0.2),
             ssl_reg=ada_cfg.get("ssl_reg", 0.1),
             dirichlet_reg=ada_cfg.get("dirichlet_reg", 0.01),
+            node_dropout=ada_cfg.get("node_dropout", 0.0),
+            tau_plus=ada_cfg.get("tau_plus", 0.1),
+            user_history_features=user_history_features,
         )
 
-    # Use centralized checkpoint finder
-    checkpoint_path = find_checkpoint(model_name, sparsity, seed)
+    checkpoint_path = get_checkpoint_path(model_name, sparsity, seed)
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(
+            f"No checkpoint for {model_name}, sparsity={sparsity}, seed={seed}. "
+            "Train this exact run before opening it in the dashboard."
+        )
 
-    if checkpoint_path and os.path.exists(checkpoint_path):
-        ckpt = torch.load(checkpoint_path, map_location=device)
+    if os.path.exists(checkpoint_path):
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        expected_fingerprint = get_experiment_fingerprint(model_name)
+        stored_fingerprint = ckpt.get("config", {}).get("experiment_fingerprint")
+        if stored_fingerprint != expected_fingerprint:
+            raise RuntimeError(
+                "Checkpoint is stale for the current data/config/code. Retrain the model."
+            )
         model.load_state_dict(ckpt["model_state_dict"])
 
     model.to(device)
     model.eval()
 
     from src.data.graph import get_norm_adj_tensor
-    train_df, _, _, _ = load_processed_data()
-    norm_adj = get_norm_adj_tensor(train_df, num_users, num_items, device)
+    norm_adj = get_norm_adj_tensor(train_df_sparse, num_users, num_items, device)
 
     with torch.no_grad():
         u_embeds, i_embeds = model(norm_adj)
@@ -534,9 +561,9 @@ def main():
             },
             {
                 "name": "XSimGCL (TKDE '23)",
-                "formula": "E' = E + \\epsilon \\cdot \\frac{\\Delta}{\\|\\Delta\\|}",
+                "formula": "E^{(l)} = \\tilde{A}E^{(l-1)} + \\epsilon \\cdot sign(E^{(l)}) \\odot \\bar{\\Delta}^{(l)}",
                 "loss": "\\mathcal{L}_{CL} = -\\log \\frac{exp(sim)}{sum}",
-                "desc": "Final-layer perturbation for efficiency"
+                "desc": "Layer-wise perturbation with final-to-intermediate contrast"
             },
             {
                 "name": "DirectAU (KDD '22)",
@@ -545,10 +572,10 @@ def main():
                 "desc": "Direct optimization of alignment and uniformity"
             },
             {
-                "name": "AdaptiveGCL (Multimodal)",
-                "formula": "H_i = E_i + W_p X_i",
-                "loss": "\\mathcal{L} = \\mathcal{L}_{BPR} + \\mathcal{L}_{semantic}",
-                "desc": "Cross-modal semantic alignment"
+                "name": "AdaptiveGCL (Course-project model)",
+                "formula": "H_i = g_i \\odot E_i + (1-g_i) \\odot W_p X_i",
+                "loss": "\\mathcal{L} = \\mathcal{L}_{BPR} + \\mathcal{L}_{semantic} + \\mathcal{L}_{hard} + \\mathcal{L}_{dir}",
+                "desc": "Gated text fusion with semantic and graph regularization"
             },
         ]
 
@@ -563,16 +590,15 @@ def main():
 
         complexity_data = [
             {"Model": "LightGCN", "Forward": "O(L·E·d)", "Contrastive": "None", "Speed": "1.0×"},
-            {"Model": "SGL", "Forward": "O(3L·E·d)", "Contrastive": "2× GNN", "Speed": "0.35×"},
-            {"Model": "XSimGCL", "Forward": "O(L·E·d)", "Contrastive": "O(N·d)", "Speed": "0.90×"},
-            {"Model": "DirectAU", "Forward": "O(L·E·d)", "Contrastive": "None", "Speed": "1.20×"},
-            {"Model": "AdaptiveGCL", "Forward": "O(L·E·d)", "Contrastive": "O(B·d)", "Speed": "0.85×"},
+            {"Model": "XSimGCL", "Forward": "O(L·E·d)", "Contrastive": "O(B²·d)", "Speed": "Measure"},
+            {"Model": "DirectAU", "Forward": "O(L·E·d)", "Contrastive": "O(B²·d)", "Speed": "Measure"},
+            {"Model": "AdaptiveGCL", "Forward": "O(L·E·d)", "Contrastive": "O(B²·d)", "Speed": "Measure"},
         ]
 
         st.dataframe(pd.DataFrame(complexity_data), use_container_width=True, hide_index=True)
 
     st.divider()
-    st.caption("⚡ Advanced Graph Contrastive Learning Suite | Academic Research")
+    st.caption("⚡ Advanced Graph Contrastive Learning Suite | Course Project")
 
 
 if __name__ == "__main__":

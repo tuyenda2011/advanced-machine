@@ -1,5 +1,7 @@
 import logging
 from typing import Any, Dict, List, Set, Tuple
+
+import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -118,58 +120,77 @@ def chronological_per_user_split(
     df: pd.DataFrame,
     val_ratio: float = 0.1,
     test_ratio: float = 0.1,
-    enforce_connectivity: bool = True,
+    enforce_connectivity: bool = False,
+    seed: int = 42,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Perform chronological per-user split: oldest interactions -> train, next -> val, latest -> test.
+    """Create an exact-ratio chronological split for the course benchmark.
 
-    Guarantees every user has at least 1 train, 1 val, and 1 test interaction.
+    Validation and test receive one latest interaction each from a deterministic
+    subset of users. Remaining users are train-only, which is necessary when the
+    requested holdout size is smaller than the total number of users.
     """
-    logger.info(f"Performing chronological per-user split (val_ratio={val_ratio}, test_ratio={test_ratio})...")
+    if not 0 < val_ratio < 1 or not 0 < test_ratio < 1:
+        raise ValueError("val_ratio and test_ratio must be between 0 and 1")
+    if not np.isclose(val_ratio, test_ratio):
+        raise ValueError("This split protocol requires equal validation and test ratios")
+    if val_ratio + test_ratio >= 1:
+        raise ValueError("validation and test ratios must leave room for training data")
 
-    # Sort interactions by user and timestamp
-    df_sorted = df.sort_values(by=["u_idx", "timestamp"]).reset_index(drop=True)
+    logger.info(
+        "Performing exact chronological split "
+        f"(train={1-val_ratio-test_ratio:.0%}, val={val_ratio:.0%}, test={test_ratio:.0%}, seed={seed})..."
+    )
 
-    train_list = []
-    val_list = []
-    test_list = []
+    df_sorted = df.sort_values(
+        by=["u_idx", "timestamp"], kind="mergesort"
+    ).reset_index(drop=True)
+    group_sizes = df_sorted.groupby("u_idx")["u_idx"].transform("size")
+    eligible_users = np.sort(
+        df_sorted.loc[group_sizes >= 3, "u_idx"].unique()
+    )
+    holdout_size = int(round(len(df_sorted) * val_ratio))
+    if holdout_size > len(eligible_users):
+        raise ValueError(
+            f"Cannot allocate {holdout_size} validation/test rows from "
+            f"only {len(eligible_users)} users with at least 3 interactions"
+        )
 
-    for _, group in df_sorted.groupby("u_idx", sort=False):
-        n = len(group)
-        if n < 3:
-            # Fallback if a user has < 3 interactions
-            n_test = 1
-            n_val = 1
-            n_train = max(1, n - 2)
-        else:
-            n_val = max(1, int(n * val_ratio))
-            n_test = max(1, int(n * test_ratio))
-            n_train = n - n_val - n_test
+    rng = np.random.default_rng(seed)
+    eval_users = set(
+        rng.choice(eligible_users, size=holdout_size, replace=False).tolist()
+    )
+    positions = df_sorted.groupby("u_idx").cumcount()
+    selected = df_sorted["u_idx"].isin(eval_users)
+    test_mask = selected & positions.eq(group_sizes - 1)
+    val_mask = selected & positions.eq(group_sizes - 2)
+    train_mask = ~(val_mask | test_mask)
 
-            if n_train < 1:
-                n_train = 1
-                n_val = max(1, (n - 1) // 2)
-                n_test = n - n_train - n_val
-
-        u_train = group.iloc[:n_train]
-        u_val = group.iloc[n_train : n_train + n_val]
-        u_test = group.iloc[n_train + n_val :]
-
-        train_list.append(u_train)
-        val_list.append(u_val)
-        test_list.append(u_test)
-
-    train_df = pd.concat(train_list, ignore_index=True)
-    val_df = pd.concat(val_list, ignore_index=True)
-    test_df = pd.concat(test_list, ignore_index=True)
+    train_df = df_sorted.loc[train_mask].reset_index(drop=True)
+    val_df = df_sorted.loc[val_mask].reset_index(drop=True)
+    test_df = df_sorted.loc[test_mask].reset_index(drop=True)
 
     if enforce_connectivity:
-        train_df, val_df, test_df = relocate_disconnected(train_df, val_df, test_df)
+        logger.warning(
+            "enforce_connectivity is ignored to preserve chronological ordering; "
+            "cold-start items must be handled by the evaluator"
+        )
 
     check_split_connectivity(train_df, val_df, test_df)
     verify_no_leakage(train_df, val_df, test_df)
 
+    train_max = train_df.groupby("u_idx")["timestamp"].max()
+    val_min = val_df.groupby("u_idx")["timestamp"].min()
+    test_min = test_df.groupby("u_idx")["timestamp"].min()
+    if any(train_max.loc[val_min.index] > val_min):
+        raise AssertionError("Temporal leakage detected between train and validation")
+    if any(train_max.loc[test_min.index] > test_min):
+        raise AssertionError("Temporal leakage detected between train and test")
+
     logger.info(
-        f"Split completed: Train={len(train_df)} edges, Val={len(val_df)} edges, Test={len(test_df)} edges."
+        f"Split completed: Train={len(train_df)} ({len(train_df)/len(df_sorted):.2%}), "
+        f"Val={len(val_df)} ({len(val_df)/len(df_sorted):.2%}), "
+        f"Test={len(test_df)} ({len(test_df)/len(df_sorted):.2%}), "
+        f"Eval users={len(eval_users)}."
     )
 
     return train_df, val_df, test_df
@@ -253,5 +274,4 @@ def global_temporal_split(
     check_split_connectivity(train_df, val_df, test_df)
     verify_no_leakage(train_df, val_df, test_df)
     return train_df, val_df, test_df
-
 

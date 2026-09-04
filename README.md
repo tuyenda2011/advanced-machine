@@ -52,11 +52,12 @@ streamlit run app/streamlit_app.py
 
 | Metric | Value | Description |
 |:------:|:-----:|:------------|
-| **Users** | 135,996 | Valid users after K-core filtering |
-| **Items** | 62,749 | Electronics products |
-| **Interactions** | 1,173,135 | Positive feedback edges |
-| **Density** | 0.0137% | Extremely sparse graph |
-| **Avg. Interactions/User** | 8.63 | Long-tail distribution |
+| **Users** | 124,895 | Valid users after positive-feedback 5-core filtering |
+| **Items** | 44,843 | Electronics products |
+| **Interactions** | 1,072,740 | Positive feedback edges |
+| **Density** | 0.0192% | Extremely sparse graph |
+| **Avg. Interactions/User** | 8.59 | Long-tail distribution |
+| **Split** | 80% / 10% / 10% | Exact chronological train/validation/test split |
 
 ### Data Sources
 
@@ -92,33 +93,31 @@ $$
 
 ---
 
-### 3.2 Edge Dropout Contrastive Learning (SGL)
+### 3.2 XSimGCL Perturbed Propagation
 
-Two augmented views via edge dropout $p_{\text{drop}} = 0.1$:
-
-$$
-z_u^{(1)} = \text{LightGCN}(G_1, u), \quad z_u^{(2)} = \text{LightGCN}(G_2, u)
-$$
-
-InfoNCE Loss:
+XSimGCL injects sign-aware normalized noise after each propagation layer and contrasts the aggregated recommendation representation with layer $l^*$:
 
 $$
-\mathcal{L}_{\text{SSL}} = -\sum_{u} \log \frac{\exp(\text{sim}(z_u^{(1)}, z_u^{(2)}) / \tau)}{\sum_v \exp(\text{sim}(z_u^{(1)}, z_v^{(2)}) / \tau)}
+e^{(k)'} = \tilde{A}e^{(k-1)'} + \epsilon\,\operatorname{sign}(e^{(k)'})\odot\frac{\Delta^{(k)}}{\|\Delta^{(k)}\|_2}
 $$
 
----
-
-### 3.3 Representation Noise Perturbation (SimGCL)
-
-Direct L2-normalized noise injection (no graph augmentation):
-
 $$
-e^{(k)'} = e^{(k)} + \epsilon \cdot \frac{\Delta}{\|\Delta\|_2}, \quad \Delta \sim U(0,1), \ \epsilon = 0.1
+\mathcal{L} = \mathcal{L}_{\text{BPR}} + \lambda_{cl}\mathcal{L}_{\text{InfoNCE}}
 $$
 
----
+### 3.3 DirectAU
 
-### 3.4 Hypersphere Representation Geometry
+DirectAU removes negative sampling and directly optimizes normalized positive-pair alignment and batch uniformity:
+
+$$
+\mathcal{L}_{\text{DirectAU}} = \mathcal{L}_{\text{align}} + \gamma\mathcal{L}_{\text{uniform}}
+$$
+
+### 3.4 AdaptiveGCL (Proposed Course-Project Model)
+
+AdaptiveGCL combines gated ID/text fusion, user semantic profiles, learnable layer attention, debiased graph-text InfoNCE, explicit hard-negative ranking penalties, and normalized Dirichlet-energy regularization. Main benchmark metrics use the shared warm-start protocol; zero-shot inference remains an auxiliary capability rather than a benchmark claim.
+
+### 3.5 Hypersphere Representation Geometry
 
 Based on Wang & Isola (ICML 2020):
 
@@ -127,7 +126,7 @@ Based on Wang & Isola (ICML 2020):
 | **Alignment** | $\mathbb{E}[ \|f(u) - f(i)\|_2^2 ]$ | Lower = closer positive pairs |
 | **Uniformity** | $\log \mathbb{E}_{u,v} [ \exp(-2\|f(u)-f(v)\|^2) ]$ | Lower = more uniform distribution |
 
-### 3.5 Beyond-Accuracy Metrics
+### 3.6 Beyond-Accuracy Metrics
 
 | Metric | Formula | Purpose |
 |:------:|:--------|:--------|
@@ -136,13 +135,14 @@ Based on Wang & Isola (ICML 2020):
 | **Coverage** | $\frac{\|\bigcup_u R_u\|}{\|I\|}$ | Catalog coverage |
 | **Gini** | $\frac{\sum (2i-1)c_{(i)}}{n\sum c_i}$ | Fairness of recommendation distribution |
 
-### 3.6 Algorithm Complexity
+### 3.7 Algorithm Complexity
 
 | Algorithm | Forward Pass | Contrastive Loss | Memory |
 |:----------|:------------:|:---------------:|:------:|
 | **LightGCN** | $O(L \cdot E \cdot d)$ | — | $1 \times$ Adj |
-| **SGL** | $O(3L \cdot E \cdot d)$ | $O(B^2 \cdot d)$ | $3 \times$ Adj |
-| **SimGCL** | $O(L \cdot E \cdot d)$ | $O(B^2 \cdot d)$ | $1 \times$ Adj |
+| **XSimGCL** | $O(L \cdot E \cdot d)$ | $O(B^2 \cdot d)$ | $1 \times$ Adj |
+| **DirectAU** | $O(L \cdot E \cdot d)$ | $O(B^2 \cdot d)$ uniformity | $1 \times$ Adj |
+| **AdaptiveGCL** | $O(L \cdot E \cdot d)$ | $O(B^2 \cdot d)$ semantic SSL | $1 \times$ Adj + text |
 
 > **Legend**: $E$ = edges, $L$ = layers, $d$ = embedding dim (64), $B$ = batch size (2048)
 
@@ -282,7 +282,7 @@ python scripts/train_all_models.py --all_sparsity
 # Quick test (1 seed, 5 epochs)
 python scripts/benchmark_all.py --quick
 
-# Full benchmark (3 seeds × 4 sparsity × 50 epochs)
+# Full benchmark (3 seeds × 4 sparsity × 100 epochs)
 python scripts/benchmark_all.py
 ```
 
@@ -356,7 +356,7 @@ streamlit run app/streamlit_app.py
 ## 🙏 Acknowledgments
 
 - Dataset: [UCSD/Stanford SNAP Lab](https://cseweb.ucsd.edu/~jmcauley/datasets.html#amazon_data)
-- Base Models: [LightGCN](https://github.com/gusye1234/LightGCN-PyTorch), [XSimGCL](https://github.com/YuWVandy/XSimGCL)
+- Base Models: [LightGCN](https://github.com/gusye1234/LightGCN-PyTorch), [XSimGCL/SELFRec](https://github.com/Coder-Yu/SELFRec), [DirectAU](https://github.com/THUwangcy/DirectAU)
 
 ---
 

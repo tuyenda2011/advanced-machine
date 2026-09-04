@@ -1,16 +1,26 @@
-from typing import Tuple
+from typing import Tuple, Union
+
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+
 from src.models.base import BaseRecommender
+
+EmbeddingPair = Tuple[torch.Tensor, torch.Tensor]
+PerturbedEmbeddingOutput = Tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]
 
 
 class XSimGCL(BaseRecommender):
     """XSimGCL: Extreme Simple Graph Contrastive Learning for Recommendation (TKDE '23).
 
-    Eliminates redundant layer-wise perturbations by applying uniform noise perturbation
-    directly to the aggregated final representation, drastically reducing training computation FLOPS.
+    Applies sign-aware normalized perturbations during propagation and contrasts
+    the aggregated recommendation representation against a selected graph layer.
     """
+
+    def _init_weights(self) -> None:
+        torch.nn.init.xavier_uniform_(self.user_embedding.weight)
+        torch.nn.init.xavier_uniform_(self.item_embedding.weight)
 
     def __init__(
         self,
@@ -21,41 +31,46 @@ class XSimGCL(BaseRecommender):
         contrastive_weight: float = 0.1,
         temperature: float = 0.2,
         epsilon: float = 0.1,
+        contrastive_layer: int = 1,
     ):
         super().__init__(num_users, num_items, embedding_dim, num_layers)
+        if not 1 <= contrastive_layer <= num_layers:
+            raise ValueError("contrastive_layer must be between 1 and num_layers")
         self.contrastive_weight = contrastive_weight
         self.temperature = temperature
         self.epsilon = epsilon
+        self.contrastive_layer = contrastive_layer
 
-    def forward(self, norm_adj: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Standard LightGCN forward propagation layer aggregation."""
+    def forward(
+        self, norm_adj: torch.Tensor, perturbed: bool = False
+    ) -> Union[EmbeddingPair, PerturbedEmbeddingOutput]:
+        """Run the official XSimGCL perturbed propagation protocol."""
         ego_embeddings = torch.cat(
             [self.user_embedding.weight, self.item_embedding.weight], dim=0
         )
-        all_embeddings = [ego_embeddings]
+        propagated_embeddings = []
+        contrastive_embeddings = ego_embeddings
 
-        for layer in range(self.num_layers):
+        for layer in range(1, self.num_layers + 1):
             ego_embeddings = torch.sparse.mm(norm_adj, ego_embeddings)
-            all_embeddings.append(ego_embeddings)
+            if perturbed:
+                noise = F.normalize(torch.rand_like(ego_embeddings), dim=-1)
+                ego_embeddings = (
+                    ego_embeddings
+                    + torch.sign(ego_embeddings) * noise * self.epsilon
+                )
+            propagated_embeddings.append(ego_embeddings)
+            if layer == self.contrastive_layer:
+                contrastive_embeddings = ego_embeddings
 
-        final_embeddings = torch.stack(all_embeddings, dim=1).mean(dim=1)
+        final_embeddings = torch.stack(propagated_embeddings, dim=1).mean(dim=1)
         user_final, item_final = torch.split(
             final_embeddings, [self.num_users, self.num_items], dim=0
         )
-        return user_final, item_final
+        if not perturbed:
+            return user_final, item_final
 
-    def forward_perturbed(
-        self, user_final: torch.Tensor, item_final: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Apply normalized random uniform noise perturbation directly to final representations."""
-        # Perturb users
-        u_noise = torch.rand_like(user_final)
-        u_noise = F.normalize(u_noise, dim=-1)
-        user_perturbed = user_final + self.epsilon * u_noise
-
-        # Perturb items
-        i_noise = torch.rand_like(item_final)
-        i_noise = F.normalize(i_noise, dim=-1)
-        item_perturbed = item_final + self.epsilon * i_noise
-
-        return user_perturbed, item_perturbed
+        user_cl, item_cl = torch.split(
+            contrastive_embeddings, [self.num_users, self.num_items], dim=0
+        )
+        return user_final, item_final, user_cl, item_cl

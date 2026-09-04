@@ -8,3 +8,4 @@ adaptive_gcl:
   node_dropout: 0.05
   tau_plus: 0.1
   hard_neg_alpha: 0.2
+  hard_neg_margin: 0.5

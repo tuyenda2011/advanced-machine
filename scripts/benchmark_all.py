@@ -21,6 +21,7 @@ from src.evaluation.significance import (
     compute_statistical_significance,
     generate_latex_table,
 )
+from src.utils.checkpoints import get_experiment_fingerprint
 from src.utils.logging import setup_logger
 
 logger = setup_logger("benchmark_all")
@@ -28,19 +29,24 @@ logger = setup_logger("benchmark_all")
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Comprehensive Academic Benchmark Suite for 4 SOTA Graph Models (LightGCN, XSimGCL, DirectAU, AdaptiveGCL) under Sparsity"
+        description="Benchmark suite for LightGCN, XSimGCL, DirectAU, and the proposed AdaptiveGCL model under sparsity"
     )
     parser.add_argument(
         "--models",
         nargs="+",
         default=["lightgcn", "xsimgcl", "directau", "adaptive_gcl"],
-        help="List of models to benchmark (default: 4 SOTA models: LightGCN, XSimGCL, DirectAU, AdaptiveGCL)",
+        help="Models to benchmark (default: LightGCN, XSimGCL, DirectAU, AdaptiveGCL)",
     )
     parser.add_argument(
         "--quick", action="store_true", help="Quick mode: 1 seed, 5 epochs, 100%% data only"
     )
     parser.add_argument(
         "--epochs", type=int, default=None, help="Override epochs for all benchmark runs"
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume matching checkpoints (disabled by default to avoid reusing stale data splits)",
     )
     args = parser.parse_args()
 
@@ -75,19 +81,31 @@ def main():
         sparsity_pct = int(sparsity * 100)
         sparsity_tag = f"s{sparsity_pct}"
 
-        run_file = os.path.join(
+        preferred_run_file = os.path.join(
             results_dir, model, f"{model}_{sparsity_tag}_seed{seed}.json"
         )
-        if not os.path.exists(run_file):
-            run_file = os.path.join(
-                results_dir, f"{model}_{sparsity_tag}_seed{seed}.json"
-            )
+        legacy_run_file = os.path.join(
+            results_dir, f"{model}_{sparsity_tag}_seed{seed}.json"
+        )
+        run_file = (
+            preferred_run_file
+            if os.path.exists(preferred_run_file)
+            else legacy_run_file
+        )
 
         # Check if run file exists and contains new metrics
         if os.path.exists(run_file):
             with open(run_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if "representation_metrics" in data and "subgroup_metrics" in data:
+            current_fingerprint = get_experiment_fingerprint(model)
+            if (
+                "representation_metrics" in data
+                and "subgroup_metrics" in data
+                and data.get("sparsity_level") == sparsity
+                and data.get("seed") == seed
+                and data.get("max_epochs") == epochs
+                and data.get("experiment_fingerprint") == current_fingerprint
+            ):
                 test_ndcg = data.get("test_metrics", {}).get("NDCG@10", 0.0)
                 test_recall = data.get("test_metrics", {}).get("Recall@10", 0.0)
                 print(
@@ -115,8 +133,9 @@ def main():
             str(seed),
             "--epochs",
             str(epochs),
-            "--resume",
         ]
+        if args.resume:
+            cmd.append("--resume")
 
         # Run train script as subprocess with live streaming to terminal
         env = os.environ.copy()
@@ -133,6 +152,7 @@ def main():
             )
             continue
 
+        run_file = preferred_run_file
         if os.path.exists(run_file):
             with open(run_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -264,13 +284,21 @@ def main():
     for sp in sorted(df["sparsity"].unique(), reverse=True):
         sp_df = df[df["sparsity"] == sp]
         for m_name in ["Recall@10", "NDCG@10", "Diversity@10", "Novelty@10"]:
-            lgcn_scores = sp_df[sp_df["model"] == "lightgcn"][m_name].values
-            if len(lgcn_scores) == 0:
+            lgcn_scores = sp_df[sp_df["model"] == "lightgcn"][["seed", m_name]]
+            if lgcn_scores.empty:
                 continue
             for other_model in [m for m in models if m != "lightgcn"]:
-                other_scores = sp_df[sp_df["model"] == other_model][m_name].values
-                if len(other_scores) > 0:
-                    sig_res = compute_statistical_significance(other_scores, lgcn_scores)
+                other_scores = sp_df[sp_df["model"] == other_model][["seed", m_name]]
+                paired = other_scores.merge(
+                    lgcn_scores,
+                    on="seed",
+                    suffixes=("_model", "_lightgcn"),
+                ).sort_values("seed")
+                if not paired.empty:
+                    sig_res = compute_statistical_significance(
+                        paired[f"{m_name}_model"].values,
+                        paired[f"{m_name}_lightgcn"].values,
+                    )
                     sig_results.append({
                         "sparsity": sp,
                         "metric": m_name,
@@ -292,7 +320,7 @@ def main():
 
     latex_code = generate_latex_table(
         display_df,
-        caption="Empirical evaluation of LightGCN, SGL, and SimGCL on Amazon Electronics across data sparsity levels.",
+        caption="Empirical evaluation of LightGCN, XSimGCL, DirectAU, and AdaptiveGCL on Amazon Electronics across data sparsity levels.",
         label="tab:main_benchmark",
     )
     latex_path = os.path.join(agg_dir, "benchmark_table.tex")

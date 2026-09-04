@@ -25,25 +25,38 @@ def compute_statistical_significance(
 
     rel_improv = ((mean_a - mean_b) / (mean_b + 1e-12)) * 100.0
 
+    if arr_a.shape != arr_b.shape:
+        raise ValueError("Paired significance tests require equally sized score arrays")
+
     if len(arr_a) < 2 or np.allclose(arr_a, arr_b):
-        p_val = 1.0
+        t_p_val = 1.0
         t_stat = 0.0
+        wilcoxon_p_val = 1.0
+        wilcoxon_stat = 0.0
     else:
         try:
             t_res = stats.ttest_rel(arr_a, arr_b)
             t_stat = float(t_res.statistic)
-            p_val = float(t_res.pvalue)
-            if np.isnan(p_val):
-                p_val = 1.0
+            t_p_val = float(t_res.pvalue)
+            if np.isnan(t_p_val):
+                t_p_val = 1.0
         except Exception:
             t_stat = 0.0
-            p_val = 1.0
+            t_p_val = 1.0
 
-    if p_val < 0.001:
+        try:
+            wilcoxon_result = stats.wilcoxon(arr_a, arr_b)
+            wilcoxon_stat = float(wilcoxon_result.statistic)
+            wilcoxon_p_val = float(wilcoxon_result.pvalue)
+        except Exception:
+            wilcoxon_stat = 0.0
+            wilcoxon_p_val = 1.0
+
+    if t_p_val < 0.001:
         star = "***"
-    elif p_val < 0.01:
+    elif t_p_val < 0.01:
         star = "**"
-    elif p_val < 0.05:
+    elif t_p_val < 0.05:
         star = "*"
     else:
         star = "ns"
@@ -53,7 +66,10 @@ def compute_statistical_significance(
         "mean_b": mean_b,
         "rel_improvement_pct": rel_improv,
         "t_statistic": t_stat,
-        "p_value": p_val,
+        "p_value": t_p_val,
+        "t_p_value": t_p_val,
+        "wilcoxon_statistic": wilcoxon_stat,
+        "wilcoxon_p_value": wilcoxon_p_val,
         "significance": star,
     }
 

@@ -3,11 +3,41 @@ import os
 from typing import Dict, Optional
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
+
+
+def build_user_history_features(
+    train_df: pd.DataFrame,
+    item_text_features: torch.Tensor,
+    num_users: int,
+) -> torch.Tensor:
+    """Mean-pool item text features from each user's training history."""
+    text_features = item_text_features.float().cpu()
+    user_features = torch.zeros(
+        (num_users, text_features.shape[1]), dtype=text_features.dtype
+    )
+    user_indices = torch.from_numpy(train_df["u_idx"].to_numpy(copy=True)).long()
+    item_indices = torch.from_numpy(train_df["i_idx"].to_numpy(copy=True)).long()
+    counts = torch.zeros(num_users, dtype=text_features.dtype)
+
+    chunk_size = 100_000
+    for start in range(0, len(user_indices), chunk_size):
+        end = start + chunk_size
+        user_chunk = user_indices[start:end]
+        item_chunk = item_indices[start:end]
+        user_features.index_add_(0, user_chunk, text_features[item_chunk])
+        counts.index_add_(
+            0,
+            user_chunk,
+            torch.ones(len(user_chunk), dtype=text_features.dtype),
+        )
+
+    return user_features / counts.clamp_min(1.0).unsqueeze(1)
 
 
 def format_item_text(meta: dict) -> str:
@@ -33,6 +63,7 @@ def encode_item_metadata(
     device: Optional[str] = None,
     save_path: Optional[str] = None,
     force_recompute: bool = False,
+    allow_fallback: bool = False,
 ) -> torch.Tensor:
     """Extract dense semantic text embeddings for all mapped items from metadata.
 
@@ -81,6 +112,10 @@ def encode_item_metadata(
         )
         embeddings_tensor = torch.from_numpy(embeddings_np).float()
     except Exception as e:
+        if not allow_fallback:
+            raise RuntimeError(
+                f"SentenceTransformer encoding failed for {model_name}"
+            ) from e
         logger.warning(f"SentenceTransformer encoding failed or offline ({e}). Using TF-IDF fallback...")
         from sklearn.feature_extraction.text import TfidfVectorizer
         from sklearn.decomposition import TruncatedSVD

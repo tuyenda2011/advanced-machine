@@ -1,5 +1,5 @@
 import logging
-from typing import Optional
+
 import numpy as np
 import pandas as pd
 
@@ -11,48 +11,81 @@ def create_sparse_train_set(
     sparsity_ratio: float = 1.0,
     seed: int = 42,
 ) -> pd.DataFrame:
-    """Sample p% of training interactions per user, ensuring each user keeps at least 1 interaction edge.
+    """Sample an exact fraction of training edges while preserving graph coverage.
 
     Validation and Test sets MUST remain 100% unchanged.
 
     Args:
         train_df: Training DataFrame with columns [u_idx, i_idx, timestamp?]
-        sparsity_ratio: Ratio of edges to keep per user (0.0 to 1.0)
+        sparsity_ratio: Global ratio of unique edges to keep (0.0 to 1.0)
         seed: Random seed for reproducibility
 
     Returns:
         Sparse training DataFrame
     """
-    if sparsity_ratio >= 1.0:
-        return train_df.copy()
+    if not 0 < sparsity_ratio <= 1:
+        raise ValueError("sparsity_ratio must be between 0 and 1")
 
-    logger.info(f"Applying per-user sparsity sampling at ratio={sparsity_ratio} (seed={seed})...")
-    np.random.seed(seed)
+    required_columns = {"u_idx", "i_idx"}
+    missing_columns = required_columns - set(train_df.columns)
+    if missing_columns:
+        raise ValueError(f"train_df is missing required columns: {sorted(missing_columns)}")
 
-    # Check if timestamp column exists for sorting
+    base = train_df.drop_duplicates(["u_idx", "i_idx"]).reset_index(drop=True)
+    if sparsity_ratio == 1.0 or base.empty:
+        return base.copy()
+
+    logger.info(
+        f"Applying coverage-preserving sparsity sampling at ratio={sparsity_ratio} "
+        f"(seed={seed})..."
+    )
     has_timestamp = "timestamp" in train_df.columns
+    rng = np.random.default_rng(seed)
+    ranked = base.copy()
+    ranked["_edge_id"] = np.arange(len(ranked))
+    ranked["_sample_order"] = rng.random(len(ranked))
 
-    sampled_list = []
-    for _, group in train_df.groupby("u_idx", sort=False):
-        n = len(group)
-        n_keep = max(1, int(np.round(n * sparsity_ratio)))
+    # Build a deterministic graph-covering core: one edge per item, then one
+    # edge for each user not already represented by that item cover.
+    random_order = ranked.sort_values("_sample_order", kind="mergesort")
+    item_cover = random_order.drop_duplicates("i_idx", keep="first")
+    covered_users = set(item_cover["u_idx"])
+    user_cover = random_order.loc[
+        ~random_order["u_idx"].isin(covered_users)
+    ].drop_duplicates("u_idx", keep="first")
+    coverage_ids = set(item_cover["_edge_id"]) | set(user_cover["_edge_id"])
 
-        if n_keep >= n:
-            sampled_list.append(group)
-        else:
-            indices = np.random.choice(group.index, size=n_keep, replace=False)
-            sampled_list.append(group.loc[indices])
+    target_edges = int(round(len(base) * sparsity_ratio))
+    target_edges = max(1, target_edges)
+    retained_edges = max(target_edges, len(coverage_ids))
+    if retained_edges > target_edges:
+        logger.warning(
+            "Requested ratio %.2f%% is below the %d-edge graph coverage floor; "
+            "retaining %.2f%% instead.",
+            sparsity_ratio * 100,
+            len(coverage_ids),
+            retained_edges / len(base) * 100,
+        )
 
-    # Sort by timestamp if available, otherwise just by user
+    additional_needed = retained_edges - len(coverage_ids)
+    additional_ids = random_order.loc[
+        ~random_order["_edge_id"].isin(coverage_ids), "_edge_id"
+    ].head(additional_needed)
+    selected_ids = coverage_ids | set(additional_ids)
+    sampled = ranked.loc[ranked["_edge_id"].isin(selected_ids)].drop(
+        columns=["_edge_id", "_sample_order"]
+    )
+
     sort_cols = ["u_idx"] + (["timestamp"] if has_timestamp else [])
     sparse_train_df = (
-        pd.concat(sampled_list, ignore_index=True)
-        .sort_values(by=sort_cols)
+        sampled.sort_values(by=sort_cols, kind="mergesort")
         .reset_index(drop=True)
     )
 
     logger.info(
-        f"Sparsity ratio {sparsity_ratio}: original edges={len(train_df)} -> retained edges={len(sparse_train_df)} ({len(sparse_train_df)/len(train_df):.2%})"
+        f"Sparsity ratio {sparsity_ratio}: original edges={len(train_df)} -> "
+        f"retained edges={len(sparse_train_df)} ({len(sparse_train_df)/len(base):.2%}); "
+        f"coverage core={len(coverage_ids)} edges"
     )
 
     return sparse_train_df

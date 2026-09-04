@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -13,6 +13,7 @@ def extract_explicit_negative_interactions(
     item2id: Dict[str, int],
     negative_threshold: float = 2.0,
     save_path: str = "data/processed/disliked_interactions.parquet",
+    user_train_cutoffs: Optional[Dict[int, int]] = None,
 ) -> Tuple[pd.DataFrame, Dict[int, List[int]]]:
     """Extract explicit negative interactions (rating <= negative_threshold) for mapped users and items.
 
@@ -46,6 +47,13 @@ def extract_explicit_negative_interactions(
     neg_df = neg_df.dropna(subset=["u_idx", "i_idx"]).copy()
     neg_df["u_idx"] = neg_df["u_idx"].astype(int)
     neg_df["i_idx"] = neg_df["i_idx"].astype(int)
+
+    if user_train_cutoffs is not None:
+        cutoffs = neg_df["u_idx"].map(user_train_cutoffs)
+        neg_df = neg_df[cutoffs.notna() & (neg_df["timestamp"] <= cutoffs)].copy()
+        logger.info(
+            f"Retained {len(neg_df):,} negatives available before each user's training cutoff."
+        )
 
     # De-duplicate: Keep unique (u_idx, i_idx)
     neg_df = neg_df.sort_values(by=["rating", "timestamp"], ascending=[True, False])

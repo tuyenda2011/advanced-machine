@@ -5,21 +5,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.losses.debiased_infonce import DebiasedInfoNCELoss
 from src.models.base import BaseRecommender
 
 logger = logging.getLogger(__name__)
 
 
 class AdaptiveGCL(BaseRecommender):
-    """Adaptive Gated Graph Contrastive Learning for Recommender Systems (AdaptiveGCL).
+    """Experimental multimodal graph recommender for the course project.
 
-    Key Innovations:
-    1. Adaptive Multimodal Gating: Learns dynamic element-wise gate g in (0, 1) between
-       Collaborative ID and Semantic Text embeddings to eliminate Modality Competition.
-    2. User Semantic Profiler: Enriches user representations by aggregating historical text semantics.
-    3. Learnable Layer-Attention: Dynamically weights multi-hop propagation layers (alpha_0, ..., alpha_L)
-       to suppress Graph Oversmoothing.
-    4. Zero-Shot Representation: Seamless zero-shot cold item embedding for long-tail items.
+    It combines gated ID/text item representations, pooled text histories for
+    users, learnable layer aggregation, and semantic contrastive supervision.
+    ``zero_shot_embed`` exposes a text-only representation for separate cold-item
+    experiments; the standard benchmark remains a warm-start ranking protocol.
     """
 
     def __init__(
@@ -34,6 +32,7 @@ class AdaptiveGCL(BaseRecommender):
         ssl_reg: float = 0.1,
         dirichlet_reg: float = 0.01,
         node_dropout: float = 0.0,
+        tau_plus: float = 0.1,
         user_history_features: Optional[torch.Tensor] = None,
     ):
         super().__init__(num_users, num_items, embedding_dim, num_layers)
@@ -42,6 +41,10 @@ class AdaptiveGCL(BaseRecommender):
         self.ssl_reg = ssl_reg
         self.dirichlet_reg = dirichlet_reg
         self.node_dropout = node_dropout
+        self.debiased_ssl = DebiasedInfoNCELoss(
+            temperature=ssl_temp,
+            tau_plus=tau_plus,
+        )
 
         # Cached propagation graph buffer
         self.register_buffer("_cached_norm_adj", None, persistent=False)
@@ -64,7 +67,7 @@ class AdaptiveGCL(BaseRecommender):
 
         # 3. User Semantic Profiler MLP (if user text history is present)
         self.user_semantic_mlp = nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim),
+            nn.Linear(text_dim, embedding_dim),
             nn.LeakyReLU(0.2),
             nn.Linear(embedding_dim, embedding_dim),
         )
@@ -78,15 +81,21 @@ class AdaptiveGCL(BaseRecommender):
                 raise ValueError(
                     f"text_features rows ({text_features.shape[0]}) must match num_items ({num_items})"
                 )
-            self.register_buffer("text_features", text_features.float())
+            self.register_buffer("text_features", text_features.float(), persistent=False)
         else:
-            self.register_buffer("text_features", torch.zeros((num_items, text_dim)))
+            self.register_buffer(
+                "text_features", torch.zeros((num_items, text_dim)), persistent=False
+            )
 
         # Register user history features if provided
         if user_history_features is not None:
-            self.register_buffer("user_history_features", user_history_features.float())
+            self.register_buffer(
+                "user_history_features",
+                user_history_features.float(),
+                persistent=False,
+            )
         else:
-            self.register_buffer("user_history_features", None)
+            self.register_buffer("user_history_features", None, persistent=False)
 
         self._init_adaptive_weights()
 
@@ -104,7 +113,9 @@ class AdaptiveGCL(BaseRecommender):
     def set_text_features(self, text_features: torch.Tensor):
         """Update or set text feature tensor buffer."""
         device = self.user_embedding.weight.device
-        self.register_buffer("text_features", text_features.float().to(device))
+        self.register_buffer(
+            "text_features", text_features.float().to(device), persistent=False
+        )
 
     def get_gated_item_embeddings(
         self, cached_proj_text: Optional[torch.Tensor] = None
@@ -218,8 +229,15 @@ class AdaptiveGCL(BaseRecommender):
         # Lap_X = X - A * X
         ax = torch.sparse.mm(adj, norm_embs)
         diff = norm_embs - ax
-        dirichlet_energy = 0.5 * torch.sum(norm_embs * diff)
+        dirichlet_energy = 0.5 * torch.sum(norm_embs * diff) / norm_embs.size(0)
         return dirichlet_energy
+
+    def compute_dirichlet_regularization(
+        self, norm_adj: torch.Tensor, final_embs: torch.Tensor
+    ) -> torch.Tensor:
+        """Encourage representations to retain variation across graph edges."""
+        energy = self.compute_dirichlet_energy(norm_adj, final_embs)
+        return -self.dirichlet_reg * energy
 
     def compute_semantic_ssl_loss(
         self,
@@ -228,16 +246,15 @@ class AdaptiveGCL(BaseRecommender):
         cached_proj_text: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute Cross-Modal InfoNCE loss between graph topological embeddings and text features."""
-        graph_i_emb = F.normalize(final_items[batch_items], dim=-1)
+        unique_items = torch.unique(batch_items)
+        graph_i_emb = final_items[unique_items]
 
         if cached_proj_text is not None:
-            proj_batch = cached_proj_text[batch_items]
+            proj_batch = cached_proj_text[unique_items]
         else:
-            proj_batch = self.text_proj(self.text_features[batch_items])
-        text_i_emb = F.normalize(proj_batch, dim=-1)
+            proj_batch = self.text_proj(self.text_features[unique_items])
 
-        pos_sim = torch.sum(graph_i_emb * text_i_emb, dim=-1) / self.ssl_temp
-        sim_matrix = torch.matmul(graph_i_emb, text_i_emb.T) / self.ssl_temp
-
-        loss = -torch.mean(pos_sim - torch.logsumexp(sim_matrix, dim=-1))
+        loss = self.debiased_ssl.compute_debiased_contrastive_loss(
+            graph_i_emb, proj_batch
+        )
         return self.ssl_reg * loss

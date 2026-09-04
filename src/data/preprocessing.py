@@ -97,26 +97,21 @@ def preprocess_amazon_electronics(
         pass_count += 1
         filter_pbar.update(1)
 
-        # Count with Counter
+        # Count frequencies with Counter
         user_counter = Counter(df["user_id"].values)
         item_counter = Counter(df["item_id"].values)
 
-        # Get valid indices using numpy (vectorized, fast)
-        valid_user_ids = np.array([u for u, c in user_counter.items() if c >= min_user_interactions])
-        valid_item_ids = np.array([it for it, c in item_counter.items() if c >= min_item_interactions])
+        # Build Python sets for O(1) hash lookup
+        valid_user_ids = {u for u, c in user_counter.items() if c >= min_user_interactions}
+        valid_item_ids = {it for it, c in item_counter.items() if c >= min_item_interactions}
 
         prev_len = len(df)
         if prev_len == 0:
             break
 
-        # Use numpy's isin for vectorized filtering
-        user_arr = df["user_id"].values
-        item_arr = df["item_id"].values
-
-        mask_users = np.isin(user_arr, valid_user_ids)
-        mask_items = np.isin(item_arr, valid_item_ids)
-
-        df = df[mask_users & mask_items].reset_index(drop=True)
+        # Fast vectorized filtering using pandas .isin with sets
+        mask = df["user_id"].isin(valid_user_ids) & df["item_id"].isin(valid_item_ids)
+        df = df[mask].reset_index(drop=True)
 
         if len(df) == prev_len or pass_count >= max_passes:
             if pass_count >= max_passes:

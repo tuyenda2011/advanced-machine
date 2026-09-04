@@ -1,7 +1,43 @@
 """Centralized checkpoint path utilities for consistent checkpoint management across the project."""
 
+import hashlib
 import os
 from typing import Optional
+
+
+def get_experiment_fingerprint(
+    model_name: str,
+    config_dir: str = "configs",
+) -> str:
+    """Hash the data manifest, model config, and core implementation files."""
+    paths = [
+        "data/manifest.json",
+        os.path.join(config_dir, "common.yaml"),
+        os.path.join(config_dir, f"{model_name}.yaml"),
+        os.path.join("src", "models", f"{model_name}.py"),
+        os.path.join("src", "models", "base.py"),
+        os.path.join("scripts", "train.py"),
+        os.path.join("src", "training", "trainer.py"),
+        os.path.join("src", "training", "early_stopping.py"),
+        os.path.join("src", "evaluation", "evaluator.py"),
+        os.path.join("src", "data", "negative_collector.py"),
+        os.path.join("src", "data", "splitter.py"),
+        os.path.join("src", "data", "sparsity.py"),
+        os.path.join("src", "data", "text_encoder.py"),
+        os.path.join("src", "utils", "config.py"),
+        os.path.join("src", "utils", "config_schemas.py"),
+        os.path.join("src", "losses", "bpr.py"),
+        os.path.join("src", "losses", "contrastive.py"),
+        os.path.join("src", "losses", "directau.py"),
+        os.path.join("src", "losses", "debiased_infonce.py"),
+        os.path.join("src", "losses", "hard_bpr.py"),
+    ]
+    digest = hashlib.sha256()
+    for path in paths:
+        digest.update(path.replace("\\", "/").encode("utf-8"))
+        with open(path, "rb") as file:
+            digest.update(file.read())
+    return digest.hexdigest()
 
 
 def get_checkpoint_dir(model_name: str) -> str:
@@ -50,8 +86,8 @@ def find_checkpoint(
     """Find an existing checkpoint for the model, checking multiple possible locations.
 
     Priority order:
-    1. Global best checkpoint (model_best.pt)
-    2. Run-specific checkpoint (model_s{tag}_seed{seed}.pt)
+    1. Run-specific checkpoint (model_s{tag}_seed{seed}.pt)
+    2. Global best checkpoint (model_best.pt)
     3. Legacy checkpoint locations (backwards compatibility)
 
     Args:
@@ -63,10 +99,10 @@ def find_checkpoint(
         Path to the found checkpoint, or None if not found
     """
     candidates = [
-        # Priority 1: Global best checkpoint
-        get_checkpoint_path(model_name, sparsity, seed, checkpoint_type="best"),
-        # Priority 2: Run-specific checkpoint
+        # Priority 1: Run-specific checkpoint
         get_checkpoint_path(model_name, sparsity, seed, checkpoint_type="run"),
+        # Priority 2: Global best checkpoint
+        get_checkpoint_path(model_name, sparsity, seed, checkpoint_type="best"),
         # Priority 3: Legacy paths for backwards compatibility
         os.path.join("results", "checkpoints", f"{model_name}_best.pt"),
         os.path.join("results", "checkpoints", f"{model_name}_s{int(sparsity * 100)}_seed{seed}.pt"),
