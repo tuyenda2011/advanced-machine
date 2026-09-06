@@ -18,14 +18,14 @@ import pandas as pd
 import torch
 
 from src.data.sparsity import create_sparse_train_set
-from src.data.text_encoder import build_user_history_features
+from src.data.text_encoder import build_user_history_features, load_training_text
 from src.evaluation.evaluator import Evaluator
 from src.models.adaptive_gcl import AdaptiveGCL
 from src.models.directau import DirectAU
 from src.models.lightgcn import LightGCN
 from src.models.xsimgcl import XSimGCL
 from src.training.trainer import Trainer
-from src.utils.checkpoints import get_experiment_fingerprint
+from src.utils.checkpoints import get_experiment_fingerprint, get_checkpoint_dir, get_model_output_dir
 from src.utils.config import load_config
 from src.utils.device import get_device
 from src.utils.logging import setup_logger
@@ -37,6 +37,8 @@ logger = setup_logger("train_script")
 def append_to_model_results_csv(results: dict, model_name: str, sparsity: float, seed: int):
     """Save or append run results to dedicated per-model CSV file (results/aggregated/{model}_results.csv)."""
     agg_dir = os.path.join("results", "aggregated")
+    if model_name == "adaptive_gcl":
+        agg_dir = get_model_output_dir("aggregated", model_name)
     os.makedirs(agg_dir, exist_ok=True)
     model_csv = os.path.join(agg_dir, f"{model_name}_results.csv")
 
@@ -45,12 +47,14 @@ def append_to_model_results_csv(results: dict, model_name: str, sparsity: float,
     rep_m = results.get("representation_metrics", {})
     svd_m = results.get("svd_metrics", {})
     sub_m = results.get("subgroup_metrics", {})
-    tail_m = sub_m.get("Tail (Cold-Start)", {})
+    tail_m = sub_m.get("Tail (Low-Activity)", {})
     head_m = sub_m.get("Head (Active)", {})
 
     row = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "model": model_name,
+        "experiment_fingerprint": results.get("experiment_fingerprint"),
+        "text_policy": "masked_text" if model_name == "adaptive_gcl" else None,
         "sparsity": sparsity,
         "seed": seed,
         "best_epoch": results.get("best_epoch", 0),
@@ -86,6 +90,7 @@ def append_to_model_results_csv(results: dict, model_name: str, sparsity: float,
         existing_df = pd.read_csv(model_csv)
         # Update row if exact same model, sparsity, seed exists, else append
         mask = (existing_df["sparsity"] == sparsity) & (existing_df["seed"] == seed)
+        mask &= existing_df.get("experiment_fingerprint", pd.Series("", index=existing_df.index)) == results.get("experiment_fingerprint")
         if mask.any():
             existing_df = existing_df[~mask]
         combined_df = pd.concat([existing_df, new_df], ignore_index=True)
@@ -166,6 +171,8 @@ def main():
         popularity_df=train_df_sparse,
     )
     test_history = pd.concat([train_df, val_df], ignore_index=True)
+    # Shared frozen content features for evaluation, including ID-only baselines.
+    diversity_features, diversity_mask = load_training_text(processed_dir, mappings)
     test_evaluator = Evaluator(
         test_history,
         test_warm,
@@ -174,6 +181,8 @@ def main():
         k_list=top_k_list,
         candidate_items=candidate_items,
         popularity_df=train_df_sparse,
+        diversity_features=diversity_features,
+        diversity_mask=diversity_mask,
     )
 
     # 7. Instantiate model
@@ -206,24 +215,12 @@ def main():
         )
     elif args.model == "adaptive_gcl":
         ada_cfg = config.get("adaptive_gcl", {})
-        text_emb_path = os.path.join(processed_dir, "item_text_embeddings.pt")
-        text_features = None
-        if os.path.exists(text_emb_path):
-            logger.info(f"Loading item text features from {text_emb_path} for AdaptiveGCL...")
-            text_features = torch.load(text_emb_path, map_location="cpu", weights_only=False)
-            text_dim = text_features.shape[1]
-        else:
-            raise FileNotFoundError(
-                f"AdaptiveGCL requires item text features at {text_emb_path}. "
-                "Run scripts/prepare_data.py first."
-            )
-
-        user_history_features = None
-        if text_features is not None:
-            logger.info("Building user semantic profiles from sparse training history...")
-            user_history_features = build_user_history_features(
-                train_df_sparse, text_features, num_users
-            )
+        text_features, item_text_mask = diversity_features, diversity_mask
+        text_dim = text_features.shape[1]
+        user_history_features, user_text_mask = build_user_history_features(
+            train_df_sparse, text_features, num_users, item_text_mask
+        )
+        logger.info("Usable text: %s/%s items; semantic profiles: %s/%s users", int(item_text_mask.sum()), num_items, int(user_text_mask.sum()), num_users)
 
         model = AdaptiveGCL(
             num_users,
@@ -234,16 +231,21 @@ def main():
             text_features=text_features,
             ssl_temp=ada_cfg.get("ssl_temp", 0.2),
             ssl_reg=ada_cfg.get("ssl_reg", 0.1),
-            dirichlet_reg=ada_cfg.get("dirichlet_reg", 0.01),
+            dirichlet_reg=ada_cfg.get("dirichlet_reg", 0.0),
             node_dropout=ada_cfg.get("node_dropout", 0.0),
-            tau_plus=ada_cfg.get("tau_plus", 0.1),
+            tau_plus=ada_cfg.get("tau_plus", 0.0),
             user_history_features=user_history_features,
+            item_text_mask=item_text_mask,
+            user_text_mask=user_text_mask,
+            use_item_text=ada_cfg.get("use_item_text", True),
+            user_semantic_weight=ada_cfg.get("user_semantic_weight", 0.5),
+            layer_aggregation=ada_cfg.get("layer_aggregation", "learnable"),
         )
 
 
     # 8. Train model
     sparsity_tag = f"s{int(args.sparsity * 100)}"
-    checkpoint_dir = os.path.join("results", "checkpoints", args.model)
+    checkpoint_dir = get_checkpoint_dir(args.model)
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_path = os.path.join(checkpoint_dir, f"{args.model}_{sparsity_tag}_seed{args.seed}.pt")
 
@@ -263,8 +265,10 @@ def main():
     results["seed"] = args.seed
     results["max_epochs"] = config["training"]["epochs"]
     results["experiment_fingerprint"] = config["experiment_fingerprint"]
+    results["text_policy"] = "masked_text" if args.model == "adaptive_gcl" else None
+    results["evaluation_protocol"] = "shared_minilm_diversity_v2"
 
-    results_dir = os.path.join("results", "raw", args.model)
+    results_dir = get_model_output_dir("raw", args.model)
     os.makedirs(results_dir, exist_ok=True)
     run_file = os.path.join(results_dir, f"{args.model}_{sparsity_tag}_seed{args.seed}.json")
 
@@ -288,7 +292,7 @@ def main():
         try:
             with open(global_best_meta_path, "r", encoding="utf-8") as f:
                 prev_best = json.load(f)
-            if prev_best.get("Val_NDCG@10", float("-inf")) >= current_val_ndcg:
+            if prev_best.get("experiment_fingerprint") == config["experiment_fingerprint"] and prev_best.get("Val_NDCG@10", float("-inf")) >= current_val_ndcg:
                 is_new_global_best = False
         except Exception:
             is_new_global_best = True
@@ -299,6 +303,7 @@ def main():
         with open(global_best_meta_path, "w", encoding="utf-8") as f:
             json.dump({
                 "model": args.model,
+                "experiment_fingerprint": config["experiment_fingerprint"],
                 "sparsity": args.sparsity,
                 "seed": args.seed,
                 "best_epoch": results.get("best_epoch", 0),

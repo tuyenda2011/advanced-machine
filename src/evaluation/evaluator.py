@@ -26,11 +26,26 @@ class Evaluator:
         batch_size: int = 1024,
         candidate_items: Optional[Set[int]] = None,
         popularity_df: Optional[pd.DataFrame] = None,
+        diversity_features: Optional[torch.Tensor] = None,
+        diversity_mask: Optional[torch.Tensor] = None,
     ):
         self.num_users = num_users
         self.num_items = num_items
         self.k_list = k_list
         self.batch_size = batch_size
+        self.diversity_features = None
+        self.diversity_mask = None
+        if diversity_features is not None:
+            if diversity_features.ndim != 2 or diversity_features.shape[0] != num_items:
+                raise ValueError("Diversity features must have one row per item")
+            if diversity_mask is None or diversity_mask.dtype != torch.bool or diversity_mask.shape != (num_items,):
+                raise ValueError("Diversity requires a boolean usable-text mask")
+            if not torch.isfinite(diversity_features).all():
+                raise ValueError("Diversity features must be finite")
+            if (diversity_features[diversity_mask].norm(dim=1) == 0).any():
+                raise ValueError("Usable diversity features must be nonzero")
+            self.diversity_features = diversity_features.detach().cpu().clone()
+            self.diversity_mask = diversity_mask.detach().cpu().clone()
 
         # Build training history set per user for masking
         self.train_history: Dict[int, Set[int]] = (
@@ -152,11 +167,16 @@ class Evaluator:
 
         if include_beyond_accuracy and topk_preds_tensor.size(0) > 0:
             for k in self.k_list:
-                # Intra-List Diversity
-                ild = compute_intra_list_diversity(
-                    topk_preds_tensor, final_item_embeds, k=k
-                )
-                metrics[f"Diversity@{k}"] = ild
+                # Shared content space only; never silently use model embeddings.
+                metrics[f"Diversity@{k}"] = float("nan")
+                if self.diversity_features is not None:
+                    metrics[f"Diversity@{k}"] = compute_intra_list_diversity(
+                        topk_preds_tensor, self.diversity_features, k=k,
+                        item_mask=self.diversity_mask,
+                    )
+                    metrics[f"DiversityValidTextFraction@{k}"] = float(
+                        self.diversity_mask[topk_preds_tensor[:, :k]].float().mean()
+                    )
 
                 # Novelty (Self-Information)
                 novelty = compute_novelty(

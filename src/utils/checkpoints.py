@@ -20,12 +20,18 @@ def get_experiment_fingerprint(
         os.path.join("src", "training", "trainer.py"),
         os.path.join("src", "training", "early_stopping.py"),
         os.path.join("src", "evaluation", "evaluator.py"),
+        os.path.join("src", "evaluation", "metrics.py"),
+        os.path.join("src", "evaluation", "subgroup.py"),
         os.path.join("src", "data", "negative_collector.py"),
         os.path.join("src", "data", "splitter.py"),
         os.path.join("src", "data", "sparsity.py"),
         os.path.join("src", "data", "text_encoder.py"),
+        os.path.join("src", "data", "provenance.py"),
+        os.path.join("src", "data", "preprocessing.py"),
+        os.path.join("src", "training", "loss_strategies.py"),
         os.path.join("src", "utils", "config.py"),
         os.path.join("src", "utils", "config_schemas.py"),
+        os.path.join("src", "utils", "geometry.py"),
         os.path.join("src", "losses", "bpr.py"),
         os.path.join("src", "losses", "contrastive.py"),
         os.path.join("src", "losses", "directau.py"),
@@ -40,6 +46,11 @@ def get_experiment_fingerprint(
     return digest.hexdigest()
 
 
+def get_model_output_dir(section: str, model_name: str) -> str:
+    path = os.path.join("results", section, model_name)
+    return os.path.join(path, "masked_text") if model_name == "adaptive_gcl" else path
+
+
 def get_checkpoint_dir(model_name: str) -> str:
     """Get the checkpoint directory for a given model.
 
@@ -49,7 +60,7 @@ def get_checkpoint_dir(model_name: str) -> str:
     Returns:
         Absolute path to the checkpoint directory
     """
-    return os.path.join("results", "checkpoints", model_name)
+    return get_model_output_dir("checkpoints", model_name)
 
 
 def get_checkpoint_path(

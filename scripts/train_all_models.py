@@ -153,7 +153,7 @@ def main():
             rep_m = r.get("representation_metrics", {})
             svd_m = r.get("svd_metrics", {})
             sub_m = r.get("subgroup_metrics", {})
-            tail_m = sub_m.get("Tail (Cold-Start)", {})
+            tail_m = sub_m.get("Tail (Low-Activity)", {})
 
             summary_rows.append({
                 "Model": m_name,

@@ -200,7 +200,11 @@ def main():
             bar_colors = [colors.get(m, "#333333") for m in models]
             bar_labels = [labels.get(m, m) for m in models]
 
-            bars = ax.bar(bar_labels, means, yerr=stds, capsize=5, color=bar_colors, alpha=0.85, width=0.5)
+            bars = ax.bar(bar_labels, means, color=bar_colors, alpha=0.85, width=0.5)
+            valid_std = np.isfinite(stds)
+            if valid_std.any():
+                ax.errorbar(np.arange(len(means))[valid_std], means[valid_std],
+                            yerr=stds[valid_std], fmt="none", ecolor="black", capsize=5)
 
             for bar, mean in zip(bars, means):
                 height = bar.get_height()
@@ -287,7 +291,7 @@ def main():
             ax.errorbar(
                 x,
                 y,
-                yerr=y_err,
+                yerr=np.ma.masked_invalid(y_err) if np.isfinite(y_err).any() else None,
                 label=labels.get(model, model.upper()),
                 color=colors.get(model, "#333333"),
                 marker="o",
@@ -308,7 +312,7 @@ def main():
         plt.close(fig)
         logger.info(f"Saved figure: {filename}")
 
-    # 4. Subgroup Analysis Plot (Cold-Start Tail vs Active Head Users)
+    # 4. Subgroup analysis by training-degree quantiles (not cold-start).
     if "Tail_Recall@10_mean" in df.columns and "Head_Recall@10_mean" in df.columns:
         fig, ax = plt.subplots(figsize=(8, 5))
         df100 = df[df["sparsity"] == 1.0]
@@ -320,10 +324,10 @@ def main():
         x = np.arange(len(models))
         width = 0.35
 
-        ax.bar(x - width / 2, tail_means, width, label="Tail Users (≤ 5 interactions)", color="#d62728", alpha=0.85)
-        ax.bar(x + width / 2, head_means, width, label="Head Users (> 5 interactions)", color="#2ca02c", alpha=0.85)
+        ax.bar(x - width / 2, tail_means, width, label="Tail (degree <= 20th percentile)", color="#d62728", alpha=0.85)
+        ax.bar(x + width / 2, head_means, width, label="Head (degree > 80th percentile)", color="#2ca02c", alpha=0.85)
 
-        ax.set_title("Subgroup Performance: Cold-Start Tail vs Active Head Users (Recall@10)", fontsize=12, fontweight="bold", pad=12)
+        ax.set_title("Subgroup Performance: Low-Activity Tail vs Active Head (Recall@10)", fontsize=12, fontweight="bold", pad=12)
         ax.set_ylabel("Recall@10", fontsize=11)
         ax.set_xticks(x)
         ax.set_xticklabels([labels.get(m, m.upper()) for m in models], fontweight="bold")

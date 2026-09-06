@@ -3,8 +3,9 @@ import gzip
 import json
 import logging
 import os
-from typing import Optional, Tuple
 import urllib.request
+from typing import Any
+
 import pandas as pd
 from tqdm import tqdm
 
@@ -40,42 +41,80 @@ def download_amazon_electronics(
 
     if not os.path.exists(reviews_file):
         logger.info(f"Downloading Reviews from {reviews_url}...")
-        with DownloadProgressBar(unit="B", unit_scale=True, miniters=1, desc="Downloading Reviews") as t:
-            urllib.request.urlretrieve(reviews_url, filename=reviews_file, reporthook=t.update_to)
+        with DownloadProgressBar(
+            unit="B", unit_scale=True, miniters=1, desc="Downloading Reviews"
+        ) as t:
+            urllib.request.urlretrieve(
+                reviews_url, filename=reviews_file, reporthook=t.update_to
+            )
         logger.info("Reviews download completed.")
 
     if not os.path.exists(meta_file):
         logger.info(f"Downloading Meta from {meta_url}...")
-        with DownloadProgressBar(unit="B", unit_scale=True, miniters=1, desc="Downloading Metadata") as t:
-            urllib.request.urlretrieve(meta_url, filename=meta_file, reporthook=t.update_to)
+        with DownloadProgressBar(
+            unit="B", unit_scale=True, miniters=1, desc="Downloading Metadata"
+        ) as t:
+            urllib.request.urlretrieve(
+                meta_url, filename=meta_file, reporthook=t.update_to
+            )
         logger.info("Meta download completed.")
 
     return dataset_dir
 
 
-def get_df_from_json_gz(path: str, desc: Optional[str] = None) -> pd.DataFrame:
+def get_df_from_json_gz(path: str, desc: str | None = None) -> pd.DataFrame:
     """Load json.gz into Pandas DataFrame with live tqdm progress bar."""
     file_name = os.path.basename(path)
     pbar_desc = desc if desc is not None else f"Parsing {file_name}"
     logger.info(f"Parsing JSON GZ file: {path}")
 
     data = []
+    ledger: dict[str, Any] = {
+        "total_lines": 0,
+        "blank_lines": 0,
+        "parsed_rows": 0,
+        "invalid_lines": 0,
+        "error_examples": [],
+    }
     with gzip.open(path, "rt", encoding="utf-8") as f:
         for line in tqdm(f, desc=pbar_desc, unit=" lines", dynamic_ncols=True):
+            ledger["total_lines"] += 1
             line_str = line.strip()
             if not line_str:
+                ledger["blank_lines"] += 1
                 continue
             try:
-                data.append(json.loads(line_str))
-            except Exception:
+                record = json.loads(line_str)
+            except (ValueError, TypeError):
                 try:
-                    data.append(ast.literal_eval(line_str))
-                except Exception:
-                    continue
-    return pd.DataFrame.from_dict(data)
+                    record = ast.literal_eval(line_str)
+                except (ValueError, SyntaxError, TypeError):
+                    record = None
+            if not isinstance(record, dict):
+                ledger["invalid_lines"] += 1
+                if len(ledger["error_examples"]) < 20:
+                    ledger["error_examples"].append(
+                        {
+                            "line": ledger["total_lines"],
+                            "reason": "not a parseable object",
+                        }
+                    )
+                continue
+            data.append(record)
+            ledger["parsed_rows"] += 1
+    if ledger["invalid_lines"]:
+        logger.warning(
+            "%s: %s invalid lines; examples (no review text): %s",
+            file_name,
+            ledger["invalid_lines"],
+            ledger["error_examples"],
+        )
+    frame = pd.DataFrame.from_dict(data)
+    frame.attrs["ingestion_ledger"] = ledger
+    return frame
 
 
-def load_raw_data(dataset_dir: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def load_raw_data(dataset_dir: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Load raw Amazon Electronics reviews and metadata into DataFrames with progress bars."""
     reviews_path = os.path.join(dataset_dir, "reviews_Electronics_5.json.gz")
     meta_path = os.path.join(dataset_dir, "meta_Electronics.json.gz")

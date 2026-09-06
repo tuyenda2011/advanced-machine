@@ -1,8 +1,8 @@
 import html
 import logging
 import re
-from typing import Any, Dict, Tuple
-import numpy as np
+from typing import Any
+
 import pandas as pd
 from tqdm import tqdm
 
@@ -25,6 +25,83 @@ def clean_text(text: Any) -> str:
 
 UNKNOWN_PLACEHOLDER = "unknown item"
 
+METADATA_FLAGS = (
+    "has_title",
+    "has_brand",
+    "has_category",
+    "has_specific_category",
+    "has_usable_text",
+)
+METADATA_POLICY = "title_or_brand_or_specific_category_v1"
+
+
+def metadata_flags(meta: dict) -> dict:
+    """Classify cleaned source fields, never imputed labels."""
+    missing = {
+        "",
+        "unknown",
+        UNKNOWN_PLACEHOLDER,
+        "electronics product",
+        "unknown electronics product",
+    }
+    title = clean_text(meta.get("title"))
+    brand = clean_text(meta.get("brand"))
+    category = clean_text(meta.get("categories"))
+    has_title = (
+        title.lower() not in missing and title != f"Item {meta.get('original_id', '')}"
+    )
+    has_brand = brand.lower() not in missing
+    has_category = category.lower() not in missing
+    specific = has_category and any(
+        c.strip().lower() not in missing | {"electronics"} for c in category.split(">")
+    )
+    return dict(
+        zip(
+            METADATA_FLAGS,
+            (
+                has_title,
+                has_brand,
+                has_category,
+                specific,
+                has_title or has_brand or specific,
+            ),
+        )
+    )
+
+
+def summarize_metadata_quality(item_metadata: dict) -> dict:
+    """Count missing/fallback fields without treating placeholders as real text."""
+    missing_values = {"", "unknown", UNKNOWN_PLACEHOLDER}
+    titles = brands = generic_categories = 0
+    for meta in item_metadata.values():
+        title = str(meta.get("title", "")).strip()
+        titles += (
+            title.lower() in missing_values
+            or title == f"Item {meta.get('original_id', '')}"
+        )
+        brands += str(meta.get("brand", "")).strip().lower() in missing_values
+        generic_categories += str(meta.get("categories", "")).strip() in {
+            "",
+            "Electronics",
+        }
+    count = len(item_metadata)
+    flags = [metadata_flags(meta) for meta in item_metadata.values()]
+    complete = sum(
+        f["has_title"] and f["has_brand"] and f["has_category"] for f in flags
+    )
+    unusable = sum(not f["has_usable_text"] for f in flags)
+    return {
+        "num_items": count,
+        "missing_or_fallback_titles": titles,
+        "missing_or_unknown_brands": brands,
+        "generic_or_missing_categories": generic_categories,
+        "missing_title_fraction": titles / max(1, count),
+        "missing_brand_fraction": brands / max(1, count),
+        "complete_metadata": complete,
+        "partial_metadata": count - complete - unusable,
+        "no_usable_text": unusable,
+    }
+
 
 def parse_categories(categories_raw: Any) -> str:
     """Parse nested category list and format into clear hierarchy string."""
@@ -33,7 +110,11 @@ def parse_categories(categories_raw: Any) -> str:
         for item in categories_raw:
             if isinstance(item, list):
                 flat_cats.extend(
-                    [clean_text(c) for c in item if c and clean_text(c) != UNKNOWN_PLACEHOLDER]
+                    [
+                        clean_text(c)
+                        for c in item
+                        if c and clean_text(c) != UNKNOWN_PLACEHOLDER
+                    ]
                 )
             elif isinstance(item, str):
                 cleaned = clean_text(item)
@@ -41,12 +122,12 @@ def parse_categories(categories_raw: Any) -> str:
                     flat_cats.append(cleaned)
         if flat_cats:
             # Deduplicate sequential identical categories while preserving order
-            unique_seq = []
+            unique_seq: list[str] = []
             for c in flat_cats:
                 if not unique_seq or unique_seq[-1] != c:
                     unique_seq.append(c)
             return " > ".join(unique_seq[-3:])
-    return "Electronics"
+    return UNKNOWN_PLACEHOLDER
 
 
 def preprocess_amazon_electronics(
@@ -55,7 +136,13 @@ def preprocess_amazon_electronics(
     positive_threshold: float = 4.0,
     min_user_interactions: int = 5,
     min_item_interactions: int = 5,
-) -> Tuple[pd.DataFrame, Dict[str, int], Dict[str, int], Dict[int, Dict[str, str]], Dict[str, Any]]:
+) -> tuple[
+    pd.DataFrame,
+    dict[str, int],
+    dict[str, int],
+    dict[int, dict[str, str]],
+    dict[str, Any],
+]:
     """Convert ratings to implicit feedback, deduplicate interactions, filter bipartite K-core,
     re-index contiguous IDs, clean metadata, and calculate graph statistics.
     """
@@ -65,16 +152,20 @@ def preprocess_amazon_electronics(
     )
 
     # Normalize column names from Amazon to standard
-    ratings_df = ratings_df.rename(columns={
-        "reviewerID": "user_id",
-        "asin": "item_id",
-        "overall": "rating",
-        "unixReviewTime": "timestamp"
-    })
+    ratings_df = ratings_df.rename(
+        columns={
+            "reviewerID": "user_id",
+            "asin": "item_id",
+            "overall": "rating",
+            "unixReviewTime": "timestamp",
+        }
+    )
 
     # 1. Filter implicit positive feedback
     df = ratings_df[ratings_df["rating"] >= positive_threshold].copy()
-    logger.info(f"Retained {len(df)} positive interactions out of {len(ratings_df)} total ratings.")
+    logger.info(
+        f"Retained {len(df)} positive interactions out of {len(ratings_df)} total ratings."
+    )
 
     # 2. De-duplication: For identical (user_id, item_id), keep the most recent
     # interaction; tie-break by highest rating (spec: [timestamp DESC, rating DESC]).
@@ -82,6 +173,14 @@ def preprocess_amazon_electronics(
     df = df.sort_values(by=["timestamp", "rating"], ascending=[False, False])
     df = df.drop_duplicates(subset=["user_id", "item_id"], keep="first").copy()
     num_dups = initial_len - len(df)
+    ledger: dict[str, Any] = {
+        "input_ratings": len(ratings_df),
+        "positive_ratings": initial_len,
+        "removed_by_rating": len(ratings_df) - initial_len,
+        "removed_duplicates": num_dups,
+        "after_dedup": len(df),
+        "kcore_rounds": [],
+    }
     if num_dups > 0:
         logger.info(f"Removed {num_dups} duplicate (user_id, item_id) interactions.")
 
@@ -91,7 +190,6 @@ def preprocess_amazon_electronics(
 
     filter_pbar = tqdm(total=None, desc="Filtering Bipartite K-core", unit=" passes")
     pass_count = 0
-    max_passes = 20  # Safety limit
 
     while True:
         pass_count += 1
@@ -102,8 +200,12 @@ def preprocess_amazon_electronics(
         item_counter = Counter(df["item_id"].values)
 
         # Build Python sets for O(1) hash lookup
-        valid_user_ids = {u for u, c in user_counter.items() if c >= min_user_interactions}
-        valid_item_ids = {it for it, c in item_counter.items() if c >= min_item_interactions}
+        valid_user_ids = {
+            u for u, c in user_counter.items() if c >= min_user_interactions
+        }
+        valid_item_ids = {
+            it for it, c in item_counter.items() if c >= min_item_interactions
+        }
 
         prev_len = len(df)
         if prev_len == 0:
@@ -112,14 +214,33 @@ def preprocess_amazon_electronics(
         # Fast vectorized filtering using pandas .isin with sets
         mask = df["user_id"].isin(valid_user_ids) & df["item_id"].isin(valid_item_ids)
         df = df[mask].reset_index(drop=True)
+        ledger["kcore_rounds"].append(
+            {
+                "round": pass_count,
+                "before": prev_len,
+                "removed": prev_len - len(df),
+                "after": len(df),
+            }
+        )
 
-        if len(df) == prev_len or pass_count >= max_passes:
-            if pass_count >= max_passes:
-                logger.warning(f"K-core filtering reached max passes ({max_passes}).")
+        # Each nonterminal pass removes edges, so finite input guarantees
+        # termination without an arbitrary cap that could return a non-core.
+        if len(df) == prev_len:
             break
 
     filter_pbar.close()
-    logger.info(f"Bipartite K-core converged in {pass_count} passes. Final: {len(df)} interactions.")
+    if df.empty:
+        raise ValueError(
+            "No interactions remain after positive filtering and K-core pruning"
+        )
+    if (
+        df.groupby("user_id").size().min() < min_user_interactions
+        or df.groupby("item_id").size().min() < min_item_interactions
+    ):
+        raise AssertionError("K-core postcondition failed")
+    logger.info(
+        f"Bipartite K-core converged in {pass_count} passes. Final: {len(df)} interactions."
+    )
 
     # 4. Create contiguous 0-indexed mappings
     unique_users = sorted(df["user_id"].unique())
@@ -136,15 +257,25 @@ def preprocess_amazon_electronics(
     items_dict = items_df.to_dict(orient="index")
     item_metadata = {}
 
-    for item_asin, idx in tqdm(item2id.items(), desc="Cleaning & Mapping Metadata", unit=" items"):
+    for item_asin, idx in tqdm(
+        item2id.items(), desc="Cleaning & Mapping Metadata", unit=" items"
+    ):
         meta = items_dict.get(
             item_asin,
-            {"title": f"Item {item_asin}", "brand": "Unknown", "categories": [["Electronics"]]},
+            {
+                "title": None,
+                "brand": None,
+                "categories": [],
+            },
         )
 
         title_cleaned = clean_text(meta.get("title", f"Item {item_asin}"))
         brand_cleaned = clean_text(meta.get("brand", "Unknown"))
-        categories_cleaned = parse_categories(meta.get("categories", [["Electronics"]]))
+        categories_raw = meta.get("categories", [])
+        categories_cleaned = parse_categories(categories_raw)
+        # Preserve absence before parse_categories supplies a display fallback.
+        if not isinstance(categories_raw, list) or not categories_raw:
+            categories_cleaned = UNKNOWN_PLACEHOLDER
 
         item_metadata[idx] = {
             "title": title_cleaned,
@@ -152,6 +283,7 @@ def preprocess_amazon_electronics(
             "categories": categories_cleaned,
             "original_id": str(item_asin),
         }
+        item_metadata[idx].update(metadata_flags(item_metadata[idx]))
 
     # 6. Compute graph statistics
     num_users = len(unique_users)
@@ -173,6 +305,9 @@ def preprocess_amazon_electronics(
         "max_user_interactions": int(user_interaction_counts.max()),
         "mean_item_interactions": float(item_interaction_counts.mean()),
         "min_item_interactions": int(item_interaction_counts.min()),
+        "kcore_iterations": pass_count,
+        "metadata_quality": summarize_metadata_quality(item_metadata),
+        "filter_ledger": {**ledger, "output_interactions": len(df)},
     }
 
     logger.info(
@@ -181,5 +316,6 @@ def preprocess_amazon_electronics(
         f"MinUserInteractions={stats['min_user_interactions']}, MinItemInteractions={stats['min_item_interactions']}"
     )
 
-    return df[["u_idx", "i_idx", "timestamp"]], user2id, item2id, item_metadata, stats
-
+    result = df[["u_idx", "i_idx", "timestamp"]].copy()
+    result.attrs.clear()  # Keep ingestion provenance in manifest, not parquet schema metadata.
+    return result, user2id, item2id, item_metadata, stats

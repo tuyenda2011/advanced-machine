@@ -1,16 +1,17 @@
-from typing import Optional
-
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 
 class BPRLoss(nn.Module):
-    """Bayesian Personalized Ranking (BPR) Loss with L2 Regularization on initial embeddings."""
+    """BPR with squared L2 or SELFRec's unsquared batch-norm regularization."""
 
-    def __init__(self, weight_decay: float = 1e-4):
+    def __init__(self, weight_decay: float = 1e-4, regularization: str = "squared"):
         super().__init__()
+        if regularization not in {"squared", "selfrec"}:
+            raise ValueError("regularization must be 'squared' or 'selfrec'")
         self.weight_decay = weight_decay
+        self.regularization = regularization
 
     def forward(
         self,
@@ -18,7 +19,7 @@ class BPRLoss(nn.Module):
         neg_scores: torch.Tensor,
         u_emb0: torch.Tensor,
         pos_emb0: torch.Tensor,
-        neg_emb0: Optional[torch.Tensor],
+        neg_emb0: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute BPR Loss and L2 Regularization Loss.
 
@@ -36,11 +37,18 @@ class BPRLoss(nn.Module):
         # BPR Loss: -log(sigmoid(pos_score - neg_score)) = softplus(-(pos_score - neg_score))
         bpr_loss = torch.mean(F.softplus(neg_scores - pos_scores))
 
-        # L2 Regularization on initial embeddings (e0)
-        reg_sum = u_emb0.norm(2).pow(2) + pos_emb0.norm(2).pow(2)
+        embeddings = [u_emb0, pos_emb0]
         if neg_emb0 is not None:
-            reg_sum = reg_sum + neg_emb0.norm(2).pow(2)
-        reg_loss = reg_sum / (2.0 * pos_scores.shape[0])
+            embeddings.append(neg_emb0)
+        if self.regularization == "selfrec":
+            # SELFRec/util/loss_torch.py: sum(norm(embedding) / batch_size).
+            reg_loss = sum(
+                embedding.norm(2) / embedding.shape[0] for embedding in embeddings
+            )
+        else:
+            reg_loss = sum(embedding.norm(2).pow(2) for embedding in embeddings) / (
+                2.0 * pos_scores.shape[0]
+            )
 
         total_loss = bpr_loss + self.weight_decay * reg_loss
         return total_loss, bpr_loss

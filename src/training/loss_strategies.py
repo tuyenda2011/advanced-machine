@@ -109,7 +109,7 @@ class XSimGCLStrategy(LossStrategy):
         contrastive_weight: float = 0.1,
         temperature: float = 0.2,
     ):
-        self.bpr_loss_fn = BPRLoss(weight_decay=weight_decay)
+        self.bpr_loss_fn = BPRLoss(weight_decay=weight_decay, regularization="selfrec")
         self.cl_loss_fn = InfoNCELoss(temperature=temperature)
         self.weight_decay = weight_decay
         self.contrastive_weight = contrastive_weight
@@ -210,7 +210,7 @@ class AdaptiveGCLStrategy(LossStrategy):
         weight_decay: float = 1e-4,
         ssl_temp: float = 0.2,
         ssl_reg: float = 0.1,
-        dirichlet_reg: float = 0.01,
+        dirichlet_reg: float = 0.0,
     ):
         self.bpr_loss_fn = BPRLoss(weight_decay=weight_decay)
         self.weight_decay = weight_decay
@@ -307,7 +307,7 @@ def get_loss_strategy(model_name: str, config: Dict[str, Any]) -> LossStrategy:
             weight_decay=weight_decay,
             ssl_temp=ada_cfg.get("ssl_temp", 0.2),
             ssl_reg=ada_cfg.get("ssl_reg", 0.1),
-            dirichlet_reg=ada_cfg.get("dirichlet_reg", 0.01),
+            dirichlet_reg=ada_cfg.get("dirichlet_reg", 0.0),
         )
 
     else:

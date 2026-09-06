@@ -20,8 +20,9 @@ from tqdm import tqdm
 from src.evaluation.significance import (
     compute_statistical_significance,
     generate_latex_table,
+    summarize_metric,
 )
-from src.utils.checkpoints import get_experiment_fingerprint
+from src.utils.checkpoints import get_experiment_fingerprint, get_model_output_dir
 from src.utils.logging import setup_logger
 
 logger = setup_logger("benchmark_all")
@@ -82,7 +83,7 @@ def main():
         sparsity_tag = f"s{sparsity_pct}"
 
         preferred_run_file = os.path.join(
-            results_dir, model, f"{model}_{sparsity_tag}_seed{seed}.json"
+            get_model_output_dir("raw", model), f"{model}_{sparsity_tag}_seed{seed}.json"
         )
         legacy_run_file = os.path.join(
             results_dir, f"{model}_{sparsity_tag}_seed{seed}.json"
@@ -178,12 +179,13 @@ def main():
         svd_m = r.get("svd_metrics", {})
         sub_m = r.get("subgroup_metrics", {})
 
-        tail_res = sub_m.get("Tail (Cold-Start)", {})
+        tail_res = sub_m.get("Tail (Low-Activity)", {})
         head_res = sub_m.get("Head (Active)", {})
 
         rows.append(
             {
                 "model": r["model_name"],
+                "evaluation_protocol": r.get("evaluation_protocol", "legacy_model_embedding_diversity"),
                 "sparsity": r["sparsity_level"],
                 "seed": r["seed"],
                 "best_epoch": r.get("best_epoch", 0),
@@ -199,7 +201,7 @@ def main():
                 "Recall@20": test_m.get("Recall@20", 0.0),
                 "NDCG@20": test_m.get("NDCG@20", 0.0),
                 # Beyond-Accuracy Metrics
-                "Diversity@10": test_m.get("Diversity@10", 0.0),
+                "Diversity@10": test_m.get("Diversity@10", float("nan")),
                 "Novelty@10": test_m.get("Novelty@10", 0.0),
                 "Coverage@10": test_m.get("Coverage@10", 0.0),
                 "Gini@10": test_m.get("Gini@10", 0.0),
@@ -254,21 +256,19 @@ def main():
             "sparsity": sparsity,
             "model": model,
             "runs": len(group),
+            "evaluation_protocol": group["evaluation_protocol"].iloc[0],
         }
 
         for m in metrics_list:
             if m in group:
-                m_mean = float(group[m].mean())
-                m_std = float(group[m].std()) if len(group) > 1 else 0.0
-                row_dict[f"{m}_mean"] = m_mean
-                row_dict[f"{m}_std"] = m_std if not np.isnan(m_std) else 0.0
-                row_dict[f"{m}_str"] = f"{m_mean:.4f} ± {0.0 if np.isnan(m_std) else m_std:.4f}"
+                for suffix, value in summarize_metric(group[m]).items():
+                    row_dict[f"{m}_{suffix}"] = value
 
         agg_rows.append(row_dict)
 
     agg_df = pd.DataFrame(agg_rows)
     agg_csv = os.path.join(agg_dir, "benchmark_summary.csv")
-    agg_df.to_csv(agg_csv, index=False)
+    agg_df.to_csv(agg_csv, index=False, na_rep="N/A")
     logger.info(f"Saved aggregated benchmark summary to {agg_csv}")
 
     # Save per-model summary files
@@ -276,7 +276,7 @@ def main():
         m_df = agg_df[agg_df["model"] == m_name]
         if not m_df.empty:
             m_csv = os.path.join(agg_dir, f"{m_name}_summary.csv")
-            m_df.to_csv(m_csv, index=False)
+            m_df.to_csv(m_csv, index=False, na_rep="N/A")
             logger.info(f"Saved dedicated summary for {m_name.upper()} to {m_csv}")
 
     # Statistical Significance Testing (Any model vs LightGCN)
@@ -293,7 +293,7 @@ def main():
                     lgcn_scores,
                     on="seed",
                     suffixes=("_model", "_lightgcn"),
-                ).sort_values("seed")
+                ).sort_values("seed").dropna()
                 if not paired.empty:
                     sig_res = compute_statistical_significance(
                         paired[f"{m_name}_model"].values,
@@ -309,7 +309,7 @@ def main():
     if sig_results:
         sig_df = pd.DataFrame(sig_results)
         sig_csv = os.path.join(agg_dir, "statistical_significance.csv")
-        sig_df.to_csv(sig_csv, index=False)
+        sig_df.to_csv(sig_csv, index=False, na_rep="N/A")
         logger.info(f"Saved statistical significance analysis to {sig_csv}")
 
     # Generate Publication-ready LaTeX Table

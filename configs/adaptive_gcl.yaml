@@ -1,11 +1,16 @@
 model_name: "adaptive_gcl"
 
 adaptive_gcl:
+  text_policy: "masked_text"
   text_dim: 384
+  use_item_text: true # false bypasses item fusion only, not user text or SSL
+  user_semantic_weight: 0.5 # 0 bypasses the user semantic MLP
+  layer_aggregation: "learnable" # global layer weights, or fixed "mean"
+  mlp_weight_decay: 0.0 # Adam L2 on MLP matrices only; tune on validation
   ssl_temp: 0.2
   ssl_reg: 0.1
-  dirichlet_reg: 0.01
+  dirichlet_reg: 0.0 # experimental; high energy does not guarantee non-collapse
   node_dropout: 0.05
-  tau_plus: 0.1
+  tau_plus: 0.0 # ordinary InfoNCE; positive priors are opt-in experiments
   hard_neg_alpha: 0.2
   hard_neg_margin: 0.5

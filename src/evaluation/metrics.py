@@ -67,6 +67,7 @@ def compute_intra_list_diversity(
     item_embeddings: torch.Tensor,
     k: int = 10,
     sample_users: int = 1000,
+    item_mask: torch.Tensor | None = None,
 ) -> float:
     """Compute Intra-List Diversity (ILD) based on cosine distance between recommended items.
 
@@ -85,7 +86,7 @@ def compute_intra_list_diversity(
     num_users = preds_k.size(0)
 
     if num_users > sample_users:
-        perm = torch.randperm(num_users)[:sample_users]
+        perm = torch.randperm(num_users, generator=torch.Generator().manual_seed(42))[:sample_users]
         preds_k = preds_k[perm]
         num_users = sample_users
 
@@ -107,7 +108,16 @@ def compute_intra_list_diversity(
     pairwise_sims = sim_matrix[:, triu_indices[0], triu_indices[1]] # (num_users, k_pairs)
     pairwise_dists = 1.0 - pairwise_sims # Cosine distance
 
-    user_ild = pairwise_dists.mean(dim=1)
+    if item_mask is not None:
+        valid = item_mask.to(preds_k.device)[preds_k]
+        pairs = valid[:, triu_indices[0]] & valid[:, triu_indices[1]]
+        counts = pairs.sum(dim=1)
+        usable = counts > 0
+        if not usable.any():
+            return float("nan")
+        user_ild = (pairwise_dists * pairs).sum(dim=1)[usable] / counts[usable]
+    else:
+        user_ild = pairwise_dists.mean(dim=1)
     return float(user_ild.mean().item())
 
 

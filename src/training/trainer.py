@@ -34,6 +34,7 @@ from src.models.directau import DirectAU
 from src.models.lightgcn import LightGCN
 from src.models.xsimgcl import XSimGCL
 from src.training.early_stopping import EarlyStopping, load_checkpoint, save_checkpoint
+from src.utils.checkpoints import get_model_output_dir
 
 logger = logging.getLogger(__name__)
 
@@ -163,9 +164,17 @@ class Trainer:
         self.lr = train_cfg["learning_rate"]
         self.weight_decay = train_cfg["weight_decay"]
 
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
+        parameters = self.model.parameters()
+        if self.model_name == "adaptive_gcl" and hasattr(self.model, "optimizer_param_groups"):
+            parameters = self.model.optimizer_param_groups(
+                config.get("adaptive_gcl", {}).get("mlp_weight_decay", 0.0)
+            )
+        self.optimizer = optim.Adam(parameters, lr=self.lr)
 
-        self.bpr_loss_fn = BPRLoss(weight_decay=self.weight_decay)
+        self.bpr_loss_fn = BPRLoss(
+            weight_decay=self.weight_decay,
+            regularization="selfrec" if self.model_name == "xsimgcl" else "squared",
+        )
         self.cl_loss_fn = InfoNCELoss(
             temperature=config.get(self.model_name, {}).get("temperature", 0.2)
         )
@@ -217,19 +226,21 @@ class Trainer:
 
     def _backward_and_step(self, total_loss: torch.Tensor) -> None:
         """Backpropagate, clip gradients, and update model parameters."""
+        if not torch.isfinite(total_loss):
+            raise FloatingPointError("Non-finite training loss; refusing to update parameters")
         if self.use_amp and self.scaler is not None:
             self.scaler.scale(total_loss).backward()
             # Gradients must be unscaled before their norm is clipped.
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), max_norm=GRADIENT_CLIP_VALUE
+                self.model.parameters(), max_norm=GRADIENT_CLIP_VALUE, error_if_nonfinite=True
             )
             self.scaler.step(self.optimizer)
             self.scaler.update()
         else:
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), max_norm=GRADIENT_CLIP_VALUE
+                self.model.parameters(), max_norm=GRADIENT_CLIP_VALUE, error_if_nonfinite=True
             )
             self.optimizer.step()
 
@@ -259,7 +270,7 @@ class Trainer:
                     flush=True,
                 )
             except Exception as ex:
-                logger.warning(f"Error loading checkpoint for resume: {ex}. Starting from epoch 1.")
+                raise RuntimeError("Cannot resume incompatible checkpoint; use a fresh run") from ex
 
         user_array = self.train_df["u_idx"].values
         pos_item_array = self.train_df["i_idx"].values
@@ -271,7 +282,7 @@ class Trainer:
         best_val_metrics = {}
         best_epoch = self.early_stopping.best_epoch
 
-        history_dir = os.path.join("results", "history", self.model_name)
+        history_dir = self.config.get("history_dir") or get_model_output_dir("history", self.model_name)
         os.makedirs(history_dir, exist_ok=True)
         history_csv_name = os.path.basename(checkpoint_path).replace(".pt", "_history.csv")
         history_csv_path = os.path.join(history_dir, history_csv_name)
@@ -311,6 +322,9 @@ class Trainer:
             bpr_loss_accum = 0.0
             cl_loss_accum = 0.0
             num_batches = 0
+            semantic_pairs = 0
+            if self.device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(self.device)
 
             for i in range(0, num_samples, self.batch_size):
                 batch_idx = indices[i : i + self.batch_size]
@@ -380,6 +394,8 @@ class Trainer:
                         total_loss = total_loss + cl_weight * cl_loss
 
                     elif self.model_name == "adaptive_gcl":
+                        if self.model.ssl_reg > 0:
+                            semantic_pairs += int(self.model.item_text_mask[torch.unique(pos_batch)].sum().item())
                         cl_loss = self.model.compute_semantic_ssl_loss(pos_batch, i_embeds)
                         total_loss = total_loss + cl_loss
 
@@ -482,11 +498,13 @@ class Trainer:
                 "val_recall_10": round(val_metrics.get("Recall@10", 0.0), 4),
                 "val_mrr_10": round(val_metrics.get("MRR@10", 0.0), 4),
                 "epoch_time_sec": round(epoch_time, 2),
+                "mean_valid_semantic_pairs": semantic_pairs / max(1, num_batches) if self.model_name == "adaptive_gcl" else None,
+                "cuda_peak_allocated_mb": torch.cuda.max_memory_allocated(self.device) / (1024 ** 2) if self.device.type == "cuda" else None,
                 "is_best": bool(is_improved),
             })
 
             # Save epoch history CSV
-            history_dir = os.path.join("results", "history", self.model_name)
+            history_dir = self.config.get("history_dir") or get_model_output_dir("history", self.model_name)
             os.makedirs(history_dir, exist_ok=True)
             history_csv_name = os.path.basename(checkpoint_path).replace(".pt", "_history.csv")
             history_csv_path = os.path.join(history_dir, history_csv_name)
@@ -502,10 +520,16 @@ class Trainer:
 
         # Load best checkpoint for final evaluation
         if os.path.exists(checkpoint_path):
-            load_checkpoint(checkpoint_path, self.model, device=self.device)
+            load_checkpoint(checkpoint_path, self.model, device=self.device,
+                            expected_fingerprint=self.config.get("experiment_fingerprint"))
             logger.info(f"Loaded best checkpoint for final evaluation: {checkpoint_path}")
 
         self.model.eval()
+        if self.config.get("validation_only", False):
+            return {"model_name": self.model_name, "best_epoch": best_epoch,
+                    "total_epochs": len(epoch_times), "total_train_time": total_train_time,
+                    "avg_epoch_time": avg_epoch_time, "val_metrics": best_val_metrics,
+                    "validation_only": True, "history": history_records}
         with torch.no_grad():
             final_u_embeds, final_i_embeds = self.model(self.norm_adj)
 

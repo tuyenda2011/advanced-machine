@@ -1,5 +1,26 @@
 # Code Review Report: Advanced Graph Contrastive Learning for Recommendation Systems
 
+## Sửa báo cáo quick-test — 06/09/2026
+
+Đã sửa p-value/std thiếu mẫu thành N/A; Diversity dùng chung MiniLM cho mọi model, mask text thiếu và lấy mẫu user cố định; đổi nhóm Tail thành Low-Activity theo phân vị bậc. Dashboard cảnh báo bảng lịch sử, biểu đồ không hiển thị std giả bằng 0 và không gọi Tail là cold-start. Các artifact quick-test cũ được giữ nguyên; chưa tái tính Diversity hoặc chạy benchmark mới. Xem [phạm vi và kiểm chứng](evaluation-reporting-fixes.md).
+
+Xác minh: **171 test PASS, 10 SKIP** (Pydantic tùy chọn không có trong AML); test sinh biểu đồ PASS, kiểm tra nhãn ảnh đã qua. Ruff và MyPy trong phạm vi sửa đạt; chưa kiểm thử dashboard bằng trình duyệt.
+
+## Sửa hai lỗi kỹ thuật — 06/09/2026
+
+- SVD fallback: lưu chuỗi thông báo lỗi PyTorch trước khi rời `except`; nếu NumPy cũng thất bại, trả `RuntimeError` có đủ hai thông báo và giữ exception NumPy làm nguyên nhân. Không còn truy cập exception alias đã bị Python xóa.
+- Validation cấu hình chung: cả nhánh có Pydantic và nhánh fallback đều chuyển vi phạm kiểm tra thành `ValueError` và dừng, thay vì chỉ log warning rồi trả cấu hình sai. Không thay siêu tham số hoặc mở rộng bộ quy tắc validation trong bản sửa này.
+- Regression tests: `tests/test_technical_regressions.py` kiểm tra SVD thành công/fallback/hai lần lỗi, cấu hình sai và việc nạp bốn cấu hình hợp lệ. Không thay kiến trúc, dữ liệu hay chạy benchmark.
+- Xác minh: toàn bộ suite trên AML đạt **157 PASS, 10 SKIP** (45,17 giây); 10 trường hợp skip cần Pydantic không có trong AML. Chạy riêng bộ hồi quy trong môi trường tạm dùng Pydantic 2.13.5 đạt **23/23 PASS**, bao gồm cả hai nhánh validation. Không cài thêm thư viện vào AML. Ruff cho test mới và kiểm tra lỗi cú pháp/tên trên hai file sửa PASS; Bandit trên hai file sửa không phát hiện vấn đề mức medium/high.
+
+## Cập nhật AdaptiveGCL — 06/09/2026
+
+Đã thêm công tắc item text, hệ số hồ sơ user cấu hình được, bỏ hẳn tính SSL khi hệ số bằng 0, tổng hợp tầng `learnable`/`mean`, và Adam L2 riêng cho ma trận MLP. Mặc định giữ công thức cũ; đây là cải tiến khả năng kiểm chứng, chưa chứng minh tăng NDCG. Runner ablation mặc định dry-run, chỉ validation khi có `--run`, lưu riêng artifact và từ chối ghi đè.
+
+Xem [hướng dẫn và giới hạn](docs/ADAPTIVE_GCL_ABLATION.md) và [kế hoạch triển khai](adaptive-gcl-improvement-plan.md). Các mục review lịch sử bên dưới không thay thế bằng chứng kiểm thử cập nhật. Zero-shot chưa được xác nhận hiệu quả cold-start.
+
+Xác minh bản triển khai: 144 test PASS; Ruff cho runner/test mới và kiểm tra cú pháp/tên các file tích hợp PASS; MyPy model/runner PASS. Chưa chạy sweep Amazon hoặc kiểm thử UI trình duyệt. Bandit còn cảnh báo pickle khi đọc mappings cục bộ; không nạp mappings từ nguồn không đáng tin.
+
 ## Tổng quan Project
 Đây là một project nghiên cứu academic về Graph Contrastive Learning cho hệ thống recommendation, bao gồm 4 model SOTA: LightGCN, XSimGCL, DirectAU, và AdaptiveGCL (multimodal).
 

@@ -6,6 +6,31 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+SPLIT_TIE_POLICY = "seeded_user_item_hash_then_item_id"
+
+
+def summarize_split_timing(train_df, val_df, test_df) -> dict:
+    """Report weak time ordering and ties; ties do not establish event order."""
+    train_max = train_df.groupby("u_idx")["timestamp"].max()
+    val_min = val_df.groupby("u_idx")["timestamp"].min()
+    val_max = val_df.groupby("u_idx")["timestamp"].max()
+    test_min = test_df.groupby("u_idx")["timestamp"].min()
+    shared = val_max.index.intersection(test_min.index)
+    train_val_ties = int((train_max.reindex(val_min.index) == val_min).sum())
+    val_test_ties = int((val_max.loc[shared] == test_min.loc[shared]).sum())
+    all_timestamps = pd.concat([part["timestamp"] for part in (train_df, val_df, test_df)])
+    return {
+        "timestamp_midnight_fraction": float((all_timestamps % 86400 == 0).mean()),
+        "train_validation_tied_users": train_val_ties,
+        "validation_test_tied_users": val_test_ties,
+        "train_validation_order_violations": int((train_max.reindex(val_min.index) > val_min).sum()),
+        "validation_test_order_violations": int((val_max.loc[shared] > test_min.loc[shared]).sum()),
+        "train_test_order_violations": int((train_max.reindex(test_min.index) > test_min).sum()),
+        "strict_temporal_order": train_val_ties == 0 and val_test_ties == 0
+            and not (train_max.reindex(val_min.index) >= val_min).any()
+            and not (val_max.loc[shared] >= test_min.loc[shared]).any(),
+    }
+
 
 def check_split_connectivity(
     train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame
@@ -141,9 +166,15 @@ def chronological_per_user_split(
         f"(train={1-val_ratio-test_ratio:.0%}, val={val_ratio:.0%}, test={test_ratio:.0%}, seed={seed})..."
     )
 
-    df_sorted = df.sort_values(
-        by=["u_idx", "timestamp"], kind="mergesort"
-    ).reset_index(drop=True)
+    # Stable seeded tie-breaking is independent of raw file row order and
+    # rating. It does not invent an intraday event order for day-level data.
+    ranked = df.copy()
+    tie_keys = ranked[["u_idx", "i_idx"]].copy()
+    tie_keys["seed"] = seed
+    ranked["_tie_break"] = pd.util.hash_pandas_object(tie_keys, index=False).to_numpy()
+    df_sorted = ranked.sort_values(
+        by=["u_idx", "timestamp", "_tie_break", "i_idx"], kind="mergesort"
+    ).drop(columns="_tie_break").reset_index(drop=True)
     group_sizes = df_sorted.groupby("u_idx")["u_idx"].transform("size")
     eligible_users = np.sort(
         df_sorted.loc[group_sizes >= 3, "u_idx"].unique()
@@ -185,6 +216,11 @@ def chronological_per_user_split(
         raise AssertionError("Temporal leakage detected between train and validation")
     if any(train_max.loc[test_min.index] > test_min):
         raise AssertionError("Temporal leakage detected between train and test")
+    timing = summarize_split_timing(train_df, val_df, test_df)
+    if timing["validation_test_order_violations"]:
+        raise AssertionError("Temporal leakage detected between validation and test")
+    if not timing["strict_temporal_order"]:
+        logger.warning("Timestamp ties cross split boundaries; report weak chronology, not strict future prediction: %s", timing)
 
     logger.info(
         f"Split completed: Train={len(train_df)} ({len(train_df)/len(df_sorted):.2%}), "
@@ -274,4 +310,3 @@ def global_temporal_split(
     check_split_connectivity(train_df, val_df, test_df)
     verify_no_leakage(train_df, val_df, test_df)
     return train_df, val_df, test_df
-

@@ -57,9 +57,21 @@ streamlit run app/streamlit_app.py
 | **Interactions** | 1,072,740 | Positive feedback edges |
 | **Density** | 0.0192% | Extremely sparse graph |
 | **Avg. Interactions/User** | 8.59 | Long-tail distribution |
-| **Split** | 80% / 10% / 10% | Exact chronological train/validation/test split |
+| **Split** | 80% / 10% / 10% | Exact global counts; per-user non-decreasing timestamps |
+
+Preprocessing filters positive feedback, deduplicates user–item pairs, and runs 5-core pruning to convergence before splitting. Timestamp ties use a seeded user–item hash, independent of input row order; day-level timestamps cannot establish strict intraday chronology. No validation/test edges are relocated into training.
+
+`data/manifest.json` records source/artifact SHA-256 hashes, metadata quality, split timing, and encoder provenance. Text caches require matching ordered item/text/encoder fingerprints and tensor checksums. Run `python scripts/audit_data.py` to check processed artifacts, temporal ordering, explicit dislikes, and coverage at all four sparsity levels. Missing metadata and cold targets remain explicit audit warnings, not silently repaired facts.
+
+Metadata-aware training uses source-derived flags (`has_title`, `has_brand`, `has_category`, `has_specific_category`, `has_usable_text`). A real title, brand, or specific category makes text usable. Only usable text is encoded; other tensor rows are zero and must be masked in item fusion, user-history pooling, and semantic SSL. All 44,843 items in the current snapshot still have usable text; this is not a claim that all metadata is complete. MiniLM is pinned to commit `1110a243fdf4706b3f48f1d95db1a4f5529b4d41`. Training and demo reject missing flags or incompatible caches.
+
+AdaptiveGCL writes new checkpoints, JSON, history and per-model CSV under `results/<section>/adaptive_gcl/masked_text/`; `benchmark_all.py` and the demo use the same paths. Old checkpoints are not compatible. See [implementation status](metadata-aware-training-plan.md) and [completed pilot results](docs/BAO_CAO_PILOT_METADATA.md). The four 5-epoch validation-only runs did not demonstrate a ranking improvement over legacy text.
+
+AdaptiveGCL now exposes isolated ablation controls for item text, user semantics, SSL, global layer aggregation and MLP-only regularization. Preview without training using `python scripts/ablate_adaptive.py`; see the [ablation guide](docs/ADAPTIVE_GCL_ABLATION.md). Defaults preserve the prior formulas; these controls are not evidence of an accuracy improvement.
 
 ### Data Sources
+
+Evaluation update: `Diversity@K` now uses the same frozen MiniLM item features for all models, with usable-text masking and fixed user sampling. Single-run standard deviations and unavailable paired tests are N/A. Tail means low-activity users, not cold-start. Existing quick-test artifacts retain the old metric definition; do not compare their Diversity values with new `shared_minilm_diversity_v2` results. See [evaluation fixes](evaluation-reporting-fixes.md).
 
 | Resource | Link |
 |:---------|:-----|
@@ -98,12 +110,14 @@ $$
 XSimGCL injects sign-aware normalized noise after each propagation layer and contrasts the aggregated recommendation representation with layer $l^*$:
 
 $$
-e^{(k)'} = \tilde{A}e^{(k-1)'} + \epsilon\,\operatorname{sign}(e^{(k)'})\odot\frac{\Delta^{(k)}}{\|\Delta^{(k)}\|_2}
+z^{(k)} = \tilde{A}e^{(k-1)'}, \qquad e^{(k)'} = z^{(k)} + \epsilon\,\operatorname{sign}(z^{(k)})\odot\frac{\Delta^{(k)}}{\|\Delta^{(k)}\|_2}
 $$
 
 $$
-\mathcal{L} = \mathcal{L}_{\text{BPR}} + \lambda_{cl}\mathcal{L}_{\text{InfoNCE}}
+\mathcal{L} = \mathcal{L}_{\text{BPR}} + \lambda_{cl}\mathcal{L}_{\text{InfoNCE}} + \frac{\lambda_{reg}}{B}(\|U_B\|_F + \|I_B^+\|_F)
 $$
+
+The unsquared batch norms match SELFRec's regularization on propagated users and positive items. BPR uses stable `softplus` rather than SELFRec's epsilon-adjusted logarithm; shared hyperparameters and the data protocol are project choices, not an exact reproduction of published scores.
 
 ### 3.3 DirectAU
 
@@ -113,9 +127,13 @@ $$
 \mathcal{L}_{\text{DirectAU}} = \mathcal{L}_{\text{align}} + \gamma\mathcal{L}_{\text{uniform}}
 $$
 
+This project uses the supported LightGCN encoder, averages user/item uniformity, and adds squared L2 regularization on sampled initial embeddings. That regularization differs from the original repository's optimizer weight decay. Full-ranking evaluation uses raw dot products, as in the original full-sort path.
+
 ### 3.4 AdaptiveGCL (Proposed Course-Project Model)
 
-AdaptiveGCL combines gated ID/text fusion, user semantic profiles, learnable layer attention, debiased graph-text InfoNCE, explicit hard-negative ranking penalties, and normalized Dirichlet-energy regularization. Main benchmark metrics use the shared warm-start protocol; zero-shot inference remains an auxiliary capability rather than a benchmark claim.
+AdaptiveGCL combines gated ID/text fusion, train-history semantic profiles, shared learnable layer weights, graph-text InfoNCE, and explicit-dislike ranking penalties. The default is ordinary InfoNCE (`tau_plus=0`) with Dirichlet regularization disabled (`dirichlet_reg=0`). Debiasing with an assumed positive prior and energy maximization remain opt-in experiments. High Dirichlet energy does not imply high embedding rank or useful rankings.
+
+Main metrics use a shared warm-start protocol. AdaptiveGCL receives extra metadata and explicit dislikes, so a gain alone cannot isolate the effect of gating. The split has exact global 80/10/10 counts using the last two interactions of selected users; it is not 80/10/10 within every user or a global time cutoff. Sparsity means coverage-preserving edge removal, with full known positive histories masked during evaluation. Zero-shot inference remains an auxiliary capability rather than a benchmark claim.
 
 ### 3.5 Hypersphere Representation Geometry
 

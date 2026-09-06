@@ -9,24 +9,36 @@ stages:
       - src/data/text_encoder.py
       - src/data/negative_collector.py
       - src/data/validation.py
+      - src/data/provenance.py
       - configs/common.yaml
+      - src/utils/config.py
+      - src/utils/config_schemas.py
     outs:
       - data/processed/train.parquet
       - data/processed/val.parquet
       - data/processed/test.parquet
       - data/processed/mappings.pkl
       - data/processed/item_text_embeddings.pt
+      - data/processed/item_text_embeddings.pt.json
       - data/processed/disliked_interactions.parquet
 
   audit:
     cmd: python scripts/audit_data.py
     deps:
       - scripts/audit_data.py
+      - src/data/provenance.py
+      - src/data/text_encoder.py
+      - src/data/splitter.py
+      - src/data/sparsity.py
+      - src/data/preprocessing.py
+      - src/data/validation.py
+      - data/manifest.json
       - data/processed/train.parquet
       - data/processed/val.parquet
       - data/processed/test.parquet
       - data/processed/mappings.pkl
       - data/processed/item_text_embeddings.pt
+      - data/processed/item_text_embeddings.pt.json
       - data/processed/disliked_interactions.parquet
     outs:
       - data/processed/audit_report.json:

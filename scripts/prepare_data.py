@@ -3,6 +3,7 @@ import json
 import os
 import pickle
 import sys
+from importlib.metadata import version
 from datetime import datetime, timezone
 
 # Ensure project root is in sys.path when script is executed directly
@@ -14,8 +15,9 @@ import pandas as pd
 from src.data.loader import download_amazon_electronics, load_raw_data
 from src.data.negative_collector import extract_explicit_negative_interactions
 from src.data.preprocessing import preprocess_amazon_electronics
-from src.data.splitter import chronological_per_user_split, verify_no_leakage
-from src.data.text_encoder import encode_item_metadata
+from src.data.provenance import sha256_file
+from src.data.splitter import SPLIT_TIE_POLICY, chronological_per_user_split, summarize_split_timing, verify_no_leakage
+from src.data.text_encoder import encode_item_metadata, PINNED_REVISION
 from src.data.validation import (
     validate_interactions,
     validate_metadata,
@@ -36,6 +38,7 @@ def write_dataset_manifest(
     test_df,
     text_tensors,
     hard_negative_count,
+    manifest_path=None,
 ):
     """Write lightweight provenance and statistics for the course report."""
     source_files = []
@@ -45,15 +48,34 @@ def write_dataset_manifest(
             {
                 "path": os.path.relpath(path, REPO_ROOT).replace("\\", "/"),
                 "size_bytes": os.path.getsize(path),
+                "sha256": sha256_file(path),
             }
         )
 
     total = len(train_df) + len(val_df) + len(test_df)
     train_items = set(train_df["i_idx"].unique())
+    processed_dir = data_cfg["processed_dir"]
+    artifact_names = ["train.parquet", "val.parquet", "test.parquet", "mappings.pkl"]
+    if text_tensors is not None:
+        artifact_names += ["item_text_embeddings.pt", "item_text_embeddings.pt.json"]
+    if os.path.exists(os.path.join(processed_dir, "disliked_interactions.parquet")):
+        artifact_names.append("disliked_interactions.parquet")
+    artifacts = [
+        {"path": os.path.relpath(os.path.join(processed_dir, name), REPO_ROOT).replace("\\", "/"),
+         "sha256": sha256_file(os.path.join(processed_dir, name))}
+        for name in artifact_names
+    ]
+    text_provenance = {}
+    if text_tensors is not None:
+        with open(os.path.join(processed_dir, "item_text_embeddings.pt.json"), encoding="utf-8") as stream:
+            text_provenance = json.load(stream)
+        text_provenance.pop("item_text_mask", None)
     manifest = {
         "dataset": data_cfg["name"],
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source_files": source_files,
+        "artifacts": artifacts,
+        "software_versions": {name: version(name) for name in ("pandas", "numpy", "torch")},
         "preprocessing": {
             "positive_rating_threshold": data_cfg["positive_rating_threshold"],
             "min_user_interactions": data_cfg["min_user_interactions"],
@@ -61,6 +83,11 @@ def write_dataset_manifest(
             "requested_split_ratios": data_cfg["split_ratios"],
             "split_seed": data_cfg.get("split_seed", 42),
             "split_protocol": "exact_chronological_selected_users",
+            "timestamp_tie_policy": SPLIT_TIE_POLICY,
+            "chronology_scope": "per_user_non_decreasing; ties do not establish intraday order",
+            "positive_dedup_policy": "positive_only_latest_timestamp_then_highest_rating",
+            "kcore_scope": "full_positive_graph_before_split",
+            "kcore_converged": True,
         },
         "statistics": {
             **stats,
@@ -79,15 +106,20 @@ def write_dataset_manifest(
                 (~test_df["i_idx"].isin(train_items)).sum()
             ),
             "hard_negative_interactions": hard_negative_count,
+            "temporal_audit": summarize_split_timing(train_df, val_df, test_df),
+            "evaluation_users": int(val_df["u_idx"].nunique()),
+            "train_only_users": int(train_df["u_idx"].nunique() - val_df["u_idx"].nunique()),
         },
         "text_features": {
+            **text_provenance,
             "encoder": "sentence-transformers/all-MiniLM-L6-v2",
             "shape": list(text_tensors.shape) if text_tensors is not None else None,
-            "normalized": True if text_tensors is not None else None,
+            "normalized": "usable_rows_unit_norm; masked_rows_zero" if text_tensors is not None else None,
         },
     }
 
-    manifest_path = os.path.join(REPO_ROOT, "data", "manifest.json")
+    manifest_path = manifest_path or os.path.join(REPO_ROOT, "data", "manifest.json")
+    os.makedirs(os.path.dirname(os.path.abspath(manifest_path)), exist_ok=True)
     with open(manifest_path, "w", encoding="utf-8") as file:
         json.dump(manifest, file, indent=2)
         file.write("\n")
@@ -97,6 +129,8 @@ def write_dataset_manifest(
 def main():
     parser = argparse.ArgumentParser(description="Download and preprocess Amazon Electronics dataset")
     parser.add_argument("--config_dir", type=str, default="configs", help="Path to config dir")
+    parser.add_argument("--output_dir", help="Optional staging directory for processed artifacts")
+    parser.add_argument("--manifest_path", help="Manifest output (required with --output_dir)")
     parser.add_argument(
         "--extract_text_embeddings",
         action=argparse.BooleanOptionalAction,
@@ -116,9 +150,13 @@ def main():
         help="Export human-readable inspection CSV files to data/processed/csv/ (default: True)",
     )
     args = parser.parse_args()
+    if args.output_dir and not args.manifest_path:
+        parser.error("--output_dir requires --manifest_path to avoid overwriting the active manifest")
 
     config = load_config("lightgcn", args.config_dir)
     data_cfg = config["dataset"]
+    if args.output_dir:
+        data_cfg["processed_dir"] = args.output_dir
 
     # 1. Download data
     dataset_dir = download_amazon_electronics(
@@ -139,6 +177,8 @@ def main():
         min_user_interactions=data_cfg["min_user_interactions"],
         min_item_interactions=data_cfg.get("min_item_interactions", 5),
     )
+    stats["ingestion_ledger"] = {"reviews": ratings_df.attrs.get("ingestion_ledger", {}),
+                                 "metadata": items_df.attrs.get("ingestion_ledger", {})}
 
     # 4. Validate cleaned metadata & interactions
     meta_df = pd.DataFrame(list(item_metadata.values()))
@@ -201,6 +241,7 @@ def main():
             num_items=len(item2id),
             model_name="sentence-transformers/all-MiniLM-L6-v2",
             save_path=text_emb_path,
+            revision=PINNED_REVISION,
         )
 
     # 9. Save processed artifacts
@@ -250,6 +291,7 @@ def main():
         test_df=test_df,
         text_tensors=text_tensors,
         hard_negative_count=len(neg_df) if neg_df is not None else 0,
+        manifest_path=args.manifest_path,
     )
 
     logger.info(f"All processed data and mappings saved to {processed_dir}")

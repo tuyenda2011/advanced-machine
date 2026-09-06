@@ -1,24 +1,30 @@
+import math
+
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
+from torch import nn
 
 
 class DebiasedInfoNCELoss(nn.Module):
     """Debiased Contrastive InfoNCE Loss (NeurIPS '20 / RecSys SSL).
 
-    Addresses False-Negative sampling bias where unobserved items in the denominator
-    contain true positive user interests. Uses positive prior tau_plus to downweight
-    false negatives and optionally amplifies known explicit hard negatives (1-2 stars).
+    Optional DCL correction with an assumed positive prior, not an estimated
+    false-negative rate. At tau_plus=0 this is standard cross-view InfoNCE.
     """
 
     def __init__(
         self,
         temperature: float = 0.2,
-        tau_plus: float = 0.1,
+        tau_plus: float = 0.0,
         hard_negative_weight: float = 1.0,
     ):
         super().__init__()
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("temperature must be finite and positive")
+        if not 0 <= tau_plus < 1:
+            raise ValueError("tau_plus must be in [0, 1)")
+        if not math.isfinite(hard_negative_weight) or hard_negative_weight < 0:
+            raise ValueError("hard_negative_weight must be finite and nonnegative")
         self.temperature = temperature
         self.tau_plus = tau_plus
         self.hard_negative_weight = hard_negative_weight
@@ -27,62 +33,66 @@ class DebiasedInfoNCELoss(nn.Module):
         self,
         query: torch.Tensor,
         positive: torch.Tensor,
-        negatives: Optional[torch.Tensor] = None,
-        hard_negatives: Optional[torch.Tensor] = None,
+        negatives: torch.Tensor | None = None,
+        hard_negatives: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute debiased InfoNCE loss for a batch of query-positive pairs.
 
         Args:
             query: Query representations (B, dim)
             positive: Positive key representations (B, dim)
-            negatives: Optional explicit negative pool (M, dim). If None, all in-batch keys are used.
+            negatives: Optional negative-only pool (M, dim), excluding known positives.
+                If None, other in-batch keys are used, excluding the diagonal.
             hard_negatives: Optional explicit hard negatives (B, dim) from 1-2 star feedback.
 
         Returns:
             Scalar loss tensor.
         """
-        q = F.normalize(query, dim=-1)
-        k_pos = F.normalize(positive, dim=-1)
-
-        # Positive pair cosine similarities: (B,)
+        if query.ndim != 2 or query.shape != positive.shape or query.shape[0] == 0:
+            raise ValueError(
+                "query and positive must have matching nonempty (B, dim) shapes"
+            )
+        dtype = torch.float64 if query.dtype == torch.float64 else torch.float32
+        q = F.normalize(query.to(dtype), dim=-1)
+        k_pos = F.normalize(positive.to(dtype), dim=-1)
         pos_sim = torch.sum(q * k_pos, dim=-1) / self.temperature
-        pos_exp = torch.exp(pos_sim)
 
         if negatives is None:
-            # Use all in-batch items as negative candidate pool (B, B)
-            sim_matrix = torch.matmul(q, k_pos.T) / self.temperature
-            exp_sim = torch.exp(sim_matrix)
-
-            # Sum over candidate negatives
-            n_samples = q.shape[0]
-            # Average exponential similarity over pool
-            avg_neg = torch.mean(exp_sim, dim=-1)  # (B,)
+            neg_sim = (q @ k_pos.T) / self.temperature
+            diagonal = torch.eye(q.shape[0], dtype=torch.bool, device=q.device)
+            neg_sim = neg_sim.masked_fill(diagonal, float("-inf"))
+            n_samples = q.shape[0] - 1
         else:
-            k_neg = F.normalize(negatives, dim=-1)
-            sim_matrix = torch.matmul(q, k_neg.T) / self.temperature
-            exp_sim = torch.exp(sim_matrix)
-            n_samples = k_neg.shape[0]
-            avg_neg = torch.mean(exp_sim, dim=-1)
+            neg_sim = (
+                q @ F.normalize(negatives.to(dtype), dim=-1).T
+            ) / self.temperature
+            n_samples = negatives.shape[0]
 
-        # Debiasing transformation: remove positive expectation from negative pool
-        # g_tilde = max((avg_neg - tau_plus * pos_exp) / (1 - tau_plus), exp(-1/tau))
-        lower_bound = torch.exp(torch.tensor(-1.0 / self.temperature, device=query.device))
-        debiased_neg = (avg_neg - self.tau_plus * pos_exp) / (1.0 - self.tau_plus)
-        debiased_neg = torch.clamp(debiased_neg, min=lower_bound.item())
+        # Subtract a common row offset before exponentiation. This preserves
+        # the DCL estimator and prevents exp(cosine / temperature) overflow.
+        shift = pos_sim
+        if n_samples:
+            shift = torch.maximum(shift, neg_sim.max(dim=-1).values)
+        hard_sim = None
+        if hard_negatives is not None and self.hard_negative_weight > 0:
+            k_hard = F.normalize(hard_negatives.to(dtype), dim=-1)
+            hard_sim = (q * k_hard).sum(dim=-1) / self.temperature
+            hard_sim = hard_sim + math.log(self.hard_negative_weight)
+            shift = torch.maximum(shift, hard_sim)
+        shift = shift.detach()
+        pos_exp = torch.exp(pos_sim - shift)
+        neg_sum = torch.exp(neg_sim - shift.unsqueeze(1)).sum(dim=-1)
 
-        # Total negative denominator score
-        total_neg_score = n_samples * debiased_neg
+        if self.tau_plus > 0 and n_samples:
+            corrected = (neg_sum - self.tau_plus * n_samples * pos_exp) / (
+                1 - self.tau_plus
+            )
+            lower_bound = n_samples * torch.exp(-1 / self.temperature - shift)
+            neg_sum = torch.maximum(corrected, lower_bound)
+        if hard_sim is not None:
+            neg_sum = neg_sum + torch.exp(hard_sim - shift)
 
-        # Incorporate explicit hard negative penalty if present
-        if hard_negatives is not None:
-            k_hard = F.normalize(hard_negatives, dim=-1)
-            hard_sim = torch.sum(q * k_hard, dim=-1) / self.temperature
-            hard_exp = torch.exp(hard_sim)
-            total_neg_score = total_neg_score + self.hard_negative_weight * hard_exp
-
-        # Loss: -log (pos / (pos + debiased_neg))
-        loss = -torch.log(pos_exp / (pos_exp + total_neg_score + 1e-8))
-        return torch.mean(loss)
+        return (torch.log(pos_exp + neg_sum) - (pos_sim - shift)).mean()
 
     def forward(
         self,
@@ -90,7 +100,7 @@ class DebiasedInfoNCELoss(nn.Module):
         u_view2: torch.Tensor,
         i_view1: torch.Tensor,
         i_view2: torch.Tensor,
-        hard_negatives: Optional[torch.Tensor] = None,
+        hard_negatives: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute dual user and item debiased contrastive loss."""
         user_loss = self.compute_debiased_contrastive_loss(u_view1, u_view2)

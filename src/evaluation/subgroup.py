@@ -11,7 +11,7 @@ def stratify_users_by_degree(
     eval_users: List[int],
     quantiles: Tuple[float, float] = (0.2, 0.8),
 ) -> Dict[str, List[int]]:
-    """Partition evaluation users into Tail (sparse/cold-start), Torso, and Head (active) groups.
+    """Partition evaluation users into Tail (low-activity), Torso, and Head (active) groups.
 
     Args:
         train_df: Training DataFrame containing 'u_idx'
@@ -40,7 +40,7 @@ def stratify_users_by_degree(
             head_indices.append(idx)
 
     return {
-        "Tail (Cold-Start)": tail_indices,
+        "Tail (Low-Activity)": tail_indices,
         "Torso (Medium)": torso_indices,
         "Head (Active)": head_indices,
     }

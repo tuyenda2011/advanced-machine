@@ -19,8 +19,9 @@ import torch
 import torch.nn.functional as F
 
 from src.data.sparsity import create_sparse_train_set
-from src.data.text_encoder import build_user_history_features
+from src.data.text_encoder import build_user_history_features, load_training_text, DEFAULT_ENCODER, PINNED_REVISION, format_item_text
 from src.models.adaptive_gcl import AdaptiveGCL
+from src.evaluation.metrics import compute_intra_list_diversity
 from src.models.directau import DirectAU
 from src.models.lightgcn import LightGCN
 from src.models.xsimgcl import XSimGCL
@@ -108,7 +109,7 @@ def load_trained_model(model_name: str, num_users: int, num_items: int, sparsity
     config = load_config(model_name, "configs")
     emb_dim = config["model"]["embedding_dim"]
     num_layers = config["model"]["num_layers"]
-    train_df, _, _, _ = load_processed_data()
+    train_df, _, _, mappings = load_processed_data()
     train_df_sparse = create_sparse_train_set(train_df, sparsity, seed)
 
     if model_name == "lightgcn":
@@ -130,27 +131,25 @@ def load_trained_model(model_name: str, num_users: int, num_items: int, sparsity
         )
     elif model_name == "adaptive_gcl":
         ada_cfg = config.get("adaptive_gcl", {})
-        text_emb_path = "data/processed/item_text_embeddings.pt"
-        text_features = None
-        if os.path.exists(text_emb_path):
-            text_features = torch.load(text_emb_path, map_location="cpu", weights_only=False)
-            text_dim = text_features.shape[1]
-        else:
-            raise FileNotFoundError(
-                f"AdaptiveGCL requires item text features at {text_emb_path}"
-            )
-        user_history_features = build_user_history_features(
-            train_df_sparse, text_features, num_users
+        text_features, item_text_mask = load_training_text(config["dataset"]["processed_dir"], mappings)
+        text_dim = text_features.shape[1]
+        user_history_features, user_text_mask = build_user_history_features(
+            train_df_sparse, text_features, num_users, item_text_mask
         )
         model = AdaptiveGCL(
             num_users, num_items, embedding_dim=emb_dim, num_layers=num_layers,
             text_dim=text_dim, text_features=text_features,
             ssl_temp=ada_cfg.get("ssl_temp", 0.2),
             ssl_reg=ada_cfg.get("ssl_reg", 0.1),
-            dirichlet_reg=ada_cfg.get("dirichlet_reg", 0.01),
+            dirichlet_reg=ada_cfg.get("dirichlet_reg", 0.0),
             node_dropout=ada_cfg.get("node_dropout", 0.0),
-            tau_plus=ada_cfg.get("tau_plus", 0.1),
+            tau_plus=ada_cfg.get("tau_plus", 0.0),
             user_history_features=user_history_features,
+            item_text_mask=item_text_mask,
+            user_text_mask=user_text_mask,
+            use_item_text=ada_cfg.get("use_item_text", True),
+            user_semantic_weight=ada_cfg.get("user_semantic_weight", 0.5),
+            layer_aggregation=ada_cfg.get("layer_aggregation", "learnable"),
         )
 
     checkpoint_path = get_checkpoint_path(model_name, sparsity, seed)
@@ -291,6 +290,7 @@ def main():
                 st.warning("Please select at least one model")
             else:
                 seen_items = set(user_history["i_idx"])
+                diversity_features, diversity_mask = load_training_text("data/processed", mappings)
 
                 for model_name in selected_models:
                     config = model_configs[model_name]
@@ -346,18 +346,15 @@ def main():
                             topk_scores = topk_scores.cpu().numpy()
 
                         # Metrics
-                        if len(topk_ids) > 1:
-                            rec_embeds = F.normalize(i_embeds[torch.tensor(topk_ids, device=device)], dim=-1)
-                            sim_mat = torch.matmul(rec_embeds, rec_embeds.T)
-                            triu_idx = torch.triu_indices(len(topk_ids), len(topk_ids), offset=1)
-                            ild_score = (1.0 - sim_mat[triu_idx[0], triu_idx[1]]).mean().item()
-                        else:
-                            ild_score = 0.0
+                        ild_score = compute_intra_list_diversity(
+                            torch.as_tensor(topk_ids, dtype=torch.long).reshape(1, -1),
+                            diversity_features, k=len(topk_ids), item_mask=diversity_mask,
+                        ) if len(topk_ids) > 1 else float("nan")
 
                         novelty_bits = np.mean([
                             -np.log2((item_pop.get(int(iid), 0) + 1) / float(num_users))
                             for iid in topk_ids
-                        ]) if topk_ids else 0.0
+                        ]) if len(topk_ids) else 0.0
 
                         # Display recommendations
                         rec_data = []
@@ -377,7 +374,7 @@ def main():
                         with m1:
                             st.metric("Latency", f"{latency_ms:.2f} ms")
                         with m2:
-                            st.metric("Diversity (ILD)", f"{ild_score:.3f}")
+                            st.metric("Content Diversity (shared MiniLM)", f"{ild_score:.3f}" if np.isfinite(ild_score) else "N/A")
                         with m3:
                             st.metric("Novelty", f"{novelty_bits:.2f} bits")
 
@@ -394,6 +391,8 @@ def main():
 
         if os.path.exists(agg_csv):
             df_res = pd.read_csv(agg_csv)
+            if "evaluation_protocol" not in df_res or not df_res["evaluation_protocol"].eq("shared_minilm_diversity_v2").all():
+                st.warning("Historical results: Diversity used model-specific embeddings. Single-run ±0 / p=1 are not valid uncertainty estimates. Regenerate results with the current evaluation protocol before comparing Diversity.")
             st.dataframe(df_res, use_container_width=True)
 
             st.subheader("Statistical Significance Tests")
@@ -401,7 +400,7 @@ def main():
             if os.path.exists(sig_csv):
                 df_sig = pd.read_csv(sig_csv)
                 st.dataframe(df_sig, use_container_width=True)
-                st.caption("Levels: *** p<0.001, ** p<0.01, * p<0.05, ns: not significant")
+                st.caption("Levels: *** p<0.001, ** p<0.01, * p<0.05, ns: not significant; N/A: insufficient samples or undefined test.")
 
             st.subheader("LaTeX Export")
             tex_file = os.path.join("results", "aggregated", "benchmark_table.tex")
@@ -454,10 +453,10 @@ def main():
     # TAB 4: Sparsity Analysis
     # ===========================================================================
     with tabs[3]:
-        st.header("Sparsity Robustness & Cold-Start Analysis")
+        st.header("Sparsity Robustness & User Activity Analysis")
 
-        st.markdown("Graph Contrastive Learning is designed to rescue **Tail (Cold-Start)** users "
-                   "with minimal interaction history.")
+        st.markdown("**Tail (Low-Activity)** groups users by low training degree. "
+                   "This is not an evaluation of unseen-user or unseen-item cold-start.")
 
         c1, c2 = st.columns(2)
         with c1:
@@ -508,8 +507,12 @@ def main():
                     try:
                         from sentence_transformers import SentenceTransformer
 
-                        text_str = f"{input_title} | {input_brand} | {input_cat} | {input_desc}"
-                        encoder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+                        text_str = format_item_text({"title": input_title, "brand": input_brand, "categories": input_cat})
+                        if input_desc.strip():
+                            text_str += " | " + input_desc.strip()
+                        if not text_str.strip():
+                            raise ValueError("Provide actual product text for zero-shot inference")
+                        encoder = SentenceTransformer(DEFAULT_ENCODER, revision=PINNED_REVISION)
                         text_vec_np = encoder.encode([text_str], normalize_embeddings=True)
                         text_vec = torch.from_numpy(text_vec_np).float()
 

@@ -67,7 +67,9 @@ def extract_explicit_negative_interactions(
 
     if save_path:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        neg_df[["u_idx", "i_idx", "rating", "timestamp"]].to_parquet(save_path, index=False)
+        saved = neg_df[["u_idx", "i_idx", "rating", "timestamp"]].copy()
+        saved.attrs.clear()
+        saved.to_parquet(save_path, index=False)
         logger.info(f"Saved disliked interactions to {save_path}")
 
     return neg_df, user_disliked

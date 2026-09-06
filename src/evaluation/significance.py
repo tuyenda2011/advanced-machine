@@ -1,13 +1,14 @@
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any
+
 import numpy as np
 import pandas as pd
 from scipy import stats
 
 
 def compute_statistical_significance(
-    scores_a: Union[List[float], np.ndarray],
-    scores_b: Union[List[float], np.ndarray],
-) -> Dict[str, Any]:
+    scores_a: list[float] | np.ndarray,
+    scores_b: list[float] | np.ndarray,
+) -> dict[str, Any]:
     """Perform paired t-test and Wilcoxon signed-rank test between two models across seeds/users.
 
     Args:
@@ -19,59 +20,70 @@ def compute_statistical_significance(
     """
     arr_a = np.asarray(scores_a, dtype=np.float64)
     arr_b = np.asarray(scores_b, dtype=np.float64)
-
-    mean_a = float(np.mean(arr_a))
-    mean_b = float(np.mean(arr_b))
-
-    rel_improv = ((mean_a - mean_b) / (mean_b + 1e-12)) * 100.0
-
-    if arr_a.shape != arr_b.shape:
-        raise ValueError("Paired significance tests require equally sized score arrays")
-
-    if len(arr_a) < 2 or np.allclose(arr_a, arr_b):
-        t_p_val = 1.0
-        t_stat = 0.0
-        wilcoxon_p_val = 1.0
-        wilcoxon_stat = 0.0
-    else:
-        try:
-            t_res = stats.ttest_rel(arr_a, arr_b)
-            t_stat = float(t_res.statistic)
-            t_p_val = float(t_res.pvalue)
-            if np.isnan(t_p_val):
-                t_p_val = 1.0
-        except Exception:
-            t_stat = 0.0
-            t_p_val = 1.0
-
-        try:
-            wilcoxon_result = stats.wilcoxon(arr_a, arr_b)
-            wilcoxon_stat = float(wilcoxon_result.statistic)
-            wilcoxon_p_val = float(wilcoxon_result.pvalue)
-        except Exception:
-            wilcoxon_stat = 0.0
-            wilcoxon_p_val = 1.0
-
-    if t_p_val < 0.001:
-        star = "***"
-    elif t_p_val < 0.01:
-        star = "**"
-    elif t_p_val < 0.05:
-        star = "*"
-    else:
-        star = "ns"
-
-    return {
+    if arr_a.shape != arr_b.shape or arr_a.ndim != 1:
+        raise ValueError("Paired significance tests require equally sized 1-D arrays")
+    if not np.isfinite(arr_a).all() or not np.isfinite(arr_b).all():
+        raise ValueError("Scores must be finite")
+    count = len(arr_a)
+    mean_a = float(arr_a.mean()) if count else float("nan")
+    mean_b = float(arr_b.mean()) if count else float("nan")
+    result = {
         "mean_a": mean_a,
         "mean_b": mean_b,
-        "rel_improvement_pct": rel_improv,
-        "t_statistic": t_stat,
-        "p_value": t_p_val,
-        "t_p_value": t_p_val,
-        "wilcoxon_statistic": wilcoxon_stat,
-        "wilcoxon_p_value": wilcoxon_p_val,
-        "significance": star,
+        "paired_samples": count,
+        "rel_improvement_pct": (mean_a - mean_b) / mean_b * 100
+        if mean_b != 0
+        else float("nan"),
+        "t_statistic": float("nan"),
+        "p_value": float("nan"),
+        "t_p_value": float("nan"),
+        "wilcoxon_statistic": float("nan"),
+        "wilcoxon_p_value": float("nan"),
+        "significance": "N/A",
+        "status": "insufficient_samples",
     }
+    if count < 2:
+        return result
+    result["status"] = "undefined_test"
+    differences = arr_a - arr_b
+    if np.var(differences) > 0:
+        t_result = stats.ttest_rel(arr_a, arr_b)
+        if np.isfinite(t_result.pvalue) and np.isfinite(t_result.statistic):
+            p = float(t_result.pvalue)
+            result.update(
+                t_statistic=float(t_result.statistic),
+                p_value=p,
+                t_p_value=p,
+                status="ok",
+                significance="***"
+                if p < 0.001
+                else "**"
+                if p < 0.01
+                else "*"
+                if p < 0.05
+                else "ns",
+            )
+    if np.any(differences != 0):
+        try:
+            w_result = stats.wilcoxon(arr_a, arr_b)
+            if np.isfinite(w_result.pvalue):
+                result.update(
+                    wilcoxon_statistic=float(w_result.statistic),
+                    wilcoxon_p_value=float(w_result.pvalue),
+                )
+        except ValueError:
+            pass
+    return result
+
+
+def summarize_metric(values) -> dict:
+    """Sample standard deviation is unavailable for fewer than two valid runs."""
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    mean = float(values.mean()) if values.size else float("nan")
+    std = float(values.std(ddof=1)) if values.size > 1 else float("nan")
+    display = f"{mean:.4f} ± {std:.4f}" if np.isfinite(std) else f"{mean:.4f} (std N/A)"
+    return {"mean": mean, "std": std, "str": display if values.size else "N/A"}
 
 
 def generate_latex_table(
@@ -103,11 +115,22 @@ def generate_latex_table(
         sparsities = [1.0]
 
     for s_idx, sp in enumerate(sparsities):
-        sp_df = summary_df[summary_df["sparsity"] == sp] if "sparsity" in summary_df.columns else summary_df
+        sp_df = (
+            summary_df[summary_df["sparsity"] == sp]
+            if "sparsity" in summary_df.columns
+            else summary_df
+        )
         sp_pct = f"{int(float(sp) * 100)}\\%"
 
         # Find max for each metric to format in bold
-        metrics = ["Recall@10", "NDCG@10", "MRR@10", "Diversity@10", "Novelty@10", "Coverage@10"]
+        metrics = [
+            "Recall@10",
+            "NDCG@10",
+            "MRR@10",
+            "Diversity@10",
+            "Novelty@10",
+            "Coverage@10",
+        ]
         max_vals = {}
         for m in metrics:
             if m in sp_df.columns:
@@ -115,18 +138,20 @@ def generate_latex_table(
 
         for row_idx, (_, row) in enumerate(sp_df.iterrows()):
             m_name = row.get("model", "").upper()
-            sp_label = f"\\multirow{{{len(sp_df)}}}{{*}}{{{sp_pct}}}" if row_idx == 0 else ""
+            sp_label = (
+                f"\\multirow{{{len(sp_df)}}}{{*}}{{{sp_pct}}}" if row_idx == 0 else ""
+            )
 
             row_entries = [sp_label, m_name]
             for m in metrics:
-                if m in row:
+                if m in row and pd.notna(row[m]):
                     val = row[m]
                     val_str = f"{val:.4f}"
                     if abs(val - max_vals.get(m, -999)) < 1e-6:
                         val_str = f"\\textbf{{{val_str}}}"
                     row_entries.append(val_str)
                 else:
-                    row_entries.append("-")
+                    row_entries.append("N/A")
 
             lines.append("    " + " & ".join(row_entries) + " \\\\")
 
@@ -136,7 +161,9 @@ def generate_latex_table(
     lines.append("    \\bottomrule")
     lines.append("  \\end{tabular}")
     lines.append("  \\vspace{1ex}")
-    lines.append("  {\\footnotesize \\textit{Note:} Bold numbers denote best performance. Statistical significance determined via paired t-test ($p < 0.05$).}")
+    lines.append(
+        "  {\\footnotesize \\textit{Note:} Bold denotes the largest observed mean, not statistical significance. Single-run standard deviations and unavailable tests are N/A; see the separate paired-test report.}"
+    )
     lines.append("\\end{table*}")
 
     return "\n".join(lines)

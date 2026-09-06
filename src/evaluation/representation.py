@@ -167,6 +167,8 @@ def _compute_svd_singular_values(centered_emb: torch.Tensor) -> np.ndarray:
         singular_vals = torch.linalg.svdvals(centered_emb)
         return singular_vals.detach().cpu().numpy()
     except (RuntimeError, AttributeError) as pytorch_err:
+        # Exception aliases are cleared after except; retain only the message.
+        pytorch_error_message = str(pytorch_err)
         import logging
         logger = logging.getLogger(__name__)
         logger.debug(f"PyTorch SVD failed ({pytorch_err}), falling back to NumPy SVD")
@@ -183,7 +185,7 @@ def _compute_svd_singular_values(centered_emb: torch.Tensor) -> np.ndarray:
         logger = logging.getLogger(__name__)
         logger.error(f"Both PyTorch and NumPy SVD failed: {numpy_err}")
         raise RuntimeError(
-            f"Failed to compute SVD: PyTorch error={pytorch_err}, NumPy error={numpy_err}"
+            f"Failed to compute SVD: PyTorch error={pytorch_error_message}, NumPy error={numpy_err}"
         ) from numpy_err
 
 

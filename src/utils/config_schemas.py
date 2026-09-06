@@ -4,8 +4,9 @@ This module provides optional validation using pydantic if available,
 otherwise falls back to basic Python validation.
 """
 
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, Literal
 import logging
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -115,18 +116,23 @@ if PYDANTIC_AVAILABLE:
 
     class AdaptiveGCLConfig(BaseModel):
         """AdaptiveGCL-specific configuration schema."""
+        text_policy: Literal["masked_text"] = "masked_text"
         text_dim: int = Field(default=384, ge=64, le=1024)
+        use_item_text: bool = True
+        user_semantic_weight: float = Field(default=0.5, ge=0, allow_inf_nan=False)
+        layer_aggregation: Literal["learnable", "mean"] = "learnable"
+        mlp_weight_decay: float = Field(default=0.0, ge=0, allow_inf_nan=False)
         ssl_temp: float = Field(default=0.2, gt=0, le=2.0)
         ssl_reg: float = Field(default=0.1, ge=0, le=10.0)
-        dirichlet_reg: float = Field(default=0.01, ge=0, le=1.0)
+        dirichlet_reg: float = Field(default=0.0, ge=0, le=1.0)
         node_dropout: float = Field(default=0.0, ge=0, lt=1.0)
-        tau_plus: float = Field(default=0.1, ge=0, lt=1.0)
+        tau_plus: float = Field(default=0.0, ge=0, lt=1.0)
         hard_neg_alpha: float = Field(default=0.2, ge=0)
         hard_neg_margin: float = Field(default=0.5, ge=0)
 
 
 def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Validate config dictionary with basic checks.
+    """Validate config and raise ValueError immediately on invalid settings.
 
     Args:
         config: Raw config dictionary
@@ -167,7 +173,7 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
                 )
 
         except ValueError as e:
-            logger.warning(f"Config validation warning: {e}")
+            raise ValueError(f"Invalid configuration: {e}") from e
 
         return config
 
@@ -181,7 +187,7 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
         if "training" in config:
             config["training"] = TrainingConfig(**config["training"]).model_dump()
     except ValidationError as e:
-        logger.warning(f"Config validation error: {e}")
+        raise ValueError(f"Invalid configuration: {e}") from e
 
     return config
 
@@ -197,12 +203,25 @@ def validate_model_config(config: Dict[str, Any], model_name: str) -> Dict[str, 
         Validated config dictionary
     """
     if model_name == "adaptive_gcl" and "adaptive_gcl" in config:
+        ada_cfg = config["adaptive_gcl"]
+        for key, default in (("use_item_text", True), ("user_semantic_weight", 0.5), ("layer_aggregation", "learnable"), ("mlp_weight_decay", 0.0)):
+            ada_cfg.setdefault(key, default)
+        if not isinstance(ada_cfg.get("use_item_text", True), bool):
+            raise ValueError("use_item_text must be a boolean")
+        if ada_cfg.get("layer_aggregation", "learnable") not in {"learnable", "mean"}:
+            raise ValueError("layer_aggregation must be learnable or mean")
+        for key, default in (("user_semantic_weight", 0.5), ("mlp_weight_decay", 0.0), ("ssl_reg", 0.1)):
+            value = ada_cfg.get(key, default)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                raise ValueError(f"{key} must be finite and nonnegative")
+        if config["adaptive_gcl"].get("text_policy", "masked_text") != "masked_text":
+            raise ValueError("Current implementation requires masked_text; use the saved code/data snapshot for legacy_text")
         if PYDANTIC_AVAILABLE:
             from pydantic import ValidationError
             try:
                 config["adaptive_gcl"] = AdaptiveGCLConfig(**config["adaptive_gcl"]).model_dump()
             except ValidationError as e:
-                logger.warning(f"AdaptiveGCL config validation error: {e}")
+                raise ValueError(f"AdaptiveGCL config validation error: {e}") from e
         else:
             validator = ConfigValidator()
             ada_cfg = config["adaptive_gcl"]

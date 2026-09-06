@@ -1,18 +1,55 @@
 {
   "dataset": "amazon-electronics",
-  "created_at": "2026-09-04T06:23:54.595067+00:00",
+  "created_at": "2026-09-05T12:24:02.277560+00:00",
   "source_files": [
     {
       "path": "data/raw/amazon-electronics/reviews_Electronics_5.json.gz",
-      "size_bytes": 495854086
+      "size_bytes": 495854086,
+      "sha256": "af3e7686df7ba4d1ea617197cc5e236c761367e86626c7d9246ac2fc79e36358"
     },
     {
       "path": "data/raw/amazon-electronics/meta_Electronics.json.gz",
-      "size_bytes": 186594679
+      "size_bytes": 186594679,
+      "sha256": "4d01fff21369dabed5a893861cd0f72359a77971c69181d680a44faa55d91ac8"
     }
   ],
+  "artifacts": [
+    {
+      "path": "data/processed/train.parquet",
+      "sha256": "7bde87462c6f463442d4374210ad93896e4fd933cd50680f3b435b510d5ef6bb"
+    },
+    {
+      "path": "data/processed/val.parquet",
+      "sha256": "3ffe1f60e9b70675694df30974512bb7da57deebb0328fc58ce95aa17f0b13f6"
+    },
+    {
+      "path": "data/processed/test.parquet",
+      "sha256": "55cc7e102f6bf31f664aff6dfe2e05cb45a04c146eb0bf92d878a37db498d3b0"
+    },
+    {
+      "path": "data/processed/mappings.pkl",
+      "sha256": "615a8c0c83156a3b8a4b2f1ed82dc39d9921c912219fe4a166cc2f2da26071ac"
+    },
+    {
+      "path": "data/processed/item_text_embeddings.pt",
+      "sha256": "1b906bfa075678c2d1c491c3cd57987483005e09fc980c4a23da024df6ee96ff"
+    },
+    {
+      "path": "data/processed/item_text_embeddings.pt.json",
+      "sha256": "bf784016eb8b87c1109163bfca33a052ac3d88e777a90a75756380f5ead505ed"
+    },
+    {
+      "path": "data/processed/disliked_interactions.parquet",
+      "sha256": "54d5100addc37aba07fb49895aa3fbb102052904c341eeb98a6ba44f6e929bd7"
+    }
+  ],
+  "software_versions": {
+    "pandas": "3.0.5",
+    "numpy": "2.4.6",
+    "torch": "2.5.1+cu121"
+  },
   "preprocessing": {
-    "positive_rating_threshold": 4.0,
+    "positive_rating_threshold": 4,
     "min_user_interactions": 5,
     "min_item_interactions": 5,
     "requested_split_ratios": [
@@ -21,7 +58,12 @@
       0.1
     ],
     "split_seed": 42,
-    "split_protocol": "exact_chronological_selected_users"
+    "split_protocol": "exact_chronological_selected_users",
+    "timestamp_tie_policy": "seeded_user_item_hash_then_item_id",
+    "chronology_scope": "per_user_non_decreasing; ties do not establish intraday order",
+    "positive_dedup_policy": "positive_only_latest_timestamp_then_highest_rating",
+    "kcore_scope": "full_positive_graph_before_split",
+    "kcore_converged": true
   },
   "statistics": {
     "num_users": 124895,
@@ -29,11 +71,127 @@
     "num_interactions": 1072740,
     "density": 0.00019153791836615673,
     "mean_user_interactions": 8.589134873293567,
-    "median_user_interactions": 6.0,
+    "median_user_interactions": 6,
     "min_user_interactions": 5,
     "max_user_interactions": 354,
     "mean_item_interactions": 23.922128314341144,
     "min_item_interactions": 5,
+    "kcore_iterations": 13,
+    "metadata_quality": {
+      "num_items": 44843,
+      "missing_or_fallback_titles": 888,
+      "missing_or_unknown_brands": 22461,
+      "generic_or_missing_categories": 0,
+      "missing_title_fraction": 0.019802421782663962,
+      "missing_brand_fraction": 0.5008808509689361,
+      "complete_metadata": 22382,
+      "partial_metadata": 22461,
+      "no_usable_text": 0
+    },
+    "filter_ledger": {
+      "input_ratings": 1689188,
+      "positive_ratings": 1356067,
+      "removed_by_rating": 333121,
+      "removed_duplicates": 0,
+      "after_dedup": 1356067,
+      "kcore_rounds": [
+        {
+          "round": 1,
+          "before": 1356067,
+          "removed": 213614,
+          "after": 1142453
+        },
+        {
+          "round": 2,
+          "before": 1142453,
+          "removed": 42317,
+          "after": 1100136
+        },
+        {
+          "round": 3,
+          "before": 1100136,
+          "removed": 18733,
+          "after": 1081403
+        },
+        {
+          "round": 4,
+          "before": 1081403,
+          "removed": 5069,
+          "after": 1076334
+        },
+        {
+          "round": 5,
+          "before": 1076334,
+          "removed": 2288,
+          "after": 1074046
+        },
+        {
+          "round": 6,
+          "before": 1074046,
+          "removed": 766,
+          "after": 1073280
+        },
+        {
+          "round": 7,
+          "before": 1073280,
+          "removed": 360,
+          "after": 1072920
+        },
+        {
+          "round": 8,
+          "before": 1072920,
+          "removed": 88,
+          "after": 1072832
+        },
+        {
+          "round": 9,
+          "before": 1072832,
+          "removed": 68,
+          "after": 1072764
+        },
+        {
+          "round": 10,
+          "before": 1072764,
+          "removed": 16,
+          "after": 1072748
+        },
+        {
+          "round": 11,
+          "before": 1072748,
+          "removed": 4,
+          "after": 1072744
+        },
+        {
+          "round": 12,
+          "before": 1072744,
+          "removed": 4,
+          "after": 1072740
+        },
+        {
+          "round": 13,
+          "before": 1072740,
+          "removed": 0,
+          "after": 1072740
+        }
+      ],
+      "output_interactions": 1072740
+    },
+    "ingestion_ledger": {
+      "reviews": {
+        "total_lines": 1689188,
+        "blank_lines": 0,
+        "parsed_rows": 1689188,
+        "invalid_lines": 0,
+        "error_examples": []
+      },
+      "metadata": {
+        "total_lines": 498196,
+        "blank_lines": 0,
+        "parsed_rows": 498196,
+        "invalid_lines": 0,
+        "error_examples": []
+      }
+    },
     "train_interactions": 858192,
     "validation_interactions": 107274,
     "test_interactions": 107274,
@@ -42,16 +200,40 @@
       0.1,
       0.1
     ],
-    "validation_cold_start_targets": 114,
-    "test_cold_start_targets": 316,
-    "hard_negative_interactions": 65854
+    "validation_cold_start_targets": 59,
+    "test_cold_start_targets": 187,
+    "hard_negative_interactions": 65854,
+    "temporal_audit": {
+      "timestamp_midnight_fraction": 1,
+      "train_validation_tied_users": 45431,
+      "validation_test_tied_users": 42592,
+      "train_validation_order_violations": 0,
+      "validation_test_order_violations": 0,
+      "train_test_order_violations": 0,
+      "strict_temporal_order": false
+    },
+    "evaluation_users": 107274,
+    "train_only_users": 17621
   },
   "text_features": {
-    "encoder": "sentence-transformers/all-MiniLM-L6-v2",
+    "format_version": 3,
+    "metadata_policy": "title_or_brand_or_specific_category_v1",
+    "input_fingerprint": "427bc0942f14f9a1eda82206574b3b83ff306b87eabc667fef86d04ac5a2a4d5",
+    "model_name": "sentence-transformers/all-MiniLM-L6-v2",
+    "revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+    "resolved_revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+    "backend": "sentence_transformers",
     "shape": [
       44843,
       384
     ],
-    "normalized": true
+    "sha256": "1b906bfa075678c2d1c491c3cd57987483005e09fc980c4a23da024df6ee96ff",
+    "software_versions": {
+      "sentence-transformers": "6.0.0",
+      "transformers": "5.15.1",
+      "tokenizers": "0.22.2"
+    },
+    "encoder": "sentence-transformers/all-MiniLM-L6-v2",
+    "normalized": "usable_rows_unit_norm; masked_rows_zero"
   }
 }
