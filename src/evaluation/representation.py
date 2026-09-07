@@ -40,6 +40,7 @@ def compute_uniformity(
     embeds: torch.Tensor,
     t: float = 2.0,
     sample_size: int = 5000,
+    seed: int = 42,
 ) -> float:
     """Compute Uniformity metric on the unit hypersphere (Wang & Isola, ICML 2020).
 
@@ -59,7 +60,9 @@ def compute_uniformity(
         return 0.0
 
     if num_nodes > sample_size:
-        perm = torch.randperm(num_nodes)[:sample_size]
+        generator = torch.Generator().manual_seed(seed)
+        perm = torch.randperm(num_nodes, generator=generator)[:sample_size]
+        perm = perm.to(embeds.device)
         sample_embeds = embeds[perm]
     else:
         sample_embeds = embeds
@@ -84,6 +87,7 @@ def compute_alignment_and_uniformity(
     item_embeds: torch.Tensor,
     edge_index: torch.Tensor,
     sample_size: int = 5000,
+    seed: int = 42,
 ) -> Dict[str, float]:
     """Compute comprehensive alignment and uniformity metrics for both user and item embeddings.
 
@@ -91,8 +95,8 @@ def compute_alignment_and_uniformity(
         Dict containing alignment, user_uniformity, item_uniformity, and mean_uniformity.
     """
     align = compute_alignment(user_embeds, item_embeds, edge_index)
-    u_unif = compute_uniformity(user_embeds, sample_size=sample_size)
-    i_unif = compute_uniformity(item_embeds, sample_size=sample_size)
+    u_unif = compute_uniformity(user_embeds, sample_size=sample_size, seed=seed)
+    i_unif = compute_uniformity(item_embeds, sample_size=sample_size, seed=seed)
     mean_unif = (u_unif + i_unif) / 2.0
 
     return {
@@ -194,6 +198,7 @@ def compute_oversmoothing_analysis(
     norm_adj: torch.Tensor,
     max_layers: int = 5,
     sample_nodes: int = 2000,
+    seed: int = 42,
 ) -> Dict[str, List[float]]:
     """Analyze over-smoothing dynamics across increasing GNN layer propagation depths.
 
@@ -214,7 +219,10 @@ def compute_oversmoothing_analysis(
     )
 
     num_total_nodes = ego_embeddings.size(0)
-    sample_idx = torch.randperm(num_total_nodes)[: min(sample_nodes, num_total_nodes)].to(device)
+    generator = torch.Generator().manual_seed(seed)
+    sample_idx = torch.randperm(num_total_nodes, generator=generator)[
+        : min(sample_nodes, num_total_nodes)
+    ].to(device)
 
     layer_distances = []
     layer_depths = list(range(max_layers + 1))

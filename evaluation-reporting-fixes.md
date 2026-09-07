@@ -1,5 +1,14 @@
 # Sửa đánh giá và báo cáo kết quả quick-test
 
+Đính chính DirectAU (2026-09-06):
+
+- [x] Evaluator nhận `score_fn`; Trainer nối `model.get_user_rating_scores` cho validation và test. Phân tích nhóm dùng lại test evaluator nên cũng dùng cùng scorer. DirectAU dùng cosine khi chọn checkpoint/early stopping và báo cáo cuối; LightGCN, XSimGCL, AdaptiveGCL giữ dot product. Gọi evaluator riêng với embedding cần truyền `score_fn=model.get_user_rating_scores` để chọn scorer của model.
+- [x] Regression tests tái hiện item norm làm đổi thứ hạng, kiểm tra batch/user ID, candidate/history masks, bất biến khi scale embedding dương, và một epoch DirectAU thực có lưu/đọc checkpoint. Toàn bộ suite đạt **181 PASS, 10 SKIP** trong AML; các skip cần Pydantic tùy chọn. Test mới được ngoại lệ khỏi `.gitignore` để đi cùng bản sửa.
+- [x] Run mới ghi `evaluation_protocol=model_scoring_shared_minilm_diversity_v3` vào JSON và CSV từng model; dashboard nhận diện giao thức mới. Fingerprint tự đổi theo evaluator/trainer/script nên kết quả/checkpoint cũ không được coi là tương thích với lần chạy mới.
+- Chưa chạy lại benchmark thật. Ví dụ tổng hợp cho NDCG@10 cosine = 1, dot product = 0 chỉ chứng minh lỗi đường chấm điểm có thể ảnh hưởng kết quả; chưa chứng minh đây là nguyên nhân chính của điểm thấp. Checkpoint cũ được chọn bằng validation dot product; đánh giá lại cùng checkpoint chỉ đo ảnh hưởng scorer, còn benchmark đúng giao thức cần chọn checkpoint lại bằng validation cosine.
+
+Các sửa đổi đánh giá trước đó:
+
 Phạm vi: sửa cách đo/trình bày, không đổi loss hoặc cấu hình AdaptiveGCL, không dùng test để chọn siêu tham số.
 
 - [x] Một lượt chạy: standard deviation và p-value không có cơ sở được ghi N/A, kèm số cặp và trạng thái kiểm định. Kiểm định không xác định không bị đổi thành `p=1`.

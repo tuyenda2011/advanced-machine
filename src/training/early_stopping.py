@@ -1,6 +1,9 @@
 import logging
 import os
+import random
 from typing import Any, Dict, Optional, Tuple
+
+import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
@@ -14,12 +17,14 @@ def save_checkpoint(
     best_score: float = 0.0,
     val_metrics: Optional[Dict[str, float]] = None,
     config: Optional[Dict[str, Any]] = None,
+    training_state: Optional[Dict[str, Any]] = None,
+    scaler=None,
 ) -> None:
     """Save full training checkpoint with model weights, optimizer state, metrics, and config.
 
     Uses atomic write (temp file + rename) to prevent corruption on interruption.
     """
-    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+    os.makedirs(os.path.dirname(checkpoint_path) or ".", exist_ok=True)
     state = {
         "epoch": epoch,
         "best_score": best_score,
@@ -27,6 +32,14 @@ def save_checkpoint(
         "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
         "val_metrics": val_metrics or {},
         "config": config or {},
+        "training_state": training_state or {},
+        "rng_state": {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        },
+        "scaler_state": scaler.state_dict() if scaler is not None else None,
     }
 
     # Atomic write: save to temp file first, then rename
@@ -47,7 +60,9 @@ def load_checkpoint(
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
 
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    # State loaders move parameter tensors to the model/optimizer devices.
+    # Keep Adam's scalar step counters and committed best snapshots on CPU.
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     # Validate checkpoint integrity
     if "model_state_dict" not in checkpoint:
@@ -69,6 +84,18 @@ def load_checkpoint(
     logger.info(f"Loaded checkpoint from {checkpoint_path} (epoch {epoch}, best score: {best_score:.4f})")
 
     return epoch, best_score, checkpoint
+
+
+def restore_training_rng(checkpoint, scaler=None):
+    """Restore stochastic training state only for an explicit resume."""
+    rng = checkpoint["rng_state"]
+    random.setstate(rng["python"])
+    np.random.set_state(rng["numpy"])
+    torch.set_rng_state(rng["torch"].cpu())
+    if rng["cuda"] is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all([state.cpu() for state in rng["cuda"]])
+    if scaler is not None and checkpoint.get("scaler_state") is not None:
+        scaler.load_state_dict(checkpoint["scaler_state"])
 
 
 class EarlyStopping:

@@ -1,7 +1,9 @@
 """Centralized checkpoint path utilities for consistent checkpoint management across the project."""
 
 import hashlib
+import json
 import os
+from copy import deepcopy
 from typing import Optional
 
 
@@ -21,7 +23,9 @@ def get_experiment_fingerprint(
         os.path.join("src", "training", "early_stopping.py"),
         os.path.join("src", "evaluation", "evaluator.py"),
         os.path.join("src", "evaluation", "metrics.py"),
+        os.path.join("src", "evaluation", "representation.py"),
         os.path.join("src", "evaluation", "subgroup.py"),
+        os.path.join("src", "data", "graph.py"),
         os.path.join("src", "data", "negative_collector.py"),
         os.path.join("src", "data", "splitter.py"),
         os.path.join("src", "data", "sparsity.py"),
@@ -32,6 +36,8 @@ def get_experiment_fingerprint(
         os.path.join("src", "utils", "config.py"),
         os.path.join("src", "utils", "config_schemas.py"),
         os.path.join("src", "utils", "geometry.py"),
+        os.path.join("src", "utils", "device.py"),
+        os.path.join("src", "utils", "seed.py"),
         os.path.join("src", "losses", "bpr.py"),
         os.path.join("src", "losses", "contrastive.py"),
         os.path.join("src", "losses", "directau.py"),
@@ -46,12 +52,40 @@ def get_experiment_fingerprint(
     return digest.hexdigest()
 
 
-def get_model_output_dir(section: str, model_name: str) -> str:
-    path = os.path.join("results", section, model_name)
+def get_model_output_dir(section: str, model_name: str, root: str = "results") -> str:
+    path = os.path.join(root, section, model_name)
     return os.path.join(path, "masked_text") if model_name == "adaptive_gcl" else path
 
 
-def get_checkpoint_dir(model_name: str) -> str:
+def get_run_fingerprint(model_name, sparsity=1.0, seed=42, config=None, config_dir="configs"):
+    """Hash learning settings, excluding epoch budget and output paths.
+
+    Pass seed=None for a family identity shared by independent seeds.
+    """
+    if config is None:
+        from src.utils.config import load_config
+        config = load_config(model_name, config_dir)
+    effective = deepcopy(config)
+    for key in ("experiment_fingerprint", "history_dir", "validation_only", "ablation_variant"):
+        effective.pop(key, None)
+    effective.setdefault("training", {}).pop("epochs", None)
+    effective["training"]["seed"] = seed
+    identity = {"code_and_data": get_experiment_fingerprint(model_name, config_dir),
+                "config": effective, "sparsity": sparsity, "seed": seed}
+    return hashlib.sha256(json.dumps(identity, sort_keys=True, allow_nan=False).encode()).hexdigest()
+
+
+def write_run_status(root, planned, succeeded, attempted):
+    """Persist counts even when a later run fails or the process is interrupted."""
+    os.makedirs(root, exist_ok=True)
+    path = os.path.join(root, "runner_status.json")
+    with open(path + ".tmp", "w", encoding="utf-8") as handle:
+        json.dump({"planned": planned, "succeeded": succeeded,
+                   "failed": attempted - succeeded, "pending": planned - attempted}, handle, indent=2)
+    os.replace(path + ".tmp", path)
+
+
+def get_checkpoint_dir(model_name: str, root: str = "results") -> str:
     """Get the checkpoint directory for a given model.
 
     Args:
@@ -60,7 +94,7 @@ def get_checkpoint_dir(model_name: str) -> str:
     Returns:
         Absolute path to the checkpoint directory
     """
-    return get_model_output_dir("checkpoints", model_name)
+    return get_model_output_dir("checkpoints", model_name, root)
 
 
 def get_checkpoint_path(

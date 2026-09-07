@@ -14,26 +14,22 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.optim as optim
-from tqdm import tqdm
 
-
-from src.data.graph import create_edge_dropout_views, get_norm_adj_tensor
+from src.data.graph import get_norm_adj_tensor
 from src.evaluation.evaluator import Evaluator
 from src.evaluation.representation import (
     compute_alignment_and_uniformity,
     compute_svd_spectrum,
 )
 from src.evaluation.subgroup import evaluate_degree_subgroups
-from src.losses.bpr import BPRLoss
-from src.losses.contrastive import InfoNCELoss
-from src.losses.directau import DirectAULoss
-from src.losses.hard_bpr import HardNegativeBPRLoss
-from src.models.adaptive_gcl import AdaptiveGCL
 from src.models.base import BaseRecommender
-from src.models.directau import DirectAU
-from src.models.lightgcn import LightGCN
-from src.models.xsimgcl import XSimGCL
-from src.training.early_stopping import EarlyStopping, load_checkpoint, save_checkpoint
+from src.training.early_stopping import (
+    EarlyStopping,
+    load_checkpoint,
+    restore_training_rng,
+    save_checkpoint,
+)
+from src.training.loss_strategies import get_loss_strategy
 from src.utils.checkpoints import get_model_output_dir
 
 logger = logging.getLogger(__name__)
@@ -81,7 +77,11 @@ def sample_negative_items(
     Returns:
         Array of negative item indices
     """
+    if num_items <= 0 or max_attempts < 0:
+        raise ValueError("num_items must be positive and max_attempts nonnegative")
     n = len(users)
+    if n == 0:
+        return np.empty(0, dtype=np.int64)
     neg_items = np.random.randint(0, num_items, size=n)
 
     # Pre-compute history sets for faster lookup
@@ -95,14 +95,25 @@ def sample_negative_items(
 
     # Retry collisions with limit
     attempts = np.zeros(n, dtype=np.int32)
-    while collisions.any() and (attempts < max_attempts).any():
+    while True:
         retry_mask = collisions & (attempts < max_attempts)
+        if not retry_mask.any():
+            break
         neg_items[retry_mask] = np.random.randint(0, num_items, size=retry_mask.sum())
 
         # Update collision status
         for i in np.where(retry_mask)[0]:
             attempts[i] += 1
             collisions[i] = neg_items[i] in user_histories[i]
+
+    # Resolve only exhausted collisions, sharing the complement per user.
+    for user in np.unique(users[collisions]):
+        remaining = np.flatnonzero(collisions & (users == user))
+        seen = np.fromiter(train_history.get(int(user), set()), dtype=np.int64)
+        candidates = np.setdiff1d(np.arange(num_items), seen, assume_unique=True)
+        if candidates.size == 0:
+            raise ValueError(f"User {int(user)} has no valid negative items")
+        neg_items[remaining] = np.random.choice(candidates, size=remaining.size)
 
     return neg_items
 
@@ -141,25 +152,38 @@ class Trainer:
         model: BaseRecommender,
         train_df: pd.DataFrame,
         val_evaluator: Evaluator,
-        test_evaluator: Evaluator,
+        test_evaluator: Evaluator | None,
         config: Dict[str, Any],
         device: torch.device,
         user_disliked_items: Optional[Dict[int, List[int]]] = None,
+        subgroup_reference_df: Optional[pd.DataFrame] = None,
     ):
         self.model = model.to(device)
         self.train_df = train_df
         self.val_evaluator = val_evaluator
         self.test_evaluator = test_evaluator
+        # Validation, final test, and subgroups must share the model's scorer.
+        self.val_evaluator.score_fn = self.model.get_user_rating_scores
+        if self.test_evaluator is not None:
+            self.test_evaluator.score_fn = self.model.get_user_rating_scores
         self.config = config
         self.device = device
         self.user_disliked_items = user_disliked_items or {}
+        self.subgroup_reference_df = (
+            subgroup_reference_df if subgroup_reference_df is not None else train_df
+        )
 
         self.model_name = config["model_name"]
+        if self.test_evaluator is None and not config.get("validation_only", False):
+            raise ValueError("A test evaluator is required unless validation_only is enabled")
         self.num_users = model.num_users
         self.num_items = model.num_items
 
         train_cfg = config["training"]
         self.epochs = train_cfg["epochs"]
+        self.monitor = config.get("evaluation", {}).get("monitor", "NDCG@10")
+        if self.monitor not in {f"NDCG@{k}" for k in self.val_evaluator.k_list}:
+            raise ValueError("Monitor must be NDCG at an evaluated cutoff")
         self.batch_size = train_cfg["batch_size"]
         self.lr = train_cfg["learning_rate"]
         self.weight_decay = train_cfg["weight_decay"]
@@ -169,28 +193,13 @@ class Trainer:
             parameters = self.model.optimizer_param_groups(
                 config.get("adaptive_gcl", {}).get("mlp_weight_decay", 0.0)
             )
-        self.optimizer = optim.Adam(parameters, lr=self.lr)
+        if self.model_name == "directau" and config.get("directau", {}).get("profile", "project_cosine") != model.profile:
+            raise ValueError("DirectAU model and config profiles differ")
+        reference_directau = self.model_name == "directau" and getattr(model, "profile", "project_cosine") == "reference_lgcn"
+        optimizer_decay = config.get("directau", {}).get("optimizer_weight_decay", 1e-6) if reference_directau else 0.0
+        self.optimizer = optim.Adam(parameters, lr=self.lr, weight_decay=optimizer_decay)
 
-        self.bpr_loss_fn = BPRLoss(
-            weight_decay=self.weight_decay,
-            regularization="selfrec" if self.model_name == "xsimgcl" else "squared",
-        )
-        self.cl_loss_fn = InfoNCELoss(
-            temperature=config.get(self.model_name, {}).get("temperature", 0.2)
-        )
-        if self.model_name == "directau":
-            d_cfg = config.get("directau", {})
-            self.directau_loss_fn = DirectAULoss(
-                gamma=d_cfg.get("gamma", 1.0),
-                t=d_cfg.get("t", 2.0),
-                weight_decay=self.weight_decay,
-            )
-        elif self.model_name == "adaptive_gcl":
-            adaptive_cfg = config.get("adaptive_gcl", {})
-            self.hard_bpr_loss_fn = HardNegativeBPRLoss(
-                alpha=adaptive_cfg.get("hard_neg_alpha", 0.2),
-                margin=adaptive_cfg.get("hard_neg_margin", 0.5),
-            )
+        self.loss_strategy = get_loss_strategy(self.model_name, config)
 
         # Precompute train history mapping for negative sampling
         self.train_history: Dict[int, Set[int]] = (
@@ -212,7 +221,7 @@ class Trainer:
         # Early stopping handler
         self.early_stopping = EarlyStopping(
             patience=train_cfg["early_stopping_patience"],
-            monitor="NDCG@10",
+            monitor=self.monitor,
             mode="max",
         )
 
@@ -232,16 +241,18 @@ class Trainer:
             self.scaler.scale(total_loss).backward()
             # Gradients must be unscaled before their norm is clipped.
             self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(
+            grad_norm = torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), max_norm=GRADIENT_CLIP_VALUE, error_if_nonfinite=True
             )
+            self.last_gradient_norm = float(grad_norm)
             self.scaler.step(self.optimizer)
             self.scaler.update()
         else:
             total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(
+            grad_norm = torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), max_norm=GRADIENT_CLIP_VALUE, error_if_nonfinite=True
             )
+            self.last_gradient_norm = float(grad_norm)
             self.optimizer.step()
 
     def train(self, checkpoint_path: str, resume: bool = False) -> Dict[str, Any]:
@@ -252,6 +263,9 @@ class Trainer:
 
         latest_checkpoint_path = checkpoint_path.replace(".pt", "_latest.pt")
         start_epoch = 1
+        best_val_metrics: Dict[str, float] = {}
+        committed_state = {}
+        resumed_checkpoint = None
 
         if resume and os.path.exists(latest_checkpoint_path):
             try:
@@ -264,9 +278,29 @@ class Trainer:
                 )
                 start_epoch = loaded_epoch + 1
                 self.early_stopping.best_score = best_sc
-                self.early_stopping.best_epoch = ckpt.get("best_epoch", loaded_epoch)
+                training_state = ckpt.get("training_state", {})
+                if "history" not in training_state or "rng_state" not in ckpt:
+                    raise ValueError("Checkpoint lacks complete resume state; start a fresh run")
+                if ckpt.get("config", {}).get("evaluation", {}).get("monitor", "NDCG@10") != self.monitor:
+                    raise ValueError("Resume monitor differs from checkpoint")
+                committed_state = training_state
+                resumed_checkpoint = ckpt
+                if self.epochs < loaded_epoch:
+                    raise ValueError("Requested epochs precede the checkpoint epoch")
+                self.early_stopping.best_epoch = int(
+                    training_state.get("best_epoch", loaded_epoch)
+                )
+                self.early_stopping.counter = int(
+                    training_state.get("early_stopping_counter", 0)
+                )
+                self.early_stopping.early_stop = (
+                    self.early_stopping.counter >= self.early_stopping.patience
+                )
+                best_val_metrics = dict(
+                    training_state.get("best_val_metrics", ckpt.get("val_metrics", {}))
+                )
                 print(
-                    f"🔄 [RESUME CHECKPOINT] Đã khôi phục trọng số! Tiếp tục train từ Epoch {start_epoch:02d}/{self.epochs:02d} (Val NDCG@10 đỉnh hiện tại: {best_sc:.4f})\n",
+                    f"🔄 [RESUME CHECKPOINT] Đã khôi phục trọng số! Tiếp tục train từ Epoch {start_epoch:02d}/{self.epochs:02d} (Val {self.monitor} đỉnh hiện tại: {best_sc:.4f})\n",
                     flush=True,
                 )
             except Exception as ex:
@@ -277,9 +311,7 @@ class Trainer:
         num_samples = len(user_array)
 
         start_train_time = time.perf_counter()
-        epoch_times = []
 
-        best_val_metrics = {}
         best_epoch = self.early_stopping.best_epoch
 
         history_dir = self.config.get("history_dir") or get_model_output_dir("history", self.model_name)
@@ -287,12 +319,37 @@ class Trainer:
         history_csv_name = os.path.basename(checkpoint_path).replace(".pt", "_history.csv")
         history_csv_path = os.path.join(history_dir, history_csv_name)
 
-        history_records = []
-        if resume and os.path.exists(history_csv_path):
-            history_records = pd.read_csv(history_csv_path).to_dict(orient="records")
+        history_records = list(committed_state.get("history", []))
+        previous_train_time = float(committed_state.get("total_train_time", 0.0))
+        previous_validation_time = float(committed_state.get("validation_time", 0.0))
+        cumulative_train_time = previous_train_time
+        best_model_state = committed_state.get("best_model_state")
+        validation_time = 0.0
+        if resumed_checkpoint is not None:
+            if [row["epoch"] for row in history_records] != list(range(1, start_epoch)):
+                raise ValueError("Checkpoint history does not match committed epochs")
+            pd.DataFrame(history_records).to_csv(history_csv_path, index=False)
+            if best_model_state is None:
+                raise ValueError("Checkpoint lacks committed best model state")
+            # Rebuild the best artifact from the same committed transaction.
+            best_artifact = dict(resumed_checkpoint)
+            best_artifact.update(model_state_dict=best_model_state, epoch=best_epoch,
+                                 val_metrics=best_val_metrics)
+            # Recovered best weights are for inference; resume uses latest only.
+            for key in ("optimizer_state_dict", "rng_state", "scaler_state", "training_state"):
+                best_artifact.pop(key, None)
+            torch.save(best_artifact, checkpoint_path + ".tmp")
+            os.replace(checkpoint_path + ".tmp", checkpoint_path)
+            restore_training_rng(resumed_checkpoint, self.scaler)
+        elif resume:
+            raise FileNotFoundError(f"Resume checkpoint missing: {latest_checkpoint_path}")
 
         for epoch in range(start_epoch, self.epochs + 1):
+            if self.early_stopping.early_stop:
+                logger.info("Resume state had already reached early stopping; skipping training")
+                break
             epoch_start = time.perf_counter()
+            gradient_norms = []
             self.model.train()
 
             # 1. Random negative sampling per epoch (only needed if model uses negative sampling)
@@ -303,13 +360,15 @@ class Trainer:
             else:
                 neg_item_array = None
 
-            if self.model_name == "adaptive_gcl" and self.user_disliked_items:
+            if self.model_name == "adaptive_gcl" and self.user_disliked_items and self.config.get("adaptive_gcl", {}).get("hard_neg_alpha", 0.2) > 0:
+                sampling_state = np.random.get_state()
                 hard_item_array, hard_item_available = sample_hard_negative_items(
                     user_array,
                     self.user_disliked_items,
                     self.train_history,
                     self.num_items,
                 )
+                np.random.set_state(sampling_state)
             else:
                 hard_item_array = None
                 hard_item_available = None
@@ -337,96 +396,30 @@ class Trainer:
 
                 self.optimizer.zero_grad()
 
-                if self.model_name == "directau":
-                    u_embeds, i_embeds = self.model(self.norm_adj)
-                    u_emb0 = self.model.user_embedding(u_batch)
-                    pos_emb0 = self.model.item_embedding(pos_batch)
-
-                    total_loss, align_loss, unif_loss = self.directau_loss_fn(
-                        u_embeds[u_batch], i_embeds[pos_batch], u_emb0, pos_emb0
-                    )
-                    bpr_loss_accum += align_loss.item()
-                    cl_loss_accum += unif_loss.item()
-                else:
-                    neg_batch = torch.tensor(
-                        neg_item_array[batch_idx], dtype=torch.long, device=self.device
-                    )
-
-                    if self.model_name == "xsimgcl":
-                        u_embeds, i_embeds, cl_u_embeds, cl_i_embeds = self.model(
-                            self.norm_adj, perturbed=True
-                        )
-                    else:
-                        u_embeds, i_embeds = self.model(self.norm_adj)
-
-                    pos_scores = (u_embeds[u_batch] * i_embeds[pos_batch]).sum(dim=-1)
-                    neg_scores = (u_embeds[u_batch] * i_embeds[neg_batch]).sum(dim=-1)
-
-                    if self.model_name == "xsimgcl":
-                        u_emb0 = u_embeds[u_batch]
-                        pos_emb0 = i_embeds[pos_batch]
-                        # Match the official SELFRec implementation, which
-                        # regularizes the propagated user and positive item only.
-                        neg_emb0 = None
-                    else:
-                        u_emb0 = self.model.user_embedding(u_batch)
-                        pos_emb0 = self.model.item_embedding(pos_batch)
-                        neg_emb0 = self.model.item_embedding(neg_batch)
-
-                    total_loss, bpr_loss = self.bpr_loss_fn(
-                        pos_scores, neg_scores, u_emb0, pos_emb0, neg_emb0
-                    )
-
-                    cl_loss = torch.tensor(0.0, device=self.device)
-
-                    if self.model_name == "xsimgcl":
-                        cl_weight = self.config["xsimgcl"]["contrastive_weight"]
-                        unique_users = torch.unique(u_batch)
-                        unique_items = torch.unique(pos_batch)
-                        cl_loss = (
-                            self.cl_loss_fn.compute_view_loss(
-                                u_embeds[unique_users], cl_u_embeds[unique_users]
-                            )
-                            + self.cl_loss_fn.compute_view_loss(
-                                i_embeds[unique_items], cl_i_embeds[unique_items]
-                            )
-                        )
-                        total_loss = total_loss + cl_weight * cl_loss
-
-                    elif self.model_name == "adaptive_gcl":
-                        if self.model.ssl_reg > 0:
-                            semantic_pairs += int(self.model.item_text_mask[torch.unique(pos_batch)].sum().item())
-                        cl_loss = self.model.compute_semantic_ssl_loss(pos_batch, i_embeds)
-                        total_loss = total_loss + cl_loss
-
-                        if hard_item_array is not None and hard_item_available is not None:
-                            batch_hard_mask = hard_item_available[batch_idx]
-                            if batch_hard_mask.any():
-                                hard_mask = torch.tensor(
-                                    batch_hard_mask, dtype=torch.bool, device=self.device
-                                )
-                                hard_batch = torch.tensor(
-                                    hard_item_array[batch_idx][batch_hard_mask],
-                                    dtype=torch.long,
-                                    device=self.device,
-                                )
-                                total_loss = total_loss + self.hard_bpr_loss_fn.compute_hard_penalty(
-                                    u_embeds[u_batch[hard_mask]],
-                                    i_embeds[pos_batch[hard_mask]],
-                                    i_embeds[hard_batch],
-                                )
-
-                        if self.model.dirichlet_reg > 0:
-                            all_final = torch.cat([u_embeds, i_embeds], dim=0)
-                            total_loss = total_loss + self.model.compute_dirichlet_regularization(
-                                self.norm_adj, all_final
-                            )
-
-                    bpr_loss_accum += bpr_loss.item()
-                    cl_loss_accum += cl_loss.item()
-
+                neg_batch = None if neg_item_array is None else torch.tensor(
+                    neg_item_array[batch_idx], dtype=torch.long, device=self.device
+                )
+                auxiliary = {}
+                if self.model_name == "adaptive_gcl":
+                    if self.model.ssl_reg > 0:
+                        semantic_pairs += int(self.model.item_text_mask[torch.unique(pos_batch)].sum().item())
+                    if hard_item_array is not None and hard_item_available is not None:
+                        available = hard_item_available[batch_idx]
+                        if available.any():
+                            auxiliary = {
+                                "hard_mask": torch.tensor(available, dtype=torch.bool, device=self.device),
+                                "hard_batch": torch.tensor(hard_item_array[batch_idx][available],
+                                                           dtype=torch.long, device=self.device),
+                            }
+                losses = self.loss_strategy.compute_loss(
+                    self.model, self.norm_adj, u_batch, pos_batch, neg_batch, self.config, **auxiliary
+                )
+                total_loss = losses.total_loss
+                bpr_loss_accum += losses.bpr_loss
+                cl_loss_accum += losses.cl_loss
 
                 self._backward_and_step(total_loss)
+                gradient_norms.append(self.last_gradient_norm)
 
                 total_loss_accum += total_loss.item()
                 num_batches += 1
@@ -443,8 +436,8 @@ class Trainer:
                 torch.cuda.synchronize()
 
             epoch_time = time.perf_counter() - epoch_start
-            epoch_times.append(epoch_time)
 
+            validation_start = time.perf_counter()
             # Evaluation on Validation set every epoch
             self.model.eval()
             with torch.no_grad():
@@ -453,12 +446,13 @@ class Trainer:
                     val_u_embeds, val_i_embeds, self.device, include_beyond_accuracy=False
                 )
 
+            validation_time += time.perf_counter() - validation_start
             val_ndcg10 = val_metrics["NDCG@10"]
             val_rec10 = val_metrics["Recall@10"]
             avg_loss = total_loss_accum / max(1, num_batches)
 
             is_improved = self.early_stopping(
-                val_ndcg10,
+                val_metrics[self.monitor],
                 epoch,
                 self.model,
                 checkpoint_path,
@@ -469,24 +463,15 @@ class Trainer:
             if is_improved:
                 best_val_metrics = val_metrics
                 best_epoch = epoch
+                best_model_state = {key: value.detach().cpu().clone()
+                                    for key, value in self.model.state_dict().items()}
 
             best_tag = " 🌟 [BEST]" if is_improved else ""
 
             # Overwrite line atomically without excessive spaces to prevent terminal wrapping
-            epoch_summary = f"Epoch {epoch:02d}/{self.epochs:02d} [{epoch_time:4.1f}s] | Loss: {avg_loss:.4f} | Val Recall@10: {val_rec10:.4f} | Val NDCG@10: {val_ndcg10:.4f}{best_tag}"
+            epoch_summary = f"Epoch {epoch:02d}/{self.epochs:02d} [{epoch_time:4.1f}s] | Loss: {avg_loss:.4f} | Val Recall@10: {val_rec10:.4f} | Val NDCG@10: {val_ndcg10:.4f} | Monitor {self.monitor}: {val_metrics[self.monitor]:.4f}{best_tag}"
             sys.stdout.write(f"\r{epoch_summary:<85}\n")
             sys.stdout.flush()
-
-            # Save latest checkpoint at end of each epoch for resuming
-            save_checkpoint(
-                latest_checkpoint_path,
-                model=self.model,
-                optimizer=self.optimizer,
-                epoch=epoch,
-                best_score=self.early_stopping.best_score,
-                val_metrics=val_metrics,
-                config=self.config,
-            )
 
             # Record epoch training history
             history_records.append({
@@ -497,7 +482,15 @@ class Trainer:
                 "val_ndcg_10": round(val_ndcg10, 4),
                 "val_recall_10": round(val_metrics.get("Recall@10", 0.0), 4),
                 "val_mrr_10": round(val_metrics.get("MRR@10", 0.0), 4),
-                "epoch_time_sec": round(epoch_time, 2),
+                "epoch_time_sec": epoch_time,
+                "val_ndcg_20": val_metrics.get("NDCG@20"),
+                "val_recall_20": val_metrics.get("Recall@20"),
+                "monitor": self.monitor,
+                "monitor_value": val_metrics[self.monitor],
+                "alignment_loss": bpr_loss_accum / max(1, num_batches) if self.model_name == "directau" else None,
+                "uniformity_loss": cl_loss_accum / max(1, num_batches) if self.model_name == "directau" else None,
+                "mean_gradient_norm": float(np.mean(gradient_norms)),
+                "gradient_clip_fraction": float(np.mean(np.asarray(gradient_norms) > GRADIENT_CLIP_VALUE)),
                 "mean_valid_semantic_pairs": semantic_pairs / max(1, num_batches) if self.model_name == "adaptive_gcl" else None,
                 "cuda_peak_allocated_mb": torch.cuda.max_memory_allocated(self.device) / (1024 ** 2) if self.device.type == "cuda" else None,
                 "is_best": bool(is_improved),
@@ -508,6 +501,27 @@ class Trainer:
             os.makedirs(history_dir, exist_ok=True)
             history_csv_name = os.path.basename(checkpoint_path).replace(".pt", "_history.csv")
             history_csv_path = os.path.join(history_dir, history_csv_name)
+            cumulative_train_time = previous_train_time + time.perf_counter() - start_train_time
+            # Commit the authoritative history with the latest checkpoint.
+            save_checkpoint(
+                latest_checkpoint_path,
+                model=self.model,
+                optimizer=self.optimizer,
+                epoch=epoch,
+                best_score=self.early_stopping.best_score,
+                val_metrics=val_metrics,
+                config=self.config,
+                training_state={
+                    "best_epoch": self.early_stopping.best_epoch,
+                    "early_stopping_counter": self.early_stopping.counter,
+                    "best_val_metrics": best_val_metrics,
+                    "history": history_records,
+                    "total_train_time": cumulative_train_time,
+                    "best_model_state": best_model_state,
+                    "validation_time": previous_validation_time + validation_time,
+                },
+                scaler=self.scaler,
+            )
             pd.DataFrame(history_records).to_csv(history_csv_path, index=False)
 
 
@@ -515,32 +529,42 @@ class Trainer:
                 logger.info(f"Stopping early at epoch {epoch}")
                 break
 
-        total_train_time = time.perf_counter() - start_train_time
-        avg_epoch_time = float(np.mean(epoch_times)) if epoch_times else 0.0
+        total_train_time = cumulative_train_time
+        all_epoch_times = [float(row["epoch_time_sec"]) for row in history_records]
+        avg_epoch_time = float(np.mean(all_epoch_times)) if all_epoch_times else 0.0
+        timing = {"training_time": sum(all_epoch_times),
+                  "validation_time": previous_validation_time + validation_time}
 
         # Load best checkpoint for final evaluation
-        if os.path.exists(checkpoint_path):
-            load_checkpoint(checkpoint_path, self.model, device=self.device,
-                            expected_fingerprint=self.config.get("experiment_fingerprint"))
-            logger.info(f"Loaded best checkpoint for final evaluation: {checkpoint_path}")
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Best checkpoint is missing: {checkpoint_path}")
+        load_checkpoint(checkpoint_path, self.model, device=self.device,
+                        expected_fingerprint=self.config.get("experiment_fingerprint"))
+        logger.info(f"Loaded best checkpoint for final evaluation: {checkpoint_path}")
 
         self.model.eval()
         if self.config.get("validation_only", False):
             return {"model_name": self.model_name, "best_epoch": best_epoch,
-                    "total_epochs": len(epoch_times), "total_train_time": total_train_time,
+                    "total_epochs": len(history_records), "total_train_time": total_train_time,
                     "avg_epoch_time": avg_epoch_time, "val_metrics": best_val_metrics,
-                    "validation_only": True, "history": history_records}
+                    "validation_only": True, "history": history_records,
+                    "monitor": self.monitor, **timing}
+        final_evaluation_start = time.perf_counter()
         with torch.no_grad():
             final_u_embeds, final_i_embeds = self.model(self.norm_adj)
 
             # 1. Full ranking evaluation including beyond-accuracy metrics with progress bar
+            assert self.test_evaluator is not None
             test_metrics, avg_user_latency_ms = self.test_evaluator.evaluate(
                 final_u_embeds, final_i_embeds, self.device, include_beyond_accuracy=True, show_progress=True
             )
 
             # 2. Representation Geometry (Alignment & Uniformity)
             rep_metrics = compute_alignment_and_uniformity(
-                final_u_embeds, final_i_embeds, self.train_edge_index
+                final_u_embeds,
+                final_i_embeds,
+                self.train_edge_index,
+                seed=int(self.config["training"].get("seed", 42)),
             )
 
             # 3. SVD Spectrum & Dimensional Collapse
@@ -553,15 +577,19 @@ class Trainer:
                 final_u_embeds,
                 final_i_embeds,
                 self.device,
-                self.train_df,
+                self.subgroup_reference_df,
+                k_list=getattr(self.test_evaluator, "k_list", [10, 20]),
             )
 
         throughput_users_per_sec = 1000.0 / avg_user_latency_ms if avg_user_latency_ms > 0 else 0.0
 
         summary_results = {
             "model_name": self.model_name,
+            "monitor": self.monitor,
+            **timing,
+            "final_evaluation_time": time.perf_counter() - final_evaluation_start,
             "best_epoch": best_epoch,
-            "total_epochs": len(epoch_times),
+            "total_epochs": len(history_records),
             "total_train_time": total_train_time,
             "avg_epoch_time": avg_epoch_time,
             "inference_latency_ms_per_user": avg_user_latency_ms,

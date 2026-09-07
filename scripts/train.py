@@ -1,8 +1,8 @@
 import argparse
-from datetime import datetime
 import json
 import os
 import sys
+from datetime import datetime
 
 # Ensure project root is in sys.path when script is executed directly
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -14,18 +14,22 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 import pickle
+
 import pandas as pd
-import torch
 
 from src.data.sparsity import create_sparse_train_set
 from src.data.text_encoder import build_user_history_features, load_training_text
-from src.evaluation.evaluator import Evaluator
+from src.evaluation.evaluator import EVALUATION_PROTOCOL, Evaluator
 from src.models.adaptive_gcl import AdaptiveGCL
 from src.models.directau import DirectAU
 from src.models.lightgcn import LightGCN
 from src.models.xsimgcl import XSimGCL
 from src.training.trainer import Trainer
-from src.utils.checkpoints import get_experiment_fingerprint, get_checkpoint_dir, get_model_output_dir
+from src.utils.checkpoints import (
+    get_checkpoint_dir,
+    get_model_output_dir,
+    get_run_fingerprint,
+)
 from src.utils.config import load_config
 from src.utils.device import get_device
 from src.utils.logging import setup_logger
@@ -34,55 +38,61 @@ from src.utils.seed import set_seed
 logger = setup_logger("train_script")
 
 
-def append_to_model_results_csv(results: dict, model_name: str, sparsity: float, seed: int):
+def append_to_model_results_csv(results: dict, model_name: str, sparsity: float, seed: int,
+                                output_root: str = "results"):
     """Save or append run results to dedicated per-model CSV file (results/aggregated/{model}_results.csv)."""
-    agg_dir = os.path.join("results", "aggregated")
+    agg_dir = os.path.join(output_root, "aggregated")
     if model_name == "adaptive_gcl":
-        agg_dir = get_model_output_dir("aggregated", model_name)
+        agg_dir = get_model_output_dir("aggregated", model_name, output_root)
     os.makedirs(agg_dir, exist_ok=True)
     model_csv = os.path.join(agg_dir, f"{model_name}_results.csv")
 
-    test_m = results.get("test_metrics", {})
-    val_m = results.get("val_metrics", {})
-    rep_m = results.get("representation_metrics", {})
-    svd_m = results.get("svd_metrics", {})
-    sub_m = results.get("subgroup_metrics", {})
-    tail_m = sub_m.get("Tail (Low-Activity)", {})
-    head_m = sub_m.get("Head (Active)", {})
+    test_m = results["test_metrics"]
+    val_m = results["val_metrics"]
+    rep_m = results["representation_metrics"]
+    svd_m = results["svd_metrics"]
+    sub_m = results["subgroup_metrics"]
+    tail_m = sub_m["Tail (Low-Activity)"]
+    head_m = sub_m["Head (Active)"]
 
     row = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "model": model_name,
-        "experiment_fingerprint": results.get("experiment_fingerprint"),
+        "experiment_fingerprint": results["experiment_fingerprint"],
+        "evaluation_protocol": results["evaluation_protocol"],
+        "monitor": results["monitor"],
+        "monitor_value": val_m[results["monitor"]],
+        "scoring_metric": results["scoring_metric"],
+        "profile": results["profile"],
         "text_policy": "masked_text" if model_name == "adaptive_gcl" else None,
         "sparsity": sparsity,
         "seed": seed,
-        "best_epoch": results.get("best_epoch", 0),
-        "total_epochs": results.get("total_epochs", 0),
-        "train_time_sec": round(results.get("total_train_time", 0.0), 2),
-        "inference_latency_ms": round(results.get("inference_latency_ms_per_user", 0.0), 3),
+        "best_epoch": results["best_epoch"],
+        "total_epochs": results["total_epochs"],
+        "train_time_sec": round(results["total_train_time"], 2),
+        "inference_latency_ms": round(results["inference_latency_ms_per_user"], 3),
         # Accuracy Metrics
-        "Recall@10": round(test_m.get("Recall@10", 0.0), 4),
-        "NDCG@10": round(test_m.get("NDCG@10", 0.0), 4),
-        "MRR@10": round(test_m.get("MRR@10", 0.0), 4),
-        "Recall@20": round(test_m.get("Recall@20", 0.0), 4),
-        "NDCG@20": round(test_m.get("NDCG@20", 0.0), 4),
+        "Recall@10": round(test_m["Recall@10"], 4),
+        "NDCG@10": round(test_m["NDCG@10"], 4),
+        "MRR@10": round(test_m["MRR@10"], 4),
+        "Recall@20": round(test_m["Recall@20"], 4),
+        "NDCG@20": round(test_m["NDCG@20"], 4),
         # Beyond-Accuracy Metrics
-        "Diversity@10": round(test_m.get("Diversity@10", 0.0), 4),
-        "Novelty@10": round(test_m.get("Novelty@10", 0.0), 4),
-        "Coverage@10": round(test_m.get("Coverage@10", 0.0), 4),
-        "Gini@10": round(test_m.get("Gini@10", 0.0), 4),
+        "Diversity@10": round(test_m["Diversity@10"], 4),
+        "Novelty@10": round(test_m["Novelty@10"], 4),
+        "Coverage@10": round(test_m["Coverage@10"], 4),
+        "Gini@10": round(test_m["Gini@10"], 4),
         # Representation Geometry
-        "Alignment": round(rep_m.get("alignment", 0.0), 4),
-        "Mean_Uniformity": round(rep_m.get("mean_uniformity", 0.0), 4),
-        "User_Effective_Rank": round(svd_m.get("user_effective_rank", 0.0), 2),
-        "Item_Effective_Rank": round(svd_m.get("item_effective_rank", 0.0), 2),
+        "Alignment": round(rep_m["alignment"], 4),
+        "Mean_Uniformity": round(rep_m["mean_uniformity"], 4),
+        "User_Effective_Rank": round(svd_m["user_effective_rank"], 2),
+        "Item_Effective_Rank": round(svd_m["item_effective_rank"], 2),
         # Subgroup
-        "Tail_Recall@10": round(tail_m.get("Recall@10", 0.0), 4),
-        "Tail_NDCG@10": round(tail_m.get("NDCG@10", 0.0), 4),
-        "Head_Recall@10": round(head_m.get("Recall@10", 0.0), 4),
-        "Head_NDCG@10": round(head_m.get("NDCG@10", 0.0), 4),
-        "Val_NDCG@10": round(val_m.get("NDCG@10", 0.0), 4),
+        "Tail_Recall@10": round(tail_m["Recall@10"], 4),
+        "Tail_NDCG@10": round(tail_m["NDCG@10"], 4),
+        "Head_Recall@10": round(head_m["Recall@10"], 4),
+        "Head_NDCG@10": round(head_m["NDCG@10"], 4),
+        "Val_NDCG@10": round(val_m["NDCG@10"], 4),
     }
 
     new_df = pd.DataFrame([row])
@@ -90,7 +100,7 @@ def append_to_model_results_csv(results: dict, model_name: str, sparsity: float,
         existing_df = pd.read_csv(model_csv)
         # Update row if exact same model, sparsity, seed exists, else append
         mask = (existing_df["sparsity"] == sparsity) & (existing_df["seed"] == seed)
-        mask &= existing_df.get("experiment_fingerprint", pd.Series("", index=existing_df.index)) == results.get("experiment_fingerprint")
+        mask &= existing_df.get("experiment_fingerprint", pd.Series("", index=existing_df.index)) == results["experiment_fingerprint"]
         if mask.any():
             existing_df = existing_df[~mask]
         combined_df = pd.concat([existing_df, new_df], ignore_index=True)
@@ -107,9 +117,16 @@ def main():
     parser.add_argument("--sparsity", type=float, default=1.0, help="Sparsity ratio for training edges (0.25 to 1.0)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--epochs", type=int, default=None, help="Override number of training epochs")
+    parser.add_argument("--validation_only", action="store_true", help="Tune using validation without reading test labels")
+    parser.add_argument("--dry_run", action="store_true", help="Print effective configuration without training")
     parser.add_argument("--resume", action="store_true", help="Resume training from latest saved checkpoint")
     parser.add_argument("--config_dir", type=str, default="configs", help="Config directory")
+    parser.add_argument("--output_root", default="results", help="Root for this run's results, history and checkpoints")
     args = parser.parse_args()
+    if args.epochs is not None and args.epochs < 1:
+        parser.error("epochs must be positive")
+    if not 0 < args.sparsity <= 1 or args.seed < 0:
+        parser.error("sparsity must be in (0, 1] and seed nonnegative")
 
     # 1. Set seed
     set_seed(args.seed)
@@ -120,11 +137,17 @@ def main():
     # 3. Load config
     config = load_config(args.model, args.config_dir)
     config["training"]["seed"] = args.seed
-    config["experiment_fingerprint"] = get_experiment_fingerprint(
-        args.model, args.config_dir
+    config["experiment_fingerprint"] = get_run_fingerprint(
+        args.model, args.sparsity, args.seed, config, args.config_dir
     )
     if args.epochs is not None:
         config["training"]["epochs"] = args.epochs
+    config["history_dir"] = get_model_output_dir("history", args.model, args.output_root)
+
+    config["validation_only"] = args.validation_only
+    if args.dry_run:
+        print(json.dumps({"model": args.model, "sparsity": args.sparsity, "config": config}, indent=2))
+        return
 
     # 4. Load dataset processed files
     processed_dir = config["dataset"]["processed_dir"]
@@ -138,7 +161,7 @@ def main():
 
     train_df = pd.read_parquet(train_path)
     val_df = pd.read_parquet(val_path)
-    test_df = pd.read_parquet(test_path)
+    test_df = None if args.validation_only else pd.read_parquet(test_path)
 
     with open(mappings_path, "rb") as f:
         mappings = pickle.load(f)
@@ -153,12 +176,13 @@ def main():
     # 6. Initialize warm-start evaluators. Models learn from sparse train data,
     # while all known positives remain excluded from recommendation candidates.
     top_k_list = config["evaluation"]["top_k"]
+    eval_batch_size = config["evaluation"]["eval_batch_size"]
     candidate_items = set(train_df_sparse["i_idx"].unique())
     val_warm = val_df[val_df["i_idx"].isin(candidate_items)].reset_index(drop=True)
-    test_warm = test_df[test_df["i_idx"].isin(candidate_items)].reset_index(drop=True)
+    test_warm = None if test_df is None else test_df[test_df["i_idx"].isin(candidate_items)].reset_index(drop=True)
     logger.info(
         f"Warm-start evaluation targets: val={len(val_warm):,}/{len(val_df):,}, "
-        f"test={len(test_warm):,}/{len(test_df):,}"
+        f"test={len(test_warm) if test_warm is not None else 'not read'}"
     )
 
     val_evaluator = Evaluator(
@@ -167,23 +191,27 @@ def main():
         num_users,
         num_items,
         k_list=top_k_list,
+        batch_size=eval_batch_size,
         candidate_items=candidate_items,
-        popularity_df=train_df_sparse,
+        popularity_df=train_df,
     )
-    test_history = pd.concat([train_df, val_df], ignore_index=True)
-    # Shared frozen content features for evaluation, including ID-only baselines.
-    diversity_features, diversity_mask = load_training_text(processed_dir, mappings)
-    test_evaluator = Evaluator(
-        test_history,
-        test_warm,
-        num_users,
-        num_items,
-        k_list=top_k_list,
-        candidate_items=candidate_items,
-        popularity_df=train_df_sparse,
-        diversity_features=diversity_features,
-        diversity_mask=diversity_mask,
-    )
+    test_evaluator = None
+    if not args.validation_only:
+        test_history = pd.concat([train_df, val_df], ignore_index=True)
+        # Shared frozen content features for evaluation, including ID-only baselines.
+        diversity_features, diversity_mask = load_training_text(processed_dir, mappings)
+        test_evaluator = Evaluator(
+            test_history,
+            test_warm,
+            num_users,
+            num_items,
+            k_list=top_k_list,
+            batch_size=eval_batch_size,
+            candidate_items=candidate_items,
+            popularity_df=train_df,
+            diversity_features=diversity_features,
+            diversity_mask=diversity_mask,
+        )
 
     # 7. Instantiate model
     emb_dim = config["model"]["embedding_dim"]
@@ -212,10 +240,14 @@ def main():
             num_layers=num_layers,
             gamma=dau_cfg["gamma"],
             t=dau_cfg["t"],
+            profile=dau_cfg.get("profile", "project_cosine"),
         )
     elif args.model == "adaptive_gcl":
         ada_cfg = config.get("adaptive_gcl", {})
-        text_features, item_text_mask = diversity_features, diversity_mask
+        if args.validation_only:
+            text_features, item_text_mask = load_training_text(processed_dir, mappings)
+        else:
+            text_features, item_text_mask = diversity_features, diversity_mask
         text_dim = text_features.shape[1]
         user_history_features, user_text_mask = build_user_history_features(
             train_df_sparse, text_features, num_users, item_text_mask
@@ -245,7 +277,7 @@ def main():
 
     # 8. Train model
     sparsity_tag = f"s{int(args.sparsity * 100)}"
-    checkpoint_dir = get_checkpoint_dir(args.model)
+    checkpoint_dir = get_checkpoint_dir(args.model, args.output_root)
     os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_path = os.path.join(checkpoint_dir, f"{args.model}_{sparsity_tag}_seed{args.seed}.pt")
 
@@ -257,7 +289,10 @@ def main():
         config,
         device,
         user_disliked_items=mappings.get("user_disliked_items", {}),
+        subgroup_reference_df=train_df,
     )
+    if os.path.exists(checkpoint_path) and not args.resume:
+        raise FileExistsError("Run already exists; choose a new --output_root or explicit --resume")
     results = trainer.train(checkpoint_path, resume=args.resume)
 
     # 9. Save run results to JSON
@@ -265,10 +300,30 @@ def main():
     results["seed"] = args.seed
     results["max_epochs"] = config["training"]["epochs"]
     results["experiment_fingerprint"] = config["experiment_fingerprint"]
+    results["experiment_family"] = get_run_fingerprint(
+        args.model, args.sparsity, None, config, args.config_dir
+    )
+    results["effective_config"] = config
+    results["scoring_metric"] = model.scoring_metric
+    results["encoder"] = "LightGCN"
+    results["profile"] = getattr(model, "profile", None)
     results["text_policy"] = "masked_text" if args.model == "adaptive_gcl" else None
-    results["evaluation_protocol"] = "shared_minilm_diversity_v2"
+    results["evaluation_protocol"] = EVALUATION_PROTOCOL
+    results["evaluation_metadata"] = {
+        "history_mask_policy": "full_train_for_val_full_train_plus_val_for_test",
+        "sparsity_scope": "model_training_graph_only",
+        "popularity_reference": "full_train_unique_users",
+        "subgroup_degree_reference": "full_train_fixed_across_sparsity",
+        "candidate_items": len(candidate_items),
+        "validation_targets": len(val_warm),
+        "validation_total_targets": len(val_df),
+        "test_targets": len(test_warm) if test_warm is not None else None,
+        "test_total_targets": len(test_df) if test_df is not None else None,
+        "uniformity_sample_seed": args.seed,
+        "latency_scope": "full_catalog_scoring_masking_topk_excludes_embedding_forward",
+    }
 
-    results_dir = get_model_output_dir("raw", args.model)
+    results_dir = get_model_output_dir("raw", args.model, args.output_root)
     os.makedirs(results_dir, exist_ok=True)
     run_file = os.path.join(results_dir, f"{args.model}_{sparsity_tag}_seed{args.seed}.json")
 
@@ -277,22 +332,27 @@ def main():
 
     logger.info(f"Saved run results to {run_file}")
 
-    # 10. Save / append to dedicated per-model CSV file (results/aggregated/{model}_results.csv)
-    append_to_model_results_csv(results, args.model, args.sparsity, args.seed)
+    if args.validation_only:
+        logger.info("Validation-only run complete; test labels were not read")
+        return
 
-    # 11. Update Global Best Model if this run achieved the highest test NDCG@10
+    # 10. Save / append to dedicated per-model CSV file (results/aggregated/{model}_results.csv)
+    append_to_model_results_csv(results, args.model, args.sparsity, args.seed, args.output_root)
+
+    # 11. Select global best using the configured validation monitor.
     global_best_meta_path = os.path.join(checkpoint_dir, f"{args.model}_best_meta.json")
     global_best_pt_path = os.path.join(checkpoint_dir, f"{args.model}_best.pt")
     
-    current_val_ndcg = results.get("val_metrics", {}).get("NDCG@10", 0.0)
-    current_test_ndcg = results.get("test_metrics", {}).get("NDCG@10", 0.0)
+    monitor = results["monitor"]
+    current_val_ndcg = results["val_metrics"][monitor]
+    current_test_ndcg = results["test_metrics"]["NDCG@10"]
     is_new_global_best = True
 
     if os.path.exists(global_best_meta_path):
         try:
             with open(global_best_meta_path, "r", encoding="utf-8") as f:
                 prev_best = json.load(f)
-            if prev_best.get("experiment_fingerprint") == config["experiment_fingerprint"] and prev_best.get("Val_NDCG@10", float("-inf")) >= current_val_ndcg:
+            if prev_best.get("experiment_family") == results["experiment_family"] and prev_best.get("monitor_value", float("-inf")) >= current_val_ndcg:
                 is_new_global_best = False
         except Exception:
             is_new_global_best = True
@@ -304,19 +364,22 @@ def main():
             json.dump({
                 "model": args.model,
                 "experiment_fingerprint": config["experiment_fingerprint"],
+                "experiment_family": results["experiment_family"],
                 "sparsity": args.sparsity,
                 "seed": args.seed,
-                "best_epoch": results.get("best_epoch", 0),
-                "Val_NDCG@10": current_val_ndcg,
+                "best_epoch": results["best_epoch"],
+                "monitor": monitor,
+                "monitor_value": current_val_ndcg,
+                "Val_NDCG@10": results["val_metrics"]["NDCG@10"],
                 "NDCG@10": current_test_ndcg,
-                "Recall@10": results.get("test_metrics", {}).get("Recall@10", 0.0),
-                "Diversity@10": results.get("test_metrics", {}).get("Diversity@10", 0.0),
-                "Novelty@10": results.get("test_metrics", {}).get("Novelty@10", 0.0),
+                "Recall@10": results["test_metrics"]["Recall@10"],
+                "Diversity@10": results["test_metrics"]["Diversity@10"],
+                "Novelty@10": results["test_metrics"]["Novelty@10"],
                 "source_checkpoint": checkpoint_path,
             }, f, indent=2)
         logger.info(
             f"🏆 Updated GLOBAL BEST MODEL for {args.model.upper()} -> "
-            f"{global_best_pt_path} (Val NDCG@10: {current_val_ndcg:.4f})"
+            f"{global_best_pt_path} (Val {monitor}: {current_val_ndcg:.4f})"
         )
 
 

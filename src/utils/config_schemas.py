@@ -4,9 +4,9 @@ This module provides optional validation using pydantic if available,
 otherwise falls back to basic Python validation.
 """
 
-from typing import Any, Dict, List, Optional, Union, Literal
 import logging
 import math
+from typing import Any, Dict, List, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +140,10 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Validated config dictionary (unchanged if pydantic not available)
     """
+    evaluation = config.get("evaluation", {})
+    monitor = evaluation.get("monitor", "NDCG@10")
+    if monitor not in {f"NDCG@{k}" for k in evaluation.get("top_k", [10, 20])}:
+        raise ValueError("evaluation.monitor must be NDCG at an evaluated cutoff")
     if not PYDANTIC_AVAILABLE:
         # Use basic validation
         validator = ConfigValidator()
@@ -202,6 +206,13 @@ def validate_model_config(config: Dict[str, Any], model_name: str) -> Dict[str, 
     Returns:
         Validated config dictionary
     """
+    if model_name == "directau":
+        directau = config.get("directau", {})
+        if directau.get("profile", "project_cosine") not in {"project_cosine", "reference_lgcn"}:
+            raise ValueError("Invalid DirectAU profile")
+        decay = directau.get("optimizer_weight_decay", 1e-6)
+        if isinstance(decay, bool) or not isinstance(decay, (int, float)) or not math.isfinite(decay) or decay < 0:
+            raise ValueError("Invalid DirectAU optimizer_weight_decay")
     if model_name == "adaptive_gcl" and "adaptive_gcl" in config:
         ada_cfg = config["adaptive_gcl"]
         for key, default in (("use_item_text", True), ("user_semantic_weight", 0.5), ("layer_aggregation", "learnable"), ("mlp_weight_decay", 0.0)):
@@ -223,7 +234,6 @@ def validate_model_config(config: Dict[str, Any], model_name: str) -> Dict[str, 
             except ValidationError as e:
                 raise ValueError(f"AdaptiveGCL config validation error: {e}") from e
         else:
-            validator = ConfigValidator()
             ada_cfg = config["adaptive_gcl"]
             if "ssl_temp" in ada_cfg:
                 ada_cfg["ssl_temp"] = max(0.001, min(2.0, ada_cfg["ssl_temp"]))

@@ -24,6 +24,7 @@ training:
   num_workers: 0
 
 evaluation:
+  monitor: "NDCG@20"
   top_k: [10, 20]
   eval_batch_size: 1024
 

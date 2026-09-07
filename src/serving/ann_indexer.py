@@ -1,6 +1,7 @@
 import logging
 import time
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 import torch
@@ -20,35 +21,36 @@ except ImportError:
 class VectorIndexer:
     """High-performance Vector Search Engine for sub-millisecond Top-K recommendation using Faiss / HNSW."""
 
-    def __init__(self, embedding_dim: int = 64, use_hnsw: bool = True, m: int = 32):
+    def __init__(self, embedding_dim: int = 64, use_hnsw: bool = True, m: int = 32,
+                 scoring_metric: str = "cosine"):
+        if scoring_metric not in {"cosine", "dot_product"}:
+            raise ValueError("scoring_metric must be cosine or dot_product")
+        self.scoring_metric = scoring_metric
         self.embedding_dim = embedding_dim
         self.use_hnsw = use_hnsw
         self.m = m
-        self.index = None
-        self.item_embeddings_np: Optional[np.ndarray] = None
-        self.item_embeddings_torch: Optional[torch.Tensor] = None
-        self.metadata: Dict[int, dict] = {}
+        self.index: Any = None
+        self.item_embeddings_np: np.ndarray | None = None
+        self.item_embeddings_torch: torch.Tensor | None = None
+        self.metadata: dict[int, dict] = {}
         self.num_items = 0
 
     def build_index(
         self,
         item_embeddings: torch.Tensor,
-        metadata: Optional[Dict[int, dict]] = None,
+        metadata: dict[int, dict] | None = None,
     ):
-        """Construct normalized Faiss index from PyTorch item embedding tensor."""
-        if isinstance(item_embeddings, torch.Tensor):
-            # Normalize to unit sphere for exact Cosine Similarity via Inner Product
-            norm_embs = F.normalize(item_embeddings.detach().cpu().float(), dim=-1)
-            self.item_embeddings_torch = norm_embs
-            self.item_embeddings_np = norm_embs.numpy().astype(np.float32)
-        else:
-            self.item_embeddings_np = np.ascontiguousarray(item_embeddings, dtype=np.float32)
-            faiss.normalize_L2(self.item_embeddings_np)
-            self.item_embeddings_torch = torch.from_numpy(self.item_embeddings_np)
-
-        self.num_items, self.embedding_dim = self.item_embeddings_np.shape
-        if metadata is not None:
-            self.metadata = metadata
+        """Build an inner-product index, normalizing only for cosine scoring."""
+        embeds = torch.as_tensor(item_embeddings).detach().cpu().float().clone()
+        if embeds.ndim != 2 or not torch.isfinite(embeds).all():
+            raise ValueError("Item embeddings must be a finite matrix")
+        if self.scoring_metric == "cosine":
+            embeds = F.normalize(embeds, dim=-1)
+        self.item_embeddings_torch = embeds.contiguous()
+        self.item_embeddings_np = self.item_embeddings_torch.numpy()
+        self.num_items, self.embedding_dim = embeds.shape
+        self.metadata = metadata or {}
+        self.index = None
 
         if FAISS_AVAILABLE:
             if self.use_hnsw:
@@ -71,9 +73,9 @@ class VectorIndexer:
         self,
         user_vector: torch.Tensor,
         k: int = 10,
-        excluded_items: Optional[Set[int]] = None,
-        filter_fn: Optional[Callable[[dict], bool]] = None,
-    ) -> List[Tuple[int, float]]:
+        excluded_items: set[int] | None = None,
+        filter_fn: Callable[[dict], bool] | None = None,
+    ) -> list[tuple[int, float]]:
         """Query top-K items for a user embedding vector with collision exclusion and metadata filtering.
 
         Args:
@@ -85,14 +87,31 @@ class VectorIndexer:
         Returns:
             List of (item_index, similarity_score) tuples.
         """
-        if excluded_items is None:
-            excluded_items = set()
+        if k < 0:
+            raise ValueError("k must be nonnegative")
+        if self.item_embeddings_torch is None:
+            raise RuntimeError("Build the index before querying")
+        if k == 0 or self.num_items == 0:
+            return []
+        excluded_items = excluded_items or set()
+        query = torch.as_tensor(user_vector).detach().cpu().float().reshape(1, -1)
+        if query.shape[1] != self.embedding_dim or not torch.isfinite(query).all():
+            raise ValueError("Query must be finite and match the embedding dimension")
+        if self.scoring_metric == "cosine":
+            query = F.normalize(query, dim=-1)
+        u_vec = query.contiguous().numpy()
 
-        if isinstance(user_vector, torch.Tensor):
-            u_vec = F.normalize(user_vector.detach().cpu().float().view(1, -1), dim=-1).numpy().astype(np.float32)
-        else:
-            u_vec = np.ascontiguousarray(user_vector, dtype=np.float32).reshape(1, -1)
-            faiss.normalize_L2(u_vec)
+        # Exact search within the filtered catalog avoids losing matches outside
+        # a fixed ANN candidate window, including empty metadata/filter matches.
+        if filter_fn is not None:
+            eligible = [i for i in range(self.num_items)
+                        if i not in excluded_items and filter_fn(self.metadata.get(i, {}))]
+            if not eligible:
+                return []
+            candidates = torch.tensor(eligible, dtype=torch.long)
+            scores = (query @ self.item_embeddings_torch[candidates].T)[0]
+            values, positions = scores.topk(min(k, len(eligible)))
+            return list(zip(candidates[positions].tolist(), values.tolist()))
 
         # Retrieve extra candidates to account for excluded items and metadata filtering
         search_k = min(self.num_items, max(k * 5, k + len(excluded_items) + 100))
@@ -114,11 +133,6 @@ class VectorIndexer:
             item_idx = int(item_idx)
             if item_idx < 0 or item_idx in excluded_items:
                 continue
-
-            if filter_fn is not None and self.metadata:
-                meta = self.metadata.get(item_idx, {})
-                if not filter_fn(meta):
-                    continue
 
             results.append((item_idx, float(score)))
             if len(results) >= k:

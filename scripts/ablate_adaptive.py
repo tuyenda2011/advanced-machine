@@ -36,6 +36,12 @@ VARIANTS = {
     "mean_layers": {"layer_aggregation": "mean"},
     "user_weight_025": {"user_semantic_weight": 0.25},
     "mlp_decay_1e4": {"mlp_weight_decay": 1e-4},
+    "no_dislikes": {"hard_neg_alpha": 0.0},
+    "no_dropout": {"node_dropout": 0.0},
+    "interaction_only": {"use_item_text": False, "user_semantic_weight": 0.0,
+                         "ssl_reg": 0.0, "layer_aggregation": "mean",
+                         "node_dropout": 0.0, "hard_neg_alpha": 0.0,
+                         "dirichlet_reg": 0.0, "tau_plus": 0.0},
 }
 
 
@@ -139,7 +145,8 @@ def run(args):
                 len(mappings["item2id"]),
                 k_list=[10, 20],
                 candidate_items=candidates,
-                popularity_df=sparse,
+                popularity_df=train,
+                batch_size=base["evaluation"]["eval_batch_size"],
             )
             for name, template in planned.items():
                 set_seed(seed)
@@ -179,6 +186,7 @@ def run(args):
                     config,
                     device,
                     user_disliked_items=mappings.get("user_disliked_items", {}),
+                    subgroup_reference_df=train,
                 )
                 print(
                     f"ABLATION {name} sparsity={ratio} seed={seed} -> {run_dir}",

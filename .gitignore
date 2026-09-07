@@ -27,7 +27,6 @@ wheels/
 .pytest_cache/
 .coverage
 htmlcov/
-tests/
 
 # Data & Artifacts (track manifest.json, ignore large data)
 data/raw/
@@ -58,5 +57,12 @@ results/
 .agents/
 
 # Documentation
-docs/
 docs/*.md
+docs/**/*.md
+
+# Local tests and test artifacts
+tests/
+test/
+
+# Local validation scratch
+.tmp/

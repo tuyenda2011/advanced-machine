@@ -4,7 +4,7 @@ Implements the Strategy Pattern to decouple Trainer from model-specific loss com
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, NamedTuple, Optional, Tuple
+from typing import Any, Dict, NamedTuple, Optional
 
 import torch
 import torch.nn as nn
@@ -12,6 +12,7 @@ import torch.nn as nn
 from src.losses.bpr import BPRLoss
 from src.losses.contrastive import InfoNCELoss
 from src.losses.directau import DirectAULoss
+from src.losses.hard_bpr import HardNegativeBPRLoss
 
 
 class LossOutput(NamedTuple):
@@ -211,7 +212,10 @@ class AdaptiveGCLStrategy(LossStrategy):
         ssl_temp: float = 0.2,
         ssl_reg: float = 0.1,
         dirichlet_reg: float = 0.0,
+        hard_neg_alpha: float = 0.2,
+        hard_neg_margin: float = 0.5,
     ):
+        self.hard_loss_fn = HardNegativeBPRLoss(hard_neg_alpha, hard_neg_margin)
         self.bpr_loss_fn = BPRLoss(weight_decay=weight_decay)
         self.weight_decay = weight_decay
         self.ssl_temp = ssl_temp
@@ -230,6 +234,8 @@ class AdaptiveGCLStrategy(LossStrategy):
         pos_batch: torch.Tensor,
         neg_batch: Optional[torch.Tensor],
         config: Dict[str, Any],
+        hard_batch: Optional[torch.Tensor] = None,
+        hard_mask: Optional[torch.Tensor] = None,
     ) -> LossOutput:
         if neg_batch is None:
             raise ValueError("AdaptiveGCLStrategy requires negative samples")
@@ -245,6 +251,11 @@ class AdaptiveGCLStrategy(LossStrategy):
         total_loss, bpr_loss = self.bpr_loss_fn(
             pos_scores, neg_scores, u_emb0, pos_emb0, neg_emb0
         )
+
+        if hard_batch is not None and hard_mask is not None and self.hard_loss_fn.alpha > 0:
+            total_loss = total_loss + self.hard_loss_fn.compute_hard_penalty(
+                u_embeds[u_batch[hard_mask]], i_embeds[pos_batch[hard_mask]], i_embeds[hard_batch]
+            )
 
         # Semantic SSL loss
         if hasattr(model, "compute_semantic_ssl_loss"):
@@ -298,7 +309,7 @@ def get_loss_strategy(model_name: str, config: Dict[str, Any]) -> LossStrategy:
         return DirectAUStrategy(
             gamma=dau_cfg.get("gamma", 1.0),
             t=dau_cfg.get("t", 2.0),
-            weight_decay=weight_decay,
+            weight_decay=0.0 if dau_cfg.get("profile") == "reference_lgcn" else weight_decay,
         )
 
     elif model_name == "adaptive_gcl":
@@ -308,6 +319,8 @@ def get_loss_strategy(model_name: str, config: Dict[str, Any]) -> LossStrategy:
             ssl_temp=ada_cfg.get("ssl_temp", 0.2),
             ssl_reg=ada_cfg.get("ssl_reg", 0.1),
             dirichlet_reg=ada_cfg.get("dirichlet_reg", 0.0),
+            hard_neg_alpha=ada_cfg.get("hard_neg_alpha", 0.2),
+            hard_neg_margin=ada_cfg.get("hard_neg_margin", 0.5),
         )
 
     else:

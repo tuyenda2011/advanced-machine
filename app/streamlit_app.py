@@ -22,14 +22,16 @@ from src.data.sparsity import create_sparse_train_set
 from src.data.text_encoder import build_user_history_features, load_training_text, DEFAULT_ENCODER, PINNED_REVISION, format_item_text
 from src.models.adaptive_gcl import AdaptiveGCL
 from src.evaluation.metrics import compute_intra_list_diversity
+from src.evaluation.evaluator import EVALUATION_PROTOCOL
 from src.models.directau import DirectAU
 from src.models.lightgcn import LightGCN
 from src.models.xsimgcl import XSimGCL
 from src.serving.ann_indexer import VectorIndexer
+from src.serving.recommendations import recommend_exact
 from src.utils.config import load_config
 from src.utils.checkpoints import (
     get_checkpoint_path,
-    get_experiment_fingerprint,
+    get_run_fingerprint,
 )
 
 
@@ -128,6 +130,7 @@ def load_trained_model(model_name: str, num_users: int, num_items: int, sparsity
         model = DirectAU(
             num_users, num_items, embedding_dim=emb_dim, num_layers=num_layers,
             gamma=dau_cfg.get("gamma", 1.0), t=dau_cfg.get("t", 2.0),
+            profile=dau_cfg.get("profile", "project_cosine"),
         )
     elif model_name == "adaptive_gcl":
         ada_cfg = config.get("adaptive_gcl", {})
@@ -161,7 +164,7 @@ def load_trained_model(model_name: str, num_users: int, num_items: int, sparsity
 
     if os.path.exists(checkpoint_path):
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        expected_fingerprint = get_experiment_fingerprint(model_name)
+        expected_fingerprint = get_run_fingerprint(model_name, sparsity, seed, config)
         stored_fingerprint = ckpt.get("config", {}).get("experiment_fingerprint")
         if stored_fingerprint != expected_fingerprint:
             raise RuntimeError(
@@ -318,32 +321,26 @@ def main():
                             return filter_fn
 
                         if use_ann and not has_filter:
-                            indexer = VectorIndexer(embedding_dim=i_embeds.shape[1], use_hnsw=True)
+                            indexer = VectorIndexer(embedding_dim=i_embeds.shape[1], use_hnsw=True,
+                                                    scoring_metric=model.scoring_metric)
                             indexer.build_index(i_embeds, metadata=item_metadata)
                             ann_results = indexer.query_topk(u_vec, k=10, excluded_items=seen_items)
                             latency_ms = (time.perf_counter() - start_t) * 1000.0
                             topk_ids = [r[0] for r in ann_results]
                             topk_scores = [r[1] for r in ann_results]
                         else:
-                            scores = torch.matmul(u_vec, i_embeds.T).squeeze(0)
-                            if seen_items:
-                                scores[torch.tensor(list(seen_items), device=device)] = -1e9
-
-                            if has_filter:
-                                filter_fn = make_filter_fn(selected_brand, selected_cat)
-                                valid_indices = [
-                                    idx for idx in range(num_items)
-                                    if filter_fn(item_metadata.get(idx, {}))
-                                ]
-                                if valid_indices:
-                                    mask = torch.ones(num_items, dtype=torch.bool, device=device)
-                                    mask[torch.tensor(valid_indices, device=device)] = False
-                                    scores[mask] = -1e9
-
-                            topk_scores, topk_indices = torch.topk(scores, k=10)
+                            results = recommend_exact(
+                                model, u_idx, u_embeds, i_embeds, k=10,
+                                excluded_items=seen_items, metadata=item_metadata,
+                                filter_fn=make_filter_fn(selected_brand, selected_cat) if has_filter else None,
+                            )
                             latency_ms = (time.perf_counter() - start_t) * 1000.0
-                            topk_ids = topk_indices.cpu().numpy()
-                            topk_scores = topk_scores.cpu().numpy()
+                            topk_ids = [item for item, _ in results]
+                            topk_scores = [score for _, score in results]
+
+                        if not topk_ids:
+                            st.info("No products match the selected filters and viewing history.")
+                            continue
 
                         # Metrics
                         ild_score = compute_intra_list_diversity(
@@ -391,8 +388,8 @@ def main():
 
         if os.path.exists(agg_csv):
             df_res = pd.read_csv(agg_csv)
-            if "evaluation_protocol" not in df_res or not df_res["evaluation_protocol"].eq("shared_minilm_diversity_v2").all():
-                st.warning("Historical results: Diversity used model-specific embeddings. Single-run ±0 / p=1 are not valid uncertainty estimates. Regenerate results with the current evaluation protocol before comparing Diversity.")
+            if "evaluation_protocol" not in df_res or not df_res["evaluation_protocol"].eq(EVALUATION_PROTOCOL).all():
+                st.warning("Kết quả dùng giao thức đánh giá cũ hoặc không đồng nhất. Hãy tạo lại benchmark trước khi so sánh metric.")
             st.dataframe(df_res, use_container_width=True)
 
             st.subheader("Statistical Significance Tests")
@@ -400,7 +397,7 @@ def main():
             if os.path.exists(sig_csv):
                 df_sig = pd.read_csv(sig_csv)
                 st.dataframe(df_sig, use_container_width=True)
-                st.caption("Levels: *** p<0.001, ** p<0.01, * p<0.05, ns: not significant; N/A: insufficient samples or undefined test.")
+                st.caption("Xem Holm-adjusted p-value; kết quả dưới 5 seed chỉ mang tính thăm dò.")
 
             st.subheader("LaTeX Export")
             tex_file = os.path.join("results", "aggregated", "benchmark_table.tex")

@@ -130,7 +130,8 @@ def compute_novelty(
     """Compute Recommendation Novelty / Serendipity based on Self-Information.
 
     Novelty@K = (1 / (|U| * K)) * sum_{u} sum_{i in R_u} -log2( P(i) )
-    where P(i) = (count(i) + 1) / num_total_users
+    where P(i) is the fraction of reference users who interacted with item i.
+    An unseen item receives a conservative pseudo-count of one.
 
     Args:
         topk_predictions: Tensor (num_eval_users, max_k) of recommended item IDs
@@ -141,6 +142,9 @@ def compute_novelty(
     Returns:
         float: Mean novelty score in bits (higher indicates more novel / tail items)
     """
+    if num_total_users <= 0:
+        raise ValueError("num_total_users must be positive")
+
     preds_k = topk_predictions[:, :k].cpu().numpy()
     num_users = preds_k.shape[0]
     if num_users == 0:
@@ -149,10 +153,12 @@ def compute_novelty(
     user_novelties = []
     for u in range(num_users):
         u_preds = preds_k[u]
-        self_info = [
-            -np.log2((item_popularity_dict.get(int(item), 0) + 1) / float(num_total_users))
-            for item in u_preds
-        ]
+        self_info = []
+        for item in u_preds:
+            count = max(1, int(item_popularity_dict.get(int(item), 0)))
+            if count > num_total_users:
+                raise ValueError("Item popularity cannot exceed the reference user count")
+            self_info.append(-np.log2(count / float(num_total_users)))
         user_novelties.append(np.mean(self_info))
 
     return float(np.mean(user_novelties))
@@ -162,6 +168,7 @@ def compute_coverage_and_gini(
     topk_predictions: torch.Tensor,
     num_total_items: int,
     k: int = 10,
+    catalog_items: Optional[Set[int]] = None,
 ) -> Tuple[float, float]:
     """Compute Catalog Coverage and Gini Index of recommendation distribution.
 
@@ -174,15 +181,28 @@ def compute_coverage_and_gini(
     preds_k = topk_predictions[:, :k].cpu().numpy().flatten()
     unique_items, counts = np.unique(preds_k, return_counts=True)
 
-    # Coverage
-    coverage = float(len(unique_items) / float(num_total_items)) if num_total_items > 0 else 0.0
+    if catalog_items is not None:
+        catalog = sorted(set(catalog_items))
+        if not set(unique_items).issubset(catalog_items):
+            raise ValueError("Recommendations contain items outside the eligible catalog")
+        count_by_item = dict(zip(unique_items.tolist(), counts.tolist()))
+        full_counts = np.array(
+            [count_by_item.get(item, 0) for item in catalog], dtype=np.float64
+        )
+        n = len(catalog)
+    else:
+        if np.any(unique_items < 0) or np.any(unique_items >= num_total_items):
+            raise ValueError("Recommendation item index is outside the catalog")
+        full_counts = np.zeros(num_total_items, dtype=np.float64)
+        full_counts[unique_items] = counts
+        n = num_total_items
 
-    # Gini Coefficient across entire catalog
-    full_counts = np.zeros(num_total_items, dtype=np.float64)
-    full_counts[unique_items] = counts
+    # Coverage
+    coverage = float(len(unique_items) / float(n)) if n > 0 else 0.0
+
+    # Gini Coefficient across the same eligible catalog as coverage.
     sorted_counts = np.sort(full_counts)
 
-    n = num_total_items
     index = np.arange(1, n + 1)
     sum_counts = np.sum(sorted_counts)
     if sum_counts == 0:

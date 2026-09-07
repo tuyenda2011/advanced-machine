@@ -90,6 +90,7 @@ def generate_latex_table(
     summary_df: pd.DataFrame,
     caption: str = "Performance comparison of LightGCN, XSimGCL, DirectAU, and AdaptiveGCL across data sparsity levels.",
     label: str = "tab:benchmark_results",
+    ranking_k: int = 10,
 ) -> str:
     """Generate publication-ready LaTeX table formatted according to ACM/IEEE guidelines.
 
@@ -104,7 +105,9 @@ def generate_latex_table(
     lines.append("  \\begin{tabular}{llcccccc}")
     lines.append("    \\toprule")
     lines.append(
-        "    \\textbf{Sparsity} & \\textbf{Model} & \\textbf{Recall@10} & \\textbf{NDCG@10} & \\textbf{MRR@10} & \\textbf{Diversity@10} & \\textbf{Novelty@10} & \\textbf{Coverage@10} \\\\"
+        "    \\textbf{Sparsity} & \\textbf{Model} & "
+        + f"\\textbf{{Recall@{ranking_k}}} & \\textbf{{NDCG@{ranking_k}}} & "
+        + "\\textbf{MRR@10} & \\textbf{Diversity@10} & \\textbf{Novelty@10} & \\textbf{Coverage@10} \\\\"
     )
     lines.append("    \\midrule")
 
@@ -124,8 +127,8 @@ def generate_latex_table(
 
         # Find max for each metric to format in bold
         metrics = [
-            "Recall@10",
-            "NDCG@10",
+            f"Recall@{ranking_k}",
+            f"NDCG@{ranking_k}",
             "MRR@10",
             "Diversity@10",
             "Novelty@10",
@@ -147,6 +150,9 @@ def generate_latex_table(
                 if m in row and pd.notna(row[m]):
                     val = row[m]
                     val_str = f"{val:.4f}"
+                    std_col = f"{m}_std"
+                    if std_col in row and pd.notna(row[std_col]):
+                        val_str += f" $\\pm$ {row[std_col]:.4f}"
                     if abs(val - max_vals.get(m, -999)) < 1e-6:
                         val_str = f"\\textbf{{{val_str}}}"
                     row_entries.append(val_str)
@@ -162,7 +168,7 @@ def generate_latex_table(
     lines.append("  \\end{tabular}")
     lines.append("  \\vspace{1ex}")
     lines.append(
-        "  {\\footnotesize \\textit{Note:} Bold denotes the largest observed mean, not statistical significance. Single-run standard deviations and unavailable tests are N/A; see the separate paired-test report.}"
+        "  {\\footnotesize \\textit{Note:} Values are mean $\\pm$ sample standard deviation when multiple runs are available. Bold denotes the largest observed mean, not statistical significance. Single-run standard deviations and unavailable tests are N/A; see the separate paired-test report.}"
     )
     lines.append("\\end{table*}")
 

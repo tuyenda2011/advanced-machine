@@ -7,6 +7,8 @@ import torch.nn as nn
 class BaseRecommender(nn.Module, ABC):
     """Abstract base class for Graph Collaborative Filtering Models."""
 
+    scoring_metric = "dot_product"
+
     def __init__(self, num_users: int, num_items: int, embedding_dim: int, num_layers: int):
         super().__init__()
         self.num_users = num_users

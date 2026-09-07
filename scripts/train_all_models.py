@@ -1,10 +1,10 @@
 import argparse
-from datetime import datetime
 import json
 import os
 import subprocess
 import sys
 import time
+from datetime import datetime
 
 # Ensure project root is in sys.path when script is executed directly
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -18,6 +18,12 @@ if hasattr(sys.stderr, "reconfigure"):
 import pandas as pd
 from tabulate import tabulate
 
+from scripts.benchmark_all import validate_run_result
+from src.utils.checkpoints import (
+    get_model_output_dir,
+    get_run_fingerprint,
+    write_run_status,
+)
 from src.utils.logging import setup_logger
 
 logger = setup_logger("train_all_models")
@@ -68,9 +74,21 @@ def main():
         action="store_true",
         help="Skip automatic research figure generation after completion",
     )
+    parser.add_argument("--dry_run", action="store_true", help="List planned runs without training")
+    parser.add_argument("--output_root", default="results")
+    parser.add_argument("--config_dir", default="configs")
     args = parser.parse_args()
+    if len(set(args.models)) != len(args.models):
+        parser.error("Duplicate models are not allowed")
 
     sparsity_list = [1.0, 0.75, 0.50, 0.25] if args.all_sparsity else args.sparsity
+    if args.epochs < 1 or args.seed < 0 or any(not 0 < ratio <= 1 for ratio in sparsity_list):
+        parser.error("Invalid epochs, seed or sparsity")
+    if len(set(sparsity_list)) != len(sparsity_list):
+        parser.error("Duplicate sparsities are not allowed")
+    if args.dry_run:
+        print(json.dumps({"models": args.models, "sparsities": sparsity_list, "seed": args.seed, "epochs": args.epochs, "runs": len(args.models)*len(sparsity_list)}, indent=2))
+        return
     start_total_time = time.perf_counter()
 
     print("=" * 85)
@@ -81,12 +99,13 @@ def main():
     print(f"⏱️ Epochs per Model: {args.epochs}")
     print("=" * 85, flush=True)
 
-    results_dir = os.path.join("results", "raw")
+    results_dir = os.path.join(args.output_root, "raw")
     os.makedirs(results_dir, exist_ok=True)
 
     completed_runs = []
     experiments = [(sp, m) for sp in sparsity_list for m in args.models]
     total_runs = len(experiments)
+    write_run_status(args.output_root, total_runs, 0, 0)
 
     for idx, (sp, model_name) in enumerate(experiments, 1):
         sparsity_pct = int(sp * 100)
@@ -108,6 +127,7 @@ def main():
             "--epochs",
             str(args.epochs),
         ]
+        cmd.extend(["--output_root", args.output_root, "--config_dir", args.config_dir])
         if args.resume:
             cmd.append("--resume")
 
@@ -115,15 +135,16 @@ def main():
         env["PYTHONPATH"] = "."
 
         run_start = time.perf_counter()
-        res = subprocess.run(cmd, env=env)
+        res = subprocess.run(cmd, env=env, check=False)
         run_duration = time.perf_counter() - run_start
 
+        write_run_status(args.output_root, total_runs, len(completed_runs), idx)
         if res.returncode != 0:
             logger.error(f"❌ Training failed for {model_name.upper()} ({sparsity_pct}%) with exit code {res.returncode}")
             continue
 
         # Load run result JSON
-        run_file = os.path.join(results_dir, model_name, f"{model_name}_{sparsity_tag}_seed{args.seed}.json")
+        run_file = os.path.join(get_model_output_dir("raw", model_name, args.output_root), f"{model_name}_{sparsity_tag}_seed{args.seed}.json")
         if not os.path.exists(run_file):
             run_file = os.path.join(results_dir, f"{model_name}_{sparsity_tag}_seed{args.seed}.json")
 
@@ -131,11 +152,25 @@ def main():
             try:
                 with open(run_file, "r", encoding="utf-8") as f:
                     run_data = json.load(f)
+                run_errors = validate_run_result(
+                    run_data,
+                    model_name,
+                    sp,
+                    args.seed,
+                    args.epochs,
+                    get_run_fingerprint(model_name, sp, args.seed, config_dir=args.config_dir),
+                )
+                if run_errors:
+                    raise ValueError("; ".join(run_errors))
                 run_data["run_duration_sec"] = run_duration
                 completed_runs.append(run_data)
+                write_run_status(args.output_root, total_runs, len(completed_runs), idx)
                 print(f"✨ Finished {model_name.upper()} ({sparsity_pct}%) in {run_duration:.1f}s", flush=True)
-            except Exception as e:
+            except (OSError, json.JSONDecodeError, ValueError) as e:
                 logger.error(f"Could not parse run JSON for {model_name}: {e}")
+
+    if len(completed_runs) != total_runs:
+        raise RuntimeError(f"Runs incomplete: {len(completed_runs)}/{total_runs} succeeded; {total_runs-len(completed_runs)} failed")
 
     total_elapsed = time.perf_counter() - start_total_time
 
@@ -147,34 +182,35 @@ def main():
 
         summary_rows = []
         for r in completed_runs:
-            m_name = r.get("model_name", "").upper()
-            sp_val = r.get("sparsity_level", 1.0)
-            test_m = r.get("test_metrics", {})
-            rep_m = r.get("representation_metrics", {})
-            svd_m = r.get("svd_metrics", {})
-            sub_m = r.get("subgroup_metrics", {})
-            tail_m = sub_m.get("Tail (Low-Activity)", {})
+            m_name = r["model_name"].upper()
+            sp_val = r["sparsity_level"]
+            test_m = r["test_metrics"]
+            rep_m = r["representation_metrics"]
+            svd_m = r["svd_metrics"]
+            tail_m = r["subgroup_metrics"]["Tail (Low-Activity)"]
 
             summary_rows.append({
                 "Model": m_name,
                 "Sparsity": f"{int(sp_val*100)}%",
-                "Recall@10": f"{test_m.get('Recall@10', 0):.4f}",
-                "NDCG@10": f"{test_m.get('NDCG@10', 0):.4f}",
-                "MRR@10": f"{test_m.get('MRR@10', 0):.4f}",
-                "Diversity@10": f"{test_m.get('Diversity@10', 0):.4f}",
-                "Novelty@10": f"{test_m.get('Novelty@10', 0):.4f}",
-                "Alignment": f"{rep_m.get('alignment', 0):.4f}",
-                "Uniformity": f"{rep_m.get('mean_uniformity', 0):.4f}",
-                "Tail Rec@10": f"{tail_m.get('Recall@10', 0):.4f}",
-                "Eff. Rank": f"{svd_m.get('user_effective_rank', 0):.2f}",
-                "Latency (ms)": f"{r.get('inference_latency_ms_per_user', 0):.2f}",
+                "Recall@20": f"{test_m['Recall@20']:.4f}",
+                "NDCG@20": f"{test_m['NDCG@20']:.4f}",
+                "Recall@10": f"{test_m['Recall@10']:.4f}",
+                "NDCG@10": f"{test_m['NDCG@10']:.4f}",
+                "MRR@10": f"{test_m['MRR@10']:.4f}",
+                "Diversity@10": f"{test_m['Diversity@10']:.4f}",
+                "Novelty@10": f"{test_m['Novelty@10']:.4f}",
+                "Alignment": f"{rep_m['alignment']:.4f}",
+                "Uniformity": f"{rep_m['mean_uniformity']:.4f}",
+                "Tail Rec@10": f"{tail_m['Recall@10']:.4f}",
+                "Eff. Rank": f"{svd_m['user_effective_rank']:.2f}",
+                "Latency (ms)": f"{r['inference_latency_ms_per_user']:.2f}",
             })
 
         summary_df = pd.DataFrame(summary_rows)
         print(tabulate(summary_df, headers="keys", tablefmt="fancy_grid", showindex=False))
 
         # Save comparative CSV
-        agg_dir = os.path.join("results", "aggregated")
+        agg_dir = os.path.join(args.output_root, "aggregated")
         os.makedirs(agg_dir, exist_ok=True)
         comparison_filename = (
             f"models_all_sparsity_seed{args.seed}.csv"
@@ -186,7 +222,7 @@ def main():
         print(f"\n📁 Saved comparative table to: {all_models_csv}")
 
     # Generate research figures unless disabled
-    if not args.no_plots:
+    if not args.no_plots and args.output_root == "results":
         print("\n📊 Generating research comparison figures & learning curves...", flush=True)
         try:
             from scripts.generate_plots import main as generate_figures

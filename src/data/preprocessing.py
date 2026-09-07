@@ -100,6 +100,7 @@ def summarize_metadata_quality(item_metadata: dict) -> dict:
         "complete_metadata": complete,
         "partial_metadata": count - complete - unusable,
         "no_usable_text": unusable,
+        "category_only_text": sum(f["has_specific_category"] and not f["has_title"] and not f["has_brand"] for f in flags),
     }
 
 

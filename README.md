@@ -26,6 +26,10 @@
 
 ## 🚀 Quick Start
 
+Pipeline update (07/09/2026): new runs select checkpoints by **validation NDCG@20** and use protocol `profile_monitor_scoring_v5`. DirectAU defaults to `reference_lgcn` (LightGCN encoder, raw-dot full-sort, normalized alignment/uniformity loss); the earlier cosine implementation is a separate `project_cosine` profile. Old runs are not comparable or resumable under the new identity.
+
+Start with the [implementation status and user-run commands](docs/improvement-implementation.md): validation-only pilots, MostPopular, resume, ablations and a 12-run final benchmark preview. Numerical regression checks are evidence about implementation, not improved recommendation quality or reproduction of paper scores. Real-data experiments remain pending.
+
 ```bash
 # Clone repository
 git clone https://github.com/.../advanced-machine.git
@@ -366,6 +370,23 @@ streamlit run app/streamlit_app.py
   booktitle={ICML},
   pages={9929--9939},
   year={2020}
+}
+
+@article{yu2022xsimgcl,
+  title={XSimGCL: Towards Extremely Simple Graph Contrastive Learning for Recommendation},
+  author={Yu, Junliang and Xia, Xin and Chen, Tong and Cui, Lizhen and Hung, Nguyen Quoc Viet and Yin, Hongzhi},
+  journal={arXiv preprint arXiv:2209.02544},
+  year={2022},
+  url={https://arxiv.org/abs/2209.02544}
+}
+
+@inproceedings{wang2022directau,
+  title={Towards Representation Alignment and Uniformity in Collaborative Filtering},
+  author={Wang, Chenyang and Yu, Yuanqing and Ma, Weizhi and Zhang, Min and Chen, Chong and Liu, Yiqun and Ma, Shaoping},
+  booktitle={KDD},
+  year={2022},
+  doi={10.1145/3534678.3539253},
+  url={https://arxiv.org/abs/2206.12811}
 }
 ```
 
