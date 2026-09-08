@@ -27,6 +27,8 @@ evaluation:
   monitor: "NDCG@20"
   top_k: [10, 20]
   eval_batch_size: 1024
+  model_diagnostics: false
+  diagnostics_sample_size: 4096
 
 sparsity:
   levels: [1.0, 0.75, 0.50, 0.25]

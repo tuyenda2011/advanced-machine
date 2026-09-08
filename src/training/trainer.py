@@ -57,6 +57,15 @@ GRADIENT_CLIP_VALUE: float = 1.0  # Gradient clipping max norm
 DEFAULT_TERMINAL_WIDTH: int = 80  # Default terminal width for progress display
 SYNC_CUDA: bool = False  # Whether to synchronize CUDA after each epoch (for accurate timing)
 
+LOSS_COMPONENT_KEYS = (
+    "bpr_raw", "id_l2_raw", "id_l2_weighted",
+    "ssl_raw", "ssl_weight", "ssl_weighted",
+    "hard_penalty_raw", "hard_margin_raw", "hard_penalty_weighted",
+    "dirichlet_raw", "dirichlet_weighted",
+    "alignment_raw", "alignment_weighted",
+    "uniformity_raw", "uniformity_weight", "uniformity_weighted",
+)
+
 
 def sample_negative_items(
     users: np.ndarray,
@@ -187,6 +196,20 @@ class Trainer:
         self.batch_size = train_cfg["batch_size"]
         self.lr = train_cfg["learning_rate"]
         self.weight_decay = train_cfg["weight_decay"]
+        eval_cfg = config.get("evaluation", {})
+        self.diagnostics_enabled = bool(
+            eval_cfg.get("model_diagnostics", False)
+            and hasattr(self.model, "collect_diagnostics")
+        )
+        diagnostics_sample_size = max(1, int(eval_cfg.get("diagnostics_sample_size", 4096)))
+        self.diagnostic_item_indices = torch.linspace(
+            0, max(0, self.num_items - 1), steps=min(self.num_items, diagnostics_sample_size),
+            device=device, dtype=torch.long,
+        ).unique()
+        self.diagnostic_user_indices = torch.linspace(
+            0, max(0, self.num_users - 1), steps=min(self.num_users, diagnostics_sample_size),
+            device=device, dtype=torch.long,
+        ).unique()
 
         parameters = self.model.parameters()
         if self.model_name == "adaptive_gcl" and hasattr(self.model, "optimizer_param_groups"):
@@ -197,6 +220,7 @@ class Trainer:
             raise ValueError("DirectAU model and config profiles differ")
         reference_directau = self.model_name == "directau" and getattr(model, "profile", "project_cosine") == "reference_lgcn"
         optimizer_decay = config.get("directau", {}).get("optimizer_weight_decay", 1e-6) if reference_directau else 0.0
+        self.optimizer_weight_decay = float(optimizer_decay)
         self.optimizer = optim.Adam(parameters, lr=self.lr, weight_decay=optimizer_decay)
 
         self.loss_strategy = get_loss_strategy(self.model_name, config)
@@ -300,7 +324,7 @@ class Trainer:
                     training_state.get("best_val_metrics", ckpt.get("val_metrics", {}))
                 )
                 print(
-                    f"🔄 [RESUME CHECKPOINT] Đã khôi phục trọng số! Tiếp tục train từ Epoch {start_epoch:02d}/{self.epochs:02d} (Val {self.monitor} đỉnh hiện tại: {best_sc:.4f})\n",
+                    f"[RESUME CHECKPOINT] Da khoi phuc trong so. Tiep tuc train tu Epoch {start_epoch:02d}/{self.epochs:02d} (Val {self.monitor} dinh hien tai: {best_sc:.4f})\n",
                     flush=True,
                 )
             except Exception as ex:
@@ -320,6 +344,9 @@ class Trainer:
         history_csv_path = os.path.join(history_dir, history_csv_name)
 
         history_records = list(committed_state.get("history", []))
+        initial_diagnostics: Dict[str, float] = dict(
+            committed_state.get("diagnostics_epoch0", {})
+        )
         previous_train_time = float(committed_state.get("total_train_time", 0.0))
         previous_validation_time = float(committed_state.get("validation_time", 0.0))
         cumulative_train_time = previous_train_time
@@ -343,6 +370,27 @@ class Trainer:
             restore_training_rng(resumed_checkpoint, self.scaler)
         elif resume:
             raise FileNotFoundError(f"Resume checkpoint missing: {latest_checkpoint_path}")
+
+        # Optional epoch-0 snapshot.  It is kept outside ``history`` so epoch
+        # numbering and early-stopping semantics remain unchanged.
+        if self.diagnostics_enabled and start_epoch == 1:
+            was_training = self.model.training
+            self.model.eval()
+            with torch.no_grad():
+                initial_user, initial_item = self.model(self.norm_adj)
+                initial_diagnostics = self.model.collect_diagnostics(
+                    self.diagnostic_item_indices, self.diagnostic_user_indices
+                )
+                initial_diagnostics["sample_user_effective_rank"] = float(
+                    compute_svd_spectrum(initial_user[self.diagnostic_user_indices])["effective_rank"]
+                )
+                initial_diagnostics["sample_item_effective_rank"] = float(
+                    compute_svd_spectrum(initial_item[self.diagnostic_item_indices])["effective_rank"]
+                )
+                initial_diagnostics["sample_user_count"] = float(self.diagnostic_user_indices.numel())
+                initial_diagnostics["sample_item_count"] = float(self.diagnostic_item_indices.numel())
+            if was_training:
+                self.model.train()
 
         for epoch in range(start_epoch, self.epochs + 1):
             if self.early_stopping.early_stop:
@@ -382,6 +430,8 @@ class Trainer:
             cl_loss_accum = 0.0
             num_batches = 0
             semantic_pairs = 0
+            hard_pair_count = 0
+            loss_component_accum = {key: 0.0 for key in LOSS_COMPONENT_KEYS}
             if self.device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(self.device)
 
@@ -405,6 +455,7 @@ class Trainer:
                         semantic_pairs += int(self.model.item_text_mask[torch.unique(pos_batch)].sum().item())
                     if hard_item_array is not None and hard_item_available is not None:
                         available = hard_item_available[batch_idx]
+                        hard_pair_count += int(np.count_nonzero(available))
                         if available.any():
                             auxiliary = {
                                 "hard_mask": torch.tensor(available, dtype=torch.bool, device=self.device),
@@ -417,6 +468,11 @@ class Trainer:
                 total_loss = losses.total_loss
                 bpr_loss_accum += losses.bpr_loss
                 cl_loss_accum += losses.cl_loss
+                for key, value in losses.extra_losses.items():
+                    if key in loss_component_accum:
+                        loss_component_accum[key] += float(
+                            value.detach().item() if isinstance(value, torch.Tensor) else value
+                        )
 
                 self._backward_and_step(total_loss)
                 gradient_norms.append(self.last_gradient_norm)
@@ -445,6 +501,26 @@ class Trainer:
                 val_metrics, _ = self.val_evaluator.evaluate(
                     val_u_embeds, val_i_embeds, self.device, include_beyond_accuracy=False
                 )
+                diagnostics = (
+                    self.model.collect_diagnostics(
+                        self.diagnostic_item_indices, self.diagnostic_user_indices
+                    )
+                    if self.diagnostics_enabled
+                    else {}
+                )
+                if self.diagnostics_enabled:
+                    sampled_user_svd = compute_svd_spectrum(
+                        val_u_embeds[self.diagnostic_user_indices]
+                    )
+                    sampled_item_svd = compute_svd_spectrum(
+                        val_i_embeds[self.diagnostic_item_indices]
+                    )
+                    diagnostics.update({
+                        "sample_user_effective_rank": float(sampled_user_svd["effective_rank"]),
+                        "sample_item_effective_rank": float(sampled_item_svd["effective_rank"]),
+                        "sample_user_count": float(self.diagnostic_user_indices.numel()),
+                        "sample_item_count": float(self.diagnostic_item_indices.numel()),
+                    })
 
             validation_time += time.perf_counter() - validation_start
             val_ndcg10 = val_metrics["NDCG@10"]
@@ -466,7 +542,7 @@ class Trainer:
                 best_model_state = {key: value.detach().cpu().clone()
                                     for key, value in self.model.state_dict().items()}
 
-            best_tag = " 🌟 [BEST]" if is_improved else ""
+            best_tag = " [BEST]" if is_improved else ""
 
             # Overwrite line atomically without excessive spaces to prevent terminal wrapping
             epoch_summary = f"Epoch {epoch:02d}/{self.epochs:02d} [{epoch_time:4.1f}s] | Loss: {avg_loss:.4f} | Val Recall@10: {val_rec10:.4f} | Val NDCG@10: {val_ndcg10:.4f} | Monitor {self.monitor}: {val_metrics[self.monitor]:.4f}{best_tag}"
@@ -474,7 +550,7 @@ class Trainer:
             sys.stdout.flush()
 
             # Record epoch training history
-            history_records.append({
+            history_record = {
                 "epoch": epoch,
                 "train_loss": round(total_loss_accum / max(1, num_batches), 4),
                 "bpr_loss": round(bpr_loss_accum / max(1, num_batches), 4),
@@ -492,9 +568,17 @@ class Trainer:
                 "mean_gradient_norm": float(np.mean(gradient_norms)),
                 "gradient_clip_fraction": float(np.mean(np.asarray(gradient_norms) > GRADIENT_CLIP_VALUE)),
                 "mean_valid_semantic_pairs": semantic_pairs / max(1, num_batches) if self.model_name == "adaptive_gcl" else None,
+                "hard_pair_count": hard_pair_count if self.model_name == "adaptive_gcl" else None,
+                "hard_pair_fraction": hard_pair_count / max(1, len(user_array)) if self.model_name == "adaptive_gcl" else None,
                 "cuda_peak_allocated_mb": torch.cuda.max_memory_allocated(self.device) / (1024 ** 2) if self.device.type == "cuda" else None,
                 "is_best": bool(is_improved),
-            })
+            }
+            for key in LOSS_COMPONENT_KEYS:
+                # Keep component values at full precision; only the legacy
+                # display aliases above are rounded for backwards compatibility.
+                history_record[f"loss_{key}"] = loss_component_accum[key] / max(1, num_batches)
+            history_record.update({f"diagnostic_{key}": value for key, value in diagnostics.items()})
+            history_records.append(history_record)
 
             # Save epoch history CSV
             history_dir = self.config.get("history_dir") or get_model_output_dir("history", self.model_name)
@@ -519,6 +603,7 @@ class Trainer:
                     "total_train_time": cumulative_train_time,
                     "best_model_state": best_model_state,
                     "validation_time": previous_validation_time + validation_time,
+                    "diagnostics_epoch0": initial_diagnostics,
                 },
                 scaler=self.scaler,
             )
@@ -543,12 +628,27 @@ class Trainer:
         logger.info(f"Loaded best checkpoint for final evaluation: {checkpoint_path}")
 
         self.model.eval()
+        last_loss_components = {
+            key: history_records[-1].get(f"loss_{key}")
+            for key in LOSS_COMPONENT_KEYS
+        } if history_records else {}
+        last_diagnostics = {
+            key.removeprefix("diagnostic_"): value
+            for key, value in (history_records[-1].items() if history_records else [])
+            if key.startswith("diagnostic_")
+        }
         if self.config.get("validation_only", False):
             return {"model_name": self.model_name, "best_epoch": best_epoch,
                     "total_epochs": len(history_records), "total_train_time": total_train_time,
                     "avg_epoch_time": avg_epoch_time, "val_metrics": best_val_metrics,
                     "validation_only": True, "history": history_records,
-                    "monitor": self.monitor, **timing}
+                    "monitor": self.monitor, "loss_schema_version": 2,
+                    "loss_components_last": last_loss_components,
+                    "diagnostics_last": last_diagnostics,
+                    "diagnostics_epoch0": initial_diagnostics,
+                    "optimizer_weight_decay": self.optimizer_weight_decay,
+                    "mlp_optimizer_weight_decay": float(self.config.get("adaptive_gcl", {}).get("mlp_weight_decay", 0.0)),
+                    **timing}
         final_evaluation_start = time.perf_counter()
         with torch.no_grad():
             final_u_embeds, final_i_embeds = self.model(self.norm_adj)
@@ -604,6 +704,12 @@ class Trainer:
                 "item_singular_values": svd_item["singular_values"][:15],
             },
             "subgroup_metrics": subgroups,
+            "loss_schema_version": 2,
+            "loss_components_last": last_loss_components,
+            "diagnostics_last": last_diagnostics,
+            "diagnostics_epoch0": initial_diagnostics,
+            "optimizer_weight_decay": self.optimizer_weight_decay,
+            "mlp_optimizer_weight_decay": float(self.config.get("adaptive_gcl", {}).get("mlp_weight_decay", 0.0)),
         }
 
         logger.info(f"Training completed for {self.model_name.upper()}.")

@@ -1,6 +1,6 @@
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 
 class HardNegativeBPRLoss(nn.Module):
@@ -52,7 +52,17 @@ class HardNegativeBPRLoss(nn.Module):
         hard_neg_emb: torch.Tensor,
     ) -> torch.Tensor:
         """Penalize explicit dislikes that outrank a user's positive item."""
+        return self.alpha * self.compute_hard_margin(
+            user_emb, pos_item_emb, hard_neg_emb
+        )
+
+    def compute_hard_margin(
+        self,
+        user_emb: torch.Tensor,
+        pos_item_emb: torch.Tensor,
+        hard_neg_emb: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the unweighted mean margin violation."""
         pos_scores = torch.sum(user_emb * pos_item_emb, dim=-1)
         hard_neg_scores = torch.sum(user_emb * hard_neg_emb, dim=-1)
-        margin_loss = F.relu(hard_neg_scores - pos_scores + self.margin).mean()
-        return self.alpha * margin_loss
+        return F.relu(hard_neg_scores - pos_scores + self.margin).mean()

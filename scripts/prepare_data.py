@@ -3,8 +3,8 @@ import json
 import os
 import pickle
 import sys
-from importlib.metadata import version
 from datetime import datetime, timezone
+from importlib.metadata import version
 
 # Ensure project root is in sys.path when script is executed directly
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -13,11 +13,20 @@ sys.path.insert(0, REPO_ROOT)
 import pandas as pd
 
 from src.data.loader import download_amazon_electronics, load_raw_data
+from src.data.metadata_overrides import apply_brand_overrides
 from src.data.negative_collector import extract_explicit_negative_interactions
-from src.data.preprocessing import preprocess_amazon_electronics
+from src.data.preprocessing import (
+    preprocess_amazon_electronics,
+    summarize_metadata_quality,
+)
 from src.data.provenance import sha256_file
-from src.data.splitter import SPLIT_TIE_POLICY, chronological_per_user_split, summarize_split_timing, verify_no_leakage
-from src.data.text_encoder import encode_item_metadata, PINNED_REVISION
+from src.data.splitter import (
+    SPLIT_TIE_POLICY,
+    chronological_per_user_split,
+    summarize_split_timing,
+    verify_no_leakage,
+)
+from src.data.text_encoder import PINNED_REVISION, encode_item_metadata
 from src.data.validation import (
     validate_interactions,
     validate_metadata,
@@ -179,6 +188,9 @@ def main():
     )
     stats["ingestion_ledger"] = {"reviews": ratings_df.attrs.get("ingestion_ledger", {}),
                                  "metadata": items_df.attrs.get("ingestion_ledger", {})}
+
+    stats["metadata_overrides"] = apply_brand_overrides(item_metadata)
+    stats["metadata_quality"] = summarize_metadata_quality(item_metadata)
 
     # 4. Validate cleaned metadata & interactions
     meta_df = pd.DataFrame(list(item_metadata.values()))

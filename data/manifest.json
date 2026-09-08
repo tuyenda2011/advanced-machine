@@ -28,15 +28,15 @@
     },
     {
       "path": "data/processed/mappings.pkl",
-      "sha256": "615a8c0c83156a3b8a4b2f1ed82dc39d9921c912219fe4a166cc2f2da26071ac"
+      "sha256": "b770dbc88b3e5a49874ddc0cad8dbf823f24572255729d822f1485c32ded0051"
     },
     {
       "path": "data/processed/item_text_embeddings.pt",
-      "sha256": "1b906bfa075678c2d1c491c3cd57987483005e09fc980c4a23da024df6ee96ff"
+      "sha256": "4d6e6ccd9dc0a21366424c03b5697fb2d42110a163e5c7d5e476f30f85402e6d"
     },
     {
       "path": "data/processed/item_text_embeddings.pt.json",
-      "sha256": "bf784016eb8b87c1109163bfca33a052ac3d88e777a90a75756380f5ead505ed"
+      "sha256": "325fd672e9ff7d12c114f615924fbe6c015537ca071197bd68c02ef47a0b5f10"
     },
     {
       "path": "data/processed/disliked_interactions.parquet",
@@ -80,13 +80,14 @@
     "metadata_quality": {
       "num_items": 44843,
       "missing_or_fallback_titles": 888,
-      "missing_or_unknown_brands": 22461,
+      "missing_or_unknown_brands": 22423,
       "generic_or_missing_categories": 0,
       "missing_title_fraction": 0.019802421782663962,
-      "missing_brand_fraction": 0.5008808509689361,
-      "complete_metadata": 22382,
-      "partial_metadata": 22461,
-      "no_usable_text": 0
+      "missing_brand_fraction": 0.500033450036795,
+      "complete_metadata": 22400,
+      "partial_metadata": 22443,
+      "no_usable_text": 0,
+      "category_only_text": 868
     },
     "filter_ledger": {
       "input_ratings": 1689188,
@@ -213,12 +214,18 @@
       "strict_temporal_order": false
     },
     "evaluation_users": 107274,
-    "train_only_users": 17621
+    "train_only_users": 17621,
+    "metadata_overrides": {
+      "path": "data/metadata_overrides.csv",
+      "sha256": "2a65656f4101c5fd3ca5c44c7769455597aa908be7954fcde1992d85b70c71e6",
+      "applied": 18,
+      "entries": 38
+    }
   },
   "text_features": {
     "format_version": 3,
     "metadata_policy": "title_or_brand_or_specific_category_v1",
-    "input_fingerprint": "427bc0942f14f9a1eda82206574b3b83ff306b87eabc667fef86d04ac5a2a4d5",
+    "input_fingerprint": "a55e2b22270ab59f6ec6d73d7491b4507753060d4ca073ad200f6fa745dd38f6",
     "model_name": "sentence-transformers/all-MiniLM-L6-v2",
     "revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
     "resolved_revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
@@ -227,7 +234,7 @@
       44843,
       384
     ],
-    "sha256": "1b906bfa075678c2d1c491c3cd57987483005e09fc980c4a23da024df6ee96ff",
+    "sha256": "4d6e6ccd9dc0a21366424c03b5697fb2d42110a163e5c7d5e476f30f85402e6d",
     "software_versions": {
       "sentence-transformers": "6.0.0",
       "transformers": "5.15.1",

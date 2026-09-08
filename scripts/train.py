@@ -33,6 +33,7 @@ from src.utils.checkpoints import (
 from src.utils.config import load_config
 from src.utils.device import get_device
 from src.utils.logging import setup_logger
+from src.utils.paths import resolve_output_root, write_run_manifest
 from src.utils.seed import set_seed
 
 logger = setup_logger("train_script")
@@ -119,14 +120,30 @@ def main():
     parser.add_argument("--epochs", type=int, default=None, help="Override number of training epochs")
     parser.add_argument("--validation_only", action="store_true", help="Tune using validation without reading test labels")
     parser.add_argument("--dry_run", action="store_true", help="Print effective configuration without training")
+    parser.add_argument("--model_diagnostics", action="store_true", help="Log deterministic layer/gate/norm diagnostics each epoch")
+    parser.add_argument("--diagnostics_sample_size", type=int, default=None, help="Node sample size for model diagnostics")
     parser.add_argument("--resume", action="store_true", help="Resume training from latest saved checkpoint")
     parser.add_argument("--config_dir", type=str, default="configs", help="Config directory")
-    parser.add_argument("--output_root", default="results", help="Root for this run's results, history and checkpoints")
+    parser.add_argument(
+        "--output_root",
+        default=None,
+        help="Root for this run. Defaults to results/runs/train_<model>_<density>_<seed>_<timestamp>/.",
+    )
     args = parser.parse_args()
     if args.epochs is not None and args.epochs < 1:
         parser.error("epochs must be positive")
     if not 0 < args.sparsity <= 1 or args.seed < 0:
         parser.error("sparsity must be in (0, 1] and seed nonnegative")
+    if args.resume and not args.output_root:
+        parser.error("--resume requires an explicit --output_root")
+
+    args.output_root = str(
+        resolve_output_root(
+            args.output_root,
+            kind="train",
+            label=f"{args.model}_s{int(args.sparsity * 100)}_seed{args.seed}",
+        )
+    )
 
     # 1. Set seed
     set_seed(args.seed)
@@ -137,17 +154,39 @@ def main():
     # 3. Load config
     config = load_config(args.model, args.config_dir)
     config["training"]["seed"] = args.seed
+    if args.epochs is not None:
+        config["training"]["epochs"] = args.epochs
+
+    if args.model_diagnostics:
+        config.setdefault("evaluation", {})["model_diagnostics"] = True
+    if args.diagnostics_sample_size is not None:
+        if args.diagnostics_sample_size < 1:
+            parser.error("diagnostics_sample_size must be positive")
+        config.setdefault("evaluation", {})["diagnostics_sample_size"] = args.diagnostics_sample_size
     config["experiment_fingerprint"] = get_run_fingerprint(
         args.model, args.sparsity, args.seed, config, args.config_dir
     )
-    if args.epochs is not None:
-        config["training"]["epochs"] = args.epochs
     config["history_dir"] = get_model_output_dir("history", args.model, args.output_root)
 
     config["validation_only"] = args.validation_only
     if args.dry_run:
-        print(json.dumps({"model": args.model, "sparsity": args.sparsity, "config": config}, indent=2))
+        print(json.dumps({"model": args.model, "sparsity": args.sparsity, "output_root": args.output_root, "config": config}, indent=2))
         return
+
+    write_run_manifest(
+        args.output_root,
+        kind="train",
+        metadata={
+            "model": args.model,
+            "density": args.sparsity,
+            "seed": args.seed,
+            "epochs": config["training"]["epochs"],
+            "validation_only": args.validation_only,
+        },
+        # A multi-model runner creates the run-level manifest. A child train
+        # process must not replace it with a single-model manifest.
+        overwrite=False,
+    )
 
     # 4. Load dataset processed files
     processed_dir = config["dataset"]["processed_dir"]
@@ -378,7 +417,7 @@ def main():
                 "source_checkpoint": checkpoint_path,
             }, f, indent=2)
         logger.info(
-            f"🏆 Updated GLOBAL BEST MODEL for {args.model.upper()} -> "
+            f"[GLOBAL BEST] Updated model for {args.model.upper()} -> "
             f"{global_best_pt_path} (Val {monitor}: {current_val_ndcg:.4f})"
         )
 

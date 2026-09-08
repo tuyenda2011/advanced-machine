@@ -4,7 +4,6 @@ import hashlib
 import json
 import os
 from copy import deepcopy
-from typing import Optional
 
 
 def get_experiment_fingerprint(
@@ -75,13 +74,18 @@ def get_run_fingerprint(model_name, sparsity=1.0, seed=42, config=None, config_d
     return hashlib.sha256(json.dumps(identity, sort_keys=True, allow_nan=False).encode()).hexdigest()
 
 
-def write_run_status(root, planned, succeeded, attempted):
+def write_run_status(root, planned, succeeded, attempted, status=None, current_model=None):
     """Persist counts even when a later run fails or the process is interrupted."""
     os.makedirs(root, exist_ok=True)
     path = os.path.join(root, "runner_status.json")
+    payload = {"planned": planned, "succeeded": succeeded,
+               "failed": attempted - succeeded, "pending": planned - attempted}
+    if status is not None:
+        payload["status"] = status
+    if current_model is not None:
+        payload["current_model"] = current_model
     with open(path + ".tmp", "w", encoding="utf-8") as handle:
-        json.dump({"planned": planned, "succeeded": succeeded,
-                   "failed": attempted - succeeded, "pending": planned - attempted}, handle, indent=2)
+        json.dump(payload, handle, indent=2)
     os.replace(path + ".tmp", path)
 
 
@@ -102,6 +106,7 @@ def get_checkpoint_path(
     sparsity: float = 1.0,
     seed: int = 42,
     checkpoint_type: str = "run",
+    root: str = "results",
 ) -> str:
     """Get the standardized checkpoint path for a model run.
 
@@ -110,11 +115,12 @@ def get_checkpoint_path(
         sparsity: Sparsity ratio (0.25 to 1.0)
         seed: Random seed
         checkpoint_type: Type of checkpoint - 'run' (per-sparsity/seed) or 'best' (global best)
+        root: Output root containing the model checkpoint section
 
     Returns:
         Absolute path to the checkpoint file
     """
-    checkpoint_dir = get_checkpoint_dir(model_name)
+    checkpoint_dir = get_checkpoint_dir(model_name, root)
     sparsity_tag = f"s{int(sparsity * 100)}"
 
     if checkpoint_type == "best":
@@ -127,7 +133,8 @@ def find_checkpoint(
     model_name: str,
     sparsity: float = 1.0,
     seed: int = 42,
-) -> Optional[str]:
+    root: str = "results",
+) -> str | None:
     """Find an existing checkpoint for the model, checking multiple possible locations.
 
     Priority order:
@@ -139,15 +146,31 @@ def find_checkpoint(
         model_name: Name of the model
         sparsity: Sparsity ratio
         seed: Random seed
+        root: Output root to search before legacy locations
 
     Returns:
         Path to the found checkpoint, or None if not found
     """
     candidates = [
         # Priority 1: Run-specific checkpoint
-        get_checkpoint_path(model_name, sparsity, seed, checkpoint_type="run"),
+        get_checkpoint_path(model_name, sparsity, seed, checkpoint_type="run", root=root),
         # Priority 2: Global best checkpoint
-        get_checkpoint_path(model_name, sparsity, seed, checkpoint_type="best"),
+        get_checkpoint_path(model_name, sparsity, seed, checkpoint_type="best", root=root),
+    ]
+
+    # New runs live below results/runs/<run_id>. Search the newest matching run
+    # before falling back to the historical flat layout.
+    if root == "results":
+        from src.utils.paths import find_latest_run_root
+
+        latest_root = find_latest_run_root(model_name=model_name, sparsity=sparsity, seed=seed)
+        if latest_root is not None:
+            candidates = [
+                get_checkpoint_path(model_name, sparsity, seed, checkpoint_type="run", root=str(latest_root)),
+                get_checkpoint_path(model_name, sparsity, seed, checkpoint_type="best", root=str(latest_root)),
+            ] + candidates
+
+    candidates += [
         # Priority 3: Legacy paths for backwards compatibility
         os.path.join("results", "checkpoints", f"{model_name}_best.pt"),
         os.path.join("results", "checkpoints", f"{model_name}_s{int(sparsity * 100)}_seed{seed}.pt"),
@@ -161,7 +184,7 @@ def find_checkpoint(
     return None
 
 
-def ensure_checkpoint_dir(model_name: str) -> str:
+def ensure_checkpoint_dir(model_name: str, root: str = "results") -> str:
     """Ensure the checkpoint directory exists and return its path.
 
     Args:
@@ -170,6 +193,6 @@ def ensure_checkpoint_dir(model_name: str) -> str:
     Returns:
         Path to the checkpoint directory
     """
-    checkpoint_dir = get_checkpoint_dir(model_name)
+    checkpoint_dir = get_checkpoint_dir(model_name, root)
     os.makedirs(checkpoint_dir, exist_ok=True)
     return checkpoint_dir

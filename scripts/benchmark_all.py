@@ -1,7 +1,11 @@
 import argparse
 import json
 import os
+import subprocess
 import sys
+
+import numpy as np
+import pandas as pd
 
 # Ensure project root is in sys.path when script is executed directly
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -12,13 +16,12 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-import subprocess
-from numbers import Real
-
-import numpy as np
-import pandas as pd
-
-from src.evaluation.evaluator import EVALUATION_PROTOCOL
+from src.evaluation.run_validation import (
+    FULL_METRIC_PATHS,
+)
+from src.evaluation.run_validation import (
+    validate_run_result as _validate_run_result,
+)
 from src.evaluation.significance import (
     compute_statistical_significance,
     generate_latex_table,
@@ -30,126 +33,20 @@ from src.utils.checkpoints import (
     write_run_status,
 )
 from src.utils.logging import setup_logger
+from src.utils.paths import resolve_output_root, write_run_manifest
 
 logger = setup_logger("benchmark_all")
 
 
-REQUIRED_METRIC_PATHS = [
-    ("val_metrics", "NDCG@10"),
-    ("test_metrics", "Recall@10"),
-    ("test_metrics", "NDCG@10"),
-    ("test_metrics", "MRR@10"),
-    ("test_metrics", "Recall@20"),
-    ("test_metrics", "NDCG@20"),
-    ("test_metrics", "Diversity@10"),
-    ("test_metrics", "Novelty@10"),
-    ("test_metrics", "Coverage@10"),
-    ("test_metrics", "Gini@10"),
-    ("representation_metrics", "alignment"),
-    ("representation_metrics", "mean_uniformity"),
-    ("svd_metrics", "user_effective_rank"),
-    ("svd_metrics", "item_effective_rank"),
-    ("subgroup_metrics", "Tail (Low-Activity)", "Recall@10"),
-    ("subgroup_metrics", "Tail (Low-Activity)", "NDCG@10"),
-    ("subgroup_metrics", "Head (Active)", "Recall@10"),
-    ("subgroup_metrics", "Head (Active)", "NDCG@10"),
-]
+REQUIRED_METRIC_PATHS = list(FULL_METRIC_PATHS)
 
 
-def _nested_value(data, path):
-    value = data
-    for key in path:
-        if not isinstance(value, dict) or key not in value:
-            raise KeyError(".".join(path))
-        value = value[key]
-    return value
-
-
-def validate_run_result(data, model, sparsity, seed, epochs, fingerprint):
-    """Return all reasons a cached or newly produced run is unusable."""
-    errors = []
-    if not isinstance(data, dict):
-        return ["result must be a JSON object"]
-    expected = {
-        "model_name": model,
-        "sparsity_level": sparsity,
-        "seed": seed,
-        "max_epochs": epochs,
-        "experiment_fingerprint": fingerprint,
-        "evaluation_protocol": EVALUATION_PROTOCOL,
-    }
-    for key, value in expected.items():
-        if isinstance(data.get(key), bool) or data.get(key) != value:
-            errors.append(f"{key}={data.get(key)!r}, expected {value!r}")
-    if not isinstance(data.get("experiment_family"), str) or not data["experiment_family"]:
-        errors.append("missing experiment_family")
-    if data.get("scoring_metric") not in ("dot_product", "cosine"):
-        errors.append("invalid scoring_metric")
-    if "profile" not in data or "monitor" not in data:
-        errors.append("missing profile or monitor")
-    if not isinstance(data.get("evaluation_metadata"), dict):
-        errors.append("missing evaluation_metadata")
-    else:
-        metadata = data["evaluation_metadata"]
-        required_metadata = {
-            "history_mask_policy": "full_train_for_val_full_train_plus_val_for_test",
-            "sparsity_scope": "model_training_graph_only",
-            "popularity_reference": "full_train_unique_users",
-            "subgroup_degree_reference": "full_train_fixed_across_sparsity",
-        }
-        for key, value in required_metadata.items():
-            if metadata.get(key) != value:
-                errors.append(f"evaluation_metadata.{key} is invalid")
-    for key in (
-        "best_epoch",
-        "total_epochs",
-        "total_train_time",
-        "avg_epoch_time",
-        "inference_latency_ms_per_user",
-        "throughput_users_per_sec",
-    ):
-        try:
-            value = data[key]
-            if isinstance(value, bool) or not isinstance(value, Real) or not np.isfinite(value) or value < 0:
-                errors.append(f"{key} must be a finite nonnegative number")
-        except (KeyError, TypeError, ValueError):
-            errors.append(f"missing or invalid {key}")
-    for path in REQUIRED_METRIC_PATHS:
-        try:
-            value = _nested_value(data, path)
-            if isinstance(value, bool) or not isinstance(value, Real) or not np.isfinite(value):
-                errors.append(f"{'.'.join(path)} must be a finite number")
-                continue
-            metric = path[-1]
-            if metric.startswith(("Recall@", "NDCG@", "MRR@", "Coverage@", "Gini@")) and not 0 <= value <= 1:
-                errors.append(f"{'.'.join(path)} must be in [0, 1]")
-            if metric.startswith("Diversity@") and not 0 <= value <= 2:
-                errors.append(f"{metric} must be in [0, 2]")
-            if (metric.startswith("Novelty@") or metric in {"alignment", "user_effective_rank", "item_effective_rank"}) and value < 0:
-                errors.append(f"{metric} must be nonnegative")
-        except (KeyError, TypeError, ValueError):
-            errors.append(f"missing or invalid {'.'.join(path)}")
-    for key in ("best_epoch", "total_epochs"):
-        if type(data.get(key)) is not int:
-            errors.append(f"{key} must be an integer")
-    if all(type(data.get(key)) is int for key in ("best_epoch", "total_epochs")):
-        if not 1 <= data["best_epoch"] <= data["total_epochs"] <= epochs:
-            errors.append("best_epoch must be within completed epochs and budget")
-    monitor = data.get("monitor", "NDCG@10")
-    if not isinstance(monitor, str) or monitor not in {"NDCG@10", "NDCG@20"}:
-        errors.append("invalid monitor")
-    elif not isinstance(data.get("val_metrics"), dict) or monitor not in data["val_metrics"]:
-        errors.append("missing validation monitor metric")
-    else:
-        value = data["val_metrics"][monitor]
-        if isinstance(value, bool) or not isinstance(value, Real) or not np.isfinite(value) or not 0 <= value <= 1:
-            errors.append("invalid validation monitor value")
-    effective = data.get("effective_config")
-    if isinstance(effective, dict):
-        evaluation = effective.get("evaluation", {})
-        if not isinstance(evaluation, dict) or evaluation.get("monitor", "NDCG@10") != monitor:
-            errors.append("monitor does not match effective config")
-    return errors
+def validate_run_result(data, model, sparsity, seed, epochs, fingerprint, *, validation_only=False):
+    """Compatibility wrapper around the shared result validator."""
+    return _validate_run_result(
+        data, model, sparsity, seed, epochs, fingerprint,
+        validation_only=validation_only,
+    )
 
 
 def holm_adjust(p_values):
@@ -192,7 +89,11 @@ def main():
     parser.add_argument("--sparsities", nargs="+", type=float)
     parser.add_argument("--seeds", nargs="+", type=int)
     parser.add_argument("--dry_run", action="store_true", help="List planned runs without training")
-    parser.add_argument("--output_root", default="results")
+    parser.add_argument(
+        "--output_root",
+        default=None,
+        help="Root for this benchmark. Defaults to results/runs/benchmark_<timestamp>/.",
+    )
     parser.add_argument("--config_dir", default="configs")
     args = parser.parse_args()
     if len(set(args.models)) != len(args.models):
@@ -216,11 +117,26 @@ def main():
         parser.error("Invalid epoch budget, sparsity or seed")
     if len(set(seeds)) != len(seeds) or len(set(sparsity_levels)) != len(sparsity_levels):
         parser.error("Duplicate seeds or sparsities are not allowed")
+    if args.resume and not args.output_root:
+        parser.error("--resume requires an explicit --output_root")
+    args.output_root = str(resolve_output_root(args.output_root, kind="benchmark"))
     logger.info(f"Planned {len(models)*len(sparsity_levels)*len(seeds)} runs: "
                 f"{len(models)} models x {len(sparsity_levels)} sparsities x {len(seeds)} seeds, {epochs} epochs")
     if args.dry_run:
-        print(json.dumps({"models": models, "sparsities": sparsity_levels, "seeds": seeds, "epochs": epochs, "runs": len(models)*len(sparsity_levels)*len(seeds)}, indent=2))
+        print(json.dumps({"models": models, "sparsities": sparsity_levels, "seeds": seeds, "epochs": epochs, "runs": len(models)*len(sparsity_levels)*len(seeds), "output_root": args.output_root}, indent=2))
         return
+
+    write_run_manifest(
+        args.output_root,
+        kind="benchmark",
+        metadata={
+            "models": list(models),
+            "densities": sparsity_levels,
+            "seeds": seeds,
+            "epochs": epochs,
+            "validation_only": False,
+        },
+    )
 
     results_dir = os.path.join(args.output_root, "raw")
     os.makedirs(results_dir, exist_ok=True)
@@ -267,7 +183,7 @@ def main():
                 test_ndcg = data["test_metrics"]["NDCG@10"]
                 test_recall = data["test_metrics"]["Recall@10"]
                 print(
-                    f"[{idx:02d}/{total_experiments:02d}] ⏩ [ĐÃ CÓ KẾT QUẢ] Bỏ qua {model.upper():<12} | Sparsity: {sparsity_pct:>3}% | Seed: {seed:>4} | Test NDCG@10: {test_ndcg:.4f} | Recall@10: {test_recall:.4f}",
+                    f"[{idx:02d}/{total_experiments:02d}] [CACHED] Bỏ qua {model.upper():<12} | Sparsity: {sparsity_pct:>3}% | Seed: {seed:>4} | Test NDCG@10: {test_ndcg:.4f} | Recall@10: {test_recall:.4f}",
                     flush=True,
                 )
                 all_runs.append(data)
@@ -277,7 +193,7 @@ def main():
 
         print("\n" + "=" * 85, flush=True)
         print(
-            f"[{idx:02d}/{total_experiments:02d}] 🚀 BẮT ĐẦU HUẤN LUYỆN: {model.upper()} | SPARSITY: {sparsity_pct}% | SEED: {seed} | MAX EPOCHS: {epochs}",
+            f"[{idx:02d}/{total_experiments:02d}] [START TRAIN]: {model.upper()} | SPARSITY: {sparsity_pct}% | SEED: {seed} | MAX EPOCHS: {epochs}",
             flush=True,
         )
         print("=" * 85, flush=True)
@@ -306,7 +222,7 @@ def main():
         write_run_status(args.output_root, total_experiments, len(all_runs), idx)
         if res.returncode != 0:
             print(
-                f"[{idx:02d}/{total_experiments:02d}] ❌ [LỖI LƯỢT CHẠY] {model.upper():<12} | Sparsity: {sparsity_pct:>3}% | Seed: {seed:>4}",
+                f"[{idx:02d}/{total_experiments:02d}] [RUN ERROR] {model.upper():<12} | Sparsity: {sparsity_pct:>3}% | Seed: {seed:>4}",
                 flush=True,
             )
             logger.error(
@@ -333,7 +249,7 @@ def main():
             test_recall = data["test_metrics"]["Recall@10"]
             best_epoch = data["best_epoch"]
             print(
-                f"[{idx:02d}/{total_experiments:02d}] ✅ [HOÀN THÀNH TRAIN] {model.upper():<12} | Sparsity: {sparsity_pct:>3}% | Seed: {seed:>4} | Best Epoch: {best_epoch:>2} | NDCG@10: {test_ndcg:.4f} | Recall@10: {test_recall:.4f}\n",
+                f"[{idx:02d}/{total_experiments:02d}] [TRAIN COMPLETE] {model.upper():<12} | Sparsity: {sparsity_pct:>3}% | Seed: {seed:>4} | Best Epoch: {best_epoch:>2} | NDCG@10: {test_ndcg:.4f} | Recall@10: {test_recall:.4f}\n",
                 flush=True,
             )
         else:
@@ -561,8 +477,7 @@ def main():
     try:
         from scripts.generate_plots import main as generate_all_figures
         logger.info("Automatically generating research publication figures...")
-        if args.output_root == "results":
-            generate_all_figures()
+        generate_all_figures(input_root=args.output_root, output_root=args.output_root)
     except Exception as e:
         logger.warning(f"Could not automatically generate figures: {e}")
 

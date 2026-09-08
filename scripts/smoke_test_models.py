@@ -1,17 +1,17 @@
 """Run each recommender once at one training density.
 
-The default is a five-epoch validation-only smoke test on all four models at
-100% of the training graph.  Use ``--with_test`` only after you want the test
-split and beyond-accuracy evaluation to run as well.
+The default is a five-epoch validation-only smoke check. Supplying a larger
+budget or ``--with_test`` makes this a real evaluation run and names the
+output ``evaluation_<timestamp>``.
 """
 
 import argparse
 import csv
 import json
 import os
+import signal
 import subprocess
 import sys
-from datetime import datetime
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -20,12 +20,18 @@ MODELS = ("lightgcn", "xsimgcl", "directau", "adaptive_gcl")
 # Make project imports work when this file is called from any working directory.
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.utils.checkpoints import get_model_output_dir, write_run_status
+from scripts.benchmark_all import validate_run_result
+from src.utils.checkpoints import (
+    get_model_output_dir,
+    get_run_fingerprint,
+    write_run_status,
+)
+from src.utils.paths import resolve_output_root, write_run_manifest
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run each model once at one density for a quick pipeline check."
+        description="Run each model once at one density; use 5 validation-only epochs for a smoke check or a larger budget for evaluation."
     )
     parser.add_argument(
         "--density",
@@ -52,7 +58,7 @@ def parse_args():
     parser.add_argument(
         "--output_root",
         default=None,
-        help="Output directory. Defaults to a new results/smoke_YYYYMMDD_HHMMSS directory.",
+        help="Output directory. Defaults to results/runs/smoke_<timestamp> for the 5-epoch check, otherwise evaluation_<timestamp>.",
     )
     parser.add_argument("--config_dir", default="configs")
     parser.add_argument(
@@ -79,14 +85,24 @@ def parse_args():
         parser.error("--seed must be nonnegative")
     if len(set(args.models)) != len(args.models):
         parser.error("Each model may be listed only once")
+    if args.resume and not args.output_root:
+        parser.error("--resume requires an explicit --output_root")
     return args
 
 
+def run_kind_for(args):
+    """Name the artifact by what was actually executed."""
+
+    return "smoke" if args.epochs <= 5 and not args.with_test else "evaluation"
+
+
 def output_root_for(args):
-    if args.output_root:
-        return Path(args.output_root)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return Path("results") / f"smoke_{stamp}"
+    return resolve_output_root(args.output_root, kind=run_kind_for(args))
+
+
+def resolve_project_path(value):
+    path = Path(value)
+    return path if path.is_absolute() else PROJECT_ROOT / path
 
 
 def build_command(args, model, output_root):
@@ -102,7 +118,7 @@ def build_command(args, model, output_root):
         "--epochs",
         str(args.epochs),
         "--config_dir",
-        str(args.config_dir),
+        str(resolve_project_path(args.config_dir)),
         "--output_root",
         str(output_root),
     ]
@@ -125,8 +141,21 @@ def read_result(model, args, output_root):
         raise FileNotFoundError(f"Training finished without result JSON: {path}")
     with path.open("r", encoding="utf-8") as handle:
         result = json.load(handle)
-    if result.get("model_name") != model or result.get("seed") != args.seed:
-        raise ValueError(f"Result identity mismatch in {path}")
+    config_dir = resolve_project_path(args.config_dir)
+    expected_fingerprint = get_run_fingerprint(
+        model, args.density, args.seed, config_dir=str(config_dir)
+    )
+    errors = validate_run_result(
+        result,
+        model,
+        args.density,
+        args.seed,
+        args.epochs,
+        expected_fingerprint,
+        validation_only=not args.with_test,
+    )
+    if errors:
+        raise ValueError(f"Invalid result {path}: " + "; ".join(errors))
     return path, result
 
 
@@ -138,6 +167,8 @@ def summary_row(model, result, status, returncode=None):
         "model": model,
         "status": status,
         "returncode": returncode,
+        "error_type": result.get("_error_type"),
+        "error_message": result.get("_error_message"),
         "best_epoch": result.get("best_epoch"),
         "total_epochs": result.get("total_epochs"),
         "monitor": monitor,
@@ -147,26 +178,32 @@ def summary_row(model, result, status, returncode=None):
         "profile": result.get("profile"),
         "train_time_sec": result.get("total_train_time"),
         "result_file": result.get("_result_file"),
+        "validation_only": result.get("validation_only"),
     }
 
 
-def save_summary(output_root, rows, args):
+def save_summary(output_root, rows, args, run_kind):
     output_root.mkdir(parents=True, exist_ok=True)
     payload = {
         "density": args.density,
         "seed": args.seed,
         "epochs": args.epochs,
         "validation_only": not args.with_test,
+        "run_kind": run_kind,
         "models": list(args.models),
         "runs": rows,
     }
-    json_path = output_root / "smoke_summary.json"
+    json_path = output_root / f"{run_kind}_summary.json"
     temp_path = json_path.with_suffix(".json.tmp")
     temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     os.replace(temp_path, json_path)
 
-    csv_path = output_root / "smoke_summary.csv"
-    fields = list(rows[0]) if rows else ["model", "status"]
+    csv_path = output_root / f"{run_kind}_summary.csv"
+    fields = [
+        "model", "status", "returncode", "error_type", "error_message",
+        "best_epoch", "total_epochs", "monitor", "val_monitor", "test_ndcg20",
+        "scoring_metric", "profile", "train_time_sec", "result_file", "validation_only",
+    ]
     with csv_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
@@ -175,6 +212,7 @@ def save_summary(output_root, rows, args):
 
 def main():
     args = parse_args()
+    run_kind = run_kind_for(args)
     output_root = output_root_for(args)
     commands = [build_command(args, model, output_root) for model in args.models]
     if args.dry_run:
@@ -194,21 +232,64 @@ def main():
             "Choose a new --output_root or pass --resume."
         )
 
+    write_run_manifest(
+        output_root,
+        kind=run_kind,
+        metadata={
+            "models": list(args.models),
+            "density": args.density,
+            "seed": args.seed,
+            "epochs": args.epochs,
+            "validation_only": not args.with_test,
+        },
+    )
+
     total = len(args.models)
     attempted = 0
     succeeded = 0
     rows = []
-    write_run_status(str(output_root), total, succeeded, attempted)
+    write_run_status(str(output_root), total, succeeded, attempted, status="running")
+    interrupted = False
     for model, command in zip(args.models, commands):
         attempted += 1
         print(f"\n[{attempted}/{total}] Running {model.upper()} at density {args.density:.2f}", flush=True)
         result = None
         returncode = None
+        process = None
+        log_path = output_root / "logs" / f"{model}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         try:
+            write_run_status(str(output_root), total, succeeded, attempted,
+                             status="running", current_model=model)
+            # A valid artifact with the requested identity/budget is reusable on
+            # resume.  Invalid or stale artifacts fall through to train.py.
+            if args.resume:
+                try:
+                    result_file, cached = read_result(model, args, output_root)
+                    cached["_result_file"] = str(result_file)
+                    succeeded += 1
+                    rows.append(summary_row(model, cached, "cached", 0))
+                    print(f"[CACHED] {model.upper()}: using validated existing result", flush=True)
+                    continue
+                except (FileNotFoundError, ValueError, json.JSONDecodeError):
+                    pass
             environment = os.environ.copy()
             environment["PYTHONPATH"] = str(PROJECT_ROOT)
-            completed = subprocess.run(command, cwd=PROJECT_ROOT, env=environment, check=False)
-            returncode = completed.returncode
+            with log_path.open("w", encoding="utf-8") as log_handle:
+                process = subprocess.Popen(
+                    command,
+                    cwd=PROJECT_ROOT,
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+                assert process.stdout is not None
+                for line in process.stdout:
+                    print(line, end="", flush=True)
+                    log_handle.write(line)
+                returncode = process.wait()
             if returncode != 0:
                 raise RuntimeError(f"train.py exited with code {returncode}")
             result_file, result = read_result(model, args, output_root)
@@ -216,20 +297,39 @@ def main():
             succeeded += 1
             rows.append(summary_row(model, result, "succeeded", returncode))
             print(
-                f"✅ {model.upper()}: {result.get('monitor', 'NDCG@20')}="
+                f"[OK] {model.upper()}: {result.get('monitor', 'NDCG@20')}="
                 f"{result.get('val_metrics', {}).get(result.get('monitor', 'NDCG@20'), float('nan')):.4f}",
                 flush=True,
             )
+        except KeyboardInterrupt as error:
+            interrupted = True
+            if process is not None and process.poll() is None:
+                process.send_signal(signal.SIGINT)
+                process.wait()
+            payload = {"_error_type": type(error).__name__, "_error_message": "interrupted"}
+            rows.append(summary_row(model, payload, "interrupted", returncode))
+            print(f"[INTERRUPTED] {model.upper()}: interrupted", flush=True)
+            break
         except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as error:
-            rows.append(summary_row(model, result or {}, "failed", returncode))
-            print(f"❌ {model.upper()}: {error}", flush=True)
+            payload = result or {}
+            payload["_error_type"] = type(error).__name__
+            payload["_error_message"] = str(error)
+            rows.append(summary_row(model, payload, "failed", returncode))
+            print(f"[ERROR] {model.upper()}: {error}", flush=True)
         finally:
-            write_run_status(str(output_root), total, succeeded, attempted)
-            save_summary(output_root, rows, args)
+            write_run_status(
+                str(output_root), total, succeeded, attempted,
+                status="interrupted" if interrupted else "running",
+            )
+            save_summary(output_root, rows, args, run_kind)
 
+    if interrupted:
+        raise KeyboardInterrupt("Smoke test interrupted; runner status and partial summary were saved")
     if succeeded != total:
+        write_run_status(str(output_root), total, succeeded, attempted, status="failed")
         raise RuntimeError(f"Smoke test incomplete: {succeeded}/{total} models succeeded")
-    print(f"\nSaved smoke summary to {output_root / 'smoke_summary.json'}", flush=True)
+    write_run_status(str(output_root), total, succeeded, attempted, status="complete")
+    print(f"\nSaved {run_kind} summary to {output_root / f'{run_kind}_summary.json'}", flush=True)
     return 0
 
 

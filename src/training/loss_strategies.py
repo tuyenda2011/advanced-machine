@@ -92,12 +92,19 @@ class BPRStrategy(LossStrategy):
         total_loss, bpr_loss = self.bpr_loss_fn(
             pos_scores, neg_scores, u_emb0, pos_emb0, neg_emb0
         )
+        id_l2_raw = self.bpr_loss_fn.compute_regularization(
+            u_emb0, pos_emb0, neg_emb0, pos_scores.shape[0]
+        )
 
         return LossOutput(
             total_loss=total_loss,
             bpr_loss=bpr_loss.item(),
             cl_loss=0.0,
-            extra_losses={},
+            extra_losses={
+                "bpr_raw": bpr_loss,
+                "id_l2_raw": id_l2_raw,
+                "id_l2_weighted": self.weight_decay * id_l2_raw,
+            },
         )
 
 
@@ -144,6 +151,9 @@ class XSimGCLStrategy(LossStrategy):
         total_loss, bpr_loss = self.bpr_loss_fn(
             pos_scores, neg_scores, u_emb0, pos_emb0, neg_emb0
         )
+        id_l2_raw = self.bpr_loss_fn.compute_regularization(
+            u_emb0, pos_emb0, neg_emb0, pos_scores.shape[0]
+        )
 
         unique_users = torch.unique(u_batch)
         unique_items = torch.unique(pos_batch)
@@ -156,12 +166,22 @@ class XSimGCLStrategy(LossStrategy):
             )
         )
         total_loss = total_loss + self.contrastive_weight * cl_loss
+        ssl_weighted = self.contrastive_weight * cl_loss
 
         return LossOutput(
             total_loss=total_loss,
             bpr_loss=bpr_loss.item(),
             cl_loss=cl_loss.item(),
-            extra_losses={"cl_loss": cl_loss},
+            extra_losses={
+                "bpr_raw": bpr_loss,
+                "id_l2_raw": id_l2_raw,
+                "id_l2_weighted": self.weight_decay * id_l2_raw,
+                "ssl_raw": cl_loss,
+                "ssl_weight": torch.as_tensor(self.contrastive_weight, device=cl_loss.device),
+                "ssl_weighted": ssl_weighted,
+                # Backwards-compatible alias used by existing history readers.
+                "cl_loss": cl_loss,
+            },
         )
 
 
@@ -194,12 +214,29 @@ class DirectAUStrategy(LossStrategy):
         total_loss, align_loss, unif_loss = self.directau_loss_fn(
             u_embeds[u_batch], i_embeds[pos_batch], u_emb0, pos_emb0
         )
+        id_l2_raw = (u_emb0.norm(2).pow(2) + pos_emb0.norm(2).pow(2)) / (
+            2.0 * u_embeds[u_batch].size(0)
+        )
+        align_weighted = align_loss
+        uniformity_weighted = self.gamma * unif_loss
+        id_l2_weighted = self.weight_decay * id_l2_raw
 
         return LossOutput(
             total_loss=total_loss,
             bpr_loss=align_loss.item(),
             cl_loss=unif_loss.item(),
-            extra_losses={"align_loss": align_loss, "unif_loss": unif_loss},
+            extra_losses={
+                "alignment_raw": align_loss,
+                "alignment_weighted": align_weighted,
+                "uniformity_raw": unif_loss,
+                "uniformity_weight": torch.as_tensor(self.gamma, device=unif_loss.device),
+                "uniformity_weighted": uniformity_weighted,
+                "id_l2_raw": id_l2_raw,
+                "id_l2_weighted": id_l2_weighted,
+                # Existing aliases retained for old CSV/history consumers.
+                "align_loss": align_loss,
+                "unif_loss": unif_loss,
+            },
         )
 
 
@@ -251,26 +288,58 @@ class AdaptiveGCLStrategy(LossStrategy):
         total_loss, bpr_loss = self.bpr_loss_fn(
             pos_scores, neg_scores, u_emb0, pos_emb0, neg_emb0
         )
+        id_l2_raw = self.bpr_loss_fn.compute_regularization(
+            u_emb0, pos_emb0, neg_emb0, pos_scores.shape[0]
+        )
 
+        hard_margin_raw = torch.zeros((), device=u_batch.device)
+        hard_penalty_weighted = torch.zeros((), device=u_batch.device)
         if hard_batch is not None and hard_mask is not None and self.hard_loss_fn.alpha > 0:
-            total_loss = total_loss + self.hard_loss_fn.compute_hard_penalty(
-                u_embeds[u_batch[hard_mask]], i_embeds[pos_batch[hard_mask]], i_embeds[hard_batch]
+            hard_margin_raw = self.hard_loss_fn.compute_hard_margin(
+                u_embeds[u_batch[hard_mask]],
+                i_embeds[pos_batch[hard_mask]],
+                i_embeds[hard_batch],
             )
+            hard_penalty_weighted = self.hard_loss_fn.alpha * hard_margin_raw
+            total_loss = total_loss + hard_penalty_weighted
 
         # Semantic SSL loss
-        if hasattr(model, "compute_semantic_ssl_loss"):
+        if hasattr(model, "compute_semantic_ssl_components"):
+            ssl_raw, cl_loss = model.compute_semantic_ssl_components(pos_batch, i_embeds)
+            total_loss = total_loss + cl_loss
+        elif hasattr(model, "compute_semantic_ssl_loss"):
             cl_loss = model.compute_semantic_ssl_loss(pos_batch, i_embeds)
+            ssl_raw = cl_loss / self.ssl_reg if self.ssl_reg > 0 else cl_loss
             total_loss = total_loss + cl_loss
         else:
+            ssl_raw = torch.tensor(0.0, device=u_batch.device)
             cl_loss = torch.tensor(0.0, device=u_batch.device)
 
         # Dirichlet Energy regularization
-        extra_losses = {"cl_loss": cl_loss}
+        dir_raw = torch.zeros((), device=u_batch.device)
+        dir_weighted = torch.zeros((), device=u_batch.device)
         if hasattr(model, "dirichlet_reg") and model.dirichlet_reg > 0:
             all_final = torch.cat([u_embeds, i_embeds], dim=0)
-            dir_loss = model.compute_dirichlet_regularization(norm_adj, all_final)
-            total_loss = total_loss + dir_loss
-            extra_losses["dir_loss"] = dir_loss
+            dir_raw = model.compute_dirichlet_energy(norm_adj, all_final)
+            dir_weighted = -model.dirichlet_reg * dir_raw
+            total_loss = total_loss + dir_weighted
+
+        extra_losses = {
+            "bpr_raw": bpr_loss,
+            "id_l2_raw": id_l2_raw,
+            "id_l2_weighted": self.weight_decay * id_l2_raw,
+            "hard_penalty_raw": hard_margin_raw,
+            "hard_margin_raw": hard_margin_raw,
+            "hard_penalty_weighted": hard_penalty_weighted,
+            "ssl_raw": ssl_raw,
+            "ssl_weight": torch.as_tensor(self.ssl_reg, device=cl_loss.device),
+            "ssl_weighted": cl_loss,
+            "dirichlet_raw": dir_raw,
+            "dirichlet_weighted": dir_weighted,
+            # Backwards-compatible aliases.
+            "cl_loss": cl_loss,
+            "dir_loss": dir_weighted,
+        }
 
         return LossOutput(
             total_loss=total_loss,

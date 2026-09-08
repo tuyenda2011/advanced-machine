@@ -69,7 +69,16 @@ Preprocessing filters positive feedback, deduplicates user–item pairs, and run
 
 Metadata-aware training uses source-derived flags (`has_title`, `has_brand`, `has_category`, `has_specific_category`, `has_usable_text`). A real title, brand, or specific category makes text usable. Only usable text is encoded; other tensor rows are zero and must be masked in item fusion, user-history pooling, and semantic SSL. All 44,843 items in the current snapshot still have usable text; this is not a claim that all metadata is complete. MiniLM is pinned to commit `1110a243fdf4706b3f48f1d95db1a4f5529b4d41`. Training and demo reject missing flags or incompatible caches.
 
-AdaptiveGCL writes new checkpoints, JSON, history and per-model CSV under `results/<section>/adaptive_gcl/masked_text/`; `benchmark_all.py` and the demo use the same paths. Old checkpoints are not compatible. See [implementation status](metadata-aware-training-plan.md) and [completed pilot results](docs/BAO_CAO_PILOT_METADATA.md). The four 5-epoch validation-only runs did not demonstrate a ranking improvement over legacy text.
+New training commands create one self-contained run under `results/runs/`: `smoke_YYYYMMDD_HHMMSS` for a 5-epoch validation-only check, `evaluation_YYYYMMDD_HHMMSS` for a real one-density evaluation, `train_all_YYYYMMDD_HHMMSS`, `benchmark_YYYYMMDD_HHMMSS`, `pilot_YYYYMMDD_HHMMSS`, `ablation_YYYYMMDD_HHMMSS`, or `train_<model>_s<density>_seed<seed>_YYYYMMDD_HHMMSS`. Each run contains `run_manifest.json`, `runner_status.json` when applicable, and the same `raw/`, `history/`, `checkpoints/`, and `aggregated/` sections; smoke/evaluation runs also capture per-model `logs/`, and benchmark summaries can add `figures/`. AdaptiveGCL keeps its `masked_text` policy subdirectory inside its model section. Pass `--output_root <path>` to resume or intentionally place a run elsewhere; the old `results/{raw,history,checkpoints,aggregated}` tree is no longer used by default and remains readable for backward compatibility. See [implementation status](metadata-aware-training-plan.md) and [completed pilot results](docs/BAO_CAO_PILOT_METADATA.md). The four 5-epoch validation-only runs did not demonstrate a ranking improvement over legacy text.
+
+To inspect the newest benchmark, open the run containing `aggregated/benchmark_summary.csv`; the dashboard and `scripts/generate_plots.py` discover that run automatically. A reproducible example is:
+
+```bash
+python scripts/benchmark_all.py --quick --output_root results/runs/benchmark_manual
+python scripts/generate_plots.py --help
+```
+
+For one real run per model at one density, use `scripts/run_models_once.py`. The older `scripts/smoke_test_models.py` entry point remains compatible; it uses the `smoke_` name only for the 5-epoch validation-only mode.
 
 AdaptiveGCL now exposes isolated ablation controls for item text, user semantics, SSL, global layer aggregation and MLP-only regularization. Preview without training using `python scripts/ablate_adaptive.py`; see the [ablation guide](docs/ADAPTIVE_GCL_ABLATION.md). Defaults preserve the prior formulas; these controls are not evidence of an accuracy improvement.
 
@@ -229,11 +238,10 @@ advanced-machine/
 ├── 📁 app/                      # Web application
 │   └── streamlit_app.py         # Interactive dashboard
 │
-├── 📁 results/                 # Output directory
-│   ├── checkpoints/            # Model weights
-│   ├── history/               # Training logs
-│   ├── aggregated/            # Summary CSVs
-│   └── figures/               # Generated plots
+├── 📁 results/                 # Output directory (new runs are isolated)
+│   ├── runs/                   # One folder per smoke/train/benchmark run
+│   │   └── <run_id>/            # manifest + raw/history/checkpoints/...
+│   └── <legacy sections>/      # Read-only compatibility with old runs
 │
 └── 📄 README.md               # This file
 ```

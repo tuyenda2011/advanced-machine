@@ -224,6 +224,84 @@ class AdaptiveGCL(BaseRecommender):
         proj = self.text_proj(new_text_features.float().to(device))
         return F.normalize(proj, dim=-1)
 
+    @torch.no_grad()
+    def collect_diagnostics(
+        self,
+        item_indices: Optional[torch.Tensor] = None,
+        user_indices: Optional[torch.Tensor] = None,
+    ) -> dict[str, float]:
+        """Collect lightweight, deterministic representation diagnostics.
+
+        The caller supplies fixed indices and invokes this after validation.
+        No random operation, parameter update or persistent cache mutation is
+        performed, so enabling diagnostics cannot change the training path.
+        """
+        device = self.user_embedding.weight.device
+        if item_indices is None:
+            item_indices = torch.arange(min(self.num_items, 4096), device=device)
+        else:
+            item_indices = item_indices.to(device=device, dtype=torch.long)
+        if user_indices is None:
+            user_indices = torch.arange(min(self.num_users, 4096), device=device)
+        else:
+            user_indices = user_indices.to(device=device, dtype=torch.long)
+
+        diagnostics: dict[str, float] = {}
+        if self.layer_aggregation == "mean":
+            layer_weights = torch.full(
+                (self.num_layers + 1,), 1.0 / (self.num_layers + 1), device=device
+            )
+        else:
+            layer_weights = F.softmax(self.layer_attention_weights, dim=0)
+        entropy = -(layer_weights * torch.log(layer_weights.clamp_min(1e-12))).sum()
+        for index, value in enumerate(layer_weights):
+            diagnostics[f"layer_weight_{index}"] = float(value.item())
+        diagnostics["layer_weight_entropy"] = float(entropy.item())
+
+        if item_indices.numel() and self.use_item_text:
+            item_id = self.item_embedding.weight[item_indices]
+            item_text = self.text_proj(self.text_features[item_indices])
+            gate = self.gate_mlp(torch.cat([item_id, item_text], dim=-1))
+            usable = self.item_text_mask[item_indices]
+            gate = torch.where(usable[:, None], gate, torch.ones_like(gate))
+            id_contrib = gate * item_id
+            text_contrib = (1.0 - gate) * item_text
+            usable_gate = gate[usable]
+            if usable_gate.numel():
+                diagnostics["gate_mean"] = float(usable_gate.mean().item())
+                diagnostics["gate_p10"] = float(torch.quantile(usable_gate, 0.10).item())
+                diagnostics["gate_p90"] = float(torch.quantile(usable_gate, 0.90).item())
+                diagnostics["gate_near_zero_fraction"] = float((usable_gate < 0.1).float().mean().item())
+                diagnostics["gate_near_one_fraction"] = float((usable_gate > 0.9).float().mean().item())
+            diagnostics["item_id_norm_mean"] = float(item_id.norm(dim=-1).mean().item())
+            diagnostics["item_text_norm_mean"] = float(item_text.norm(dim=-1).mean().item())
+            diagnostics["item_id_contribution_norm_mean"] = float(id_contrib.norm(dim=-1).mean().item())
+            diagnostics["item_text_contribution_norm_mean"] = float(text_contrib.norm(dim=-1).mean().item())
+            diagnostics["usable_item_text_fraction"] = float(usable.float().mean().item())
+        else:
+            diagnostics["gate_mean"] = 1.0
+            diagnostics["gate_p10"] = 1.0
+            diagnostics["gate_p90"] = 1.0
+            diagnostics["gate_near_zero_fraction"] = 0.0
+            diagnostics["gate_near_one_fraction"] = 1.0
+
+        if (
+            user_indices.numel()
+            and self.user_history_features is not None
+            and self.user_semantic_weight > 0
+        ):
+            user_id = self.user_embedding.weight[user_indices]
+            user_sem = self.user_semantic_mlp(self.user_history_features[user_indices])
+            usable_users = self.user_text_mask[user_indices]
+            weighted_sem = self.user_semantic_weight * torch.where(
+                usable_users[:, None], user_sem, torch.zeros_like(user_sem)
+            )
+            diagnostics["user_id_norm_mean"] = float(user_id.norm(dim=-1).mean().item())
+            diagnostics["user_semantic_norm_mean"] = float(user_sem.norm(dim=-1).mean().item())
+            diagnostics["user_semantic_weighted_norm_mean"] = float(weighted_sem.norm(dim=-1).mean().item())
+            diagnostics["usable_user_text_fraction"] = float(usable_users.float().mean().item())
+        return diagnostics
+
     def _apply_node_dropout(self, norm_adj: torch.Tensor) -> torch.Tensor:
         """Apply random node dropout during training to create contrastive views."""
         adj = norm_adj.coalesce()
@@ -332,12 +410,26 @@ class AdaptiveGCL(BaseRecommender):
         cached_proj_text: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute Cross-Modal InfoNCE loss between graph topological embeddings and text features."""
+        _, weighted = self.compute_semantic_ssl_components(
+            batch_items, final_items, cached_proj_text=cached_proj_text
+        )
+        return weighted
+
+    def compute_semantic_ssl_components(
+        self,
+        batch_items: torch.Tensor,
+        final_items: torch.Tensor,
+        cached_proj_text: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return raw and weighted semantic SSL losses for diagnostics."""
         if self.ssl_reg == 0:
-            return final_items.sum() * 0.0
+            zero = final_items.sum() * 0.0
+            return zero, zero
         unique_items = torch.unique(batch_items)
         unique_items = unique_items[self.item_text_mask[unique_items]]
         if unique_items.numel() < 2:
-            return final_items.sum() * 0.0
+            zero = final_items.sum() * 0.0
+            return zero, zero
         graph_i_emb = final_items[unique_items]
 
         if cached_proj_text is not None:
@@ -345,7 +437,7 @@ class AdaptiveGCL(BaseRecommender):
         else:
             proj_batch = self.text_proj(self.text_features[unique_items])
 
-        loss = self.debiased_ssl.compute_debiased_contrastive_loss(
+        raw_loss = self.debiased_ssl.compute_debiased_contrastive_loss(
             graph_i_emb, proj_batch
         )
-        return self.ssl_reg * loss
+        return raw_loss, self.ssl_reg * raw_loss

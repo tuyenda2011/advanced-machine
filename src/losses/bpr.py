@@ -37,18 +37,26 @@ class BPRLoss(nn.Module):
         # BPR Loss: -log(sigmoid(pos_score - neg_score)) = softplus(-(pos_score - neg_score))
         bpr_loss = torch.mean(F.softplus(neg_scores - pos_scores))
 
+        reg_loss = self.compute_regularization(u_emb0, pos_emb0, neg_emb0, pos_scores.shape[0])
+        total_loss = bpr_loss + self.weight_decay * reg_loss
+        return total_loss, bpr_loss
+
+    def compute_regularization(
+        self,
+        u_emb0: torch.Tensor,
+        pos_emb0: torch.Tensor,
+        neg_emb0: torch.Tensor | None,
+        batch_size: int | None = None,
+    ) -> torch.Tensor:
+        """Return the raw embedding regularizer before ``weight_decay``.
+
+        Keeping this calculation next to ``forward`` makes the logged loss
+        decomposition exactly match the objective used for optimization.
+        """
         embeddings = [u_emb0, pos_emb0]
         if neg_emb0 is not None:
             embeddings.append(neg_emb0)
         if self.regularization == "selfrec":
-            # SELFRec/util/loss_torch.py: sum(norm(embedding) / batch_size).
-            reg_loss = sum(
-                embedding.norm(2) / embedding.shape[0] for embedding in embeddings
-            )
-        else:
-            reg_loss = sum(embedding.norm(2).pow(2) for embedding in embeddings) / (
-                2.0 * pos_scores.shape[0]
-            )
-
-        total_loss = bpr_loss + self.weight_decay * reg_loss
-        return total_loss, bpr_loss
+            return sum(embedding.norm(2) / embedding.shape[0] for embedding in embeddings)
+        size = int(batch_size or pos_emb0.shape[0])
+        return sum(embedding.norm(2).pow(2) for embedding in embeddings) / (2.0 * size)

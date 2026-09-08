@@ -1,5 +1,7 @@
+import argparse
 import os
 import sys
+from pathlib import Path
 
 # Ensure project root is in sys.path when script is executed directly
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -13,10 +15,9 @@ if hasattr(sys.stderr, "reconfigure"):
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import seaborn as sns
-
 
 from src.utils.logging import setup_logger
+from src.utils.paths import PROJECT_ROOT, find_latest_run_root, resolve_path
 
 logger = setup_logger("generate_plots")
 
@@ -46,7 +47,7 @@ def plot_radar_chart(df100: pd.DataFrame, fig_dir: str):
     angles = np.linspace(0, 2 * np.pi, num_vars, endpoint=False).tolist()
     angles += angles[:1] # complete loop
 
-    fig, ax = plt.subplots(figsize=(7, 7), subplot_kw=dict(polar=True))
+    fig, ax = plt.subplots(figsize=(7, 7), subplot_kw={"polar": True})
 
     colors = {
         "lightgcn": "#1f77b4",
@@ -113,8 +114,34 @@ def plot_radar_chart(df100: pd.DataFrame, fig_dir: str):
     logger.info(f"Saved figure: {filename}")
 
 
-def main():
-    fig_dir = os.path.join("results", "figures")
+def main(input_root=None, output_root=None):
+    """Generate plots from one run root.
+
+    When no root is supplied, the newest benchmark run is selected and the
+    legacy ``results`` tree is used only as a fallback.
+    """
+    if input_root is None:
+        cwd_root = Path.cwd() / "results"
+        canonical_root = find_latest_run_root(
+            required_relative_path=os.path.join("aggregated", "benchmark_summary.csv"),
+            preferred_kinds=("benchmark", "train_all"),
+        )
+        if Path.cwd().resolve() == PROJECT_ROOT.resolve():
+            input_root = canonical_root or cwd_root
+        else:
+            input_root = (
+                cwd_root
+                if (cwd_root / "aggregated" / "benchmark_summary.csv").exists()
+                else canonical_root or PROJECT_ROOT / "results"
+            )
+    else:
+        input_root = resolve_path(input_root)
+    if output_root is None:
+        output_root = input_root
+    else:
+        output_root = resolve_path(output_root)
+
+    fig_dir = os.path.join(output_root, "figures")
     os.makedirs(fig_dir, exist_ok=True)
 
     colors = {
@@ -133,7 +160,7 @@ def main():
     }
 
     # 1. Always generate Training Learning Curves if history records exist
-    history_dir = os.path.join("results", "history")
+    history_dir = os.path.join(input_root, "history")
     if os.path.exists(history_dir):
         history_paths = []
         for root, _, files in os.walk(history_dir):
@@ -176,7 +203,7 @@ def main():
             logger.info(f"Saved figure: {filename}")
 
     # 2. Benchmark Summary Figures (if benchmark summary exists)
-    agg_csv = os.path.join("results", "aggregated", "benchmark_summary.csv")
+    agg_csv = os.path.join(input_root, "aggregated", "benchmark_summary.csv")
     if not os.path.exists(agg_csv):
         logger.info(f"Full benchmark summary {agg_csv} not found yet (will be generated when running benchmark_all.py).")
         return
@@ -343,4 +370,16 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Generate plots from a benchmark run root.")
+    parser.add_argument(
+        "--input_root",
+        default=None,
+        help="Run root containing history/ and aggregated/. Defaults to newest benchmark run.",
+    )
+    parser.add_argument(
+        "--output_root",
+        default=None,
+        help="Run root receiving figures/. Defaults to --input_root.",
+    )
+    cli_args = parser.parse_args()
+    main(input_root=cli_args.input_root, output_root=cli_args.output_root)

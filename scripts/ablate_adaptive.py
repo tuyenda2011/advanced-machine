@@ -7,7 +7,6 @@ import json
 import pickle
 import sys
 from copy import deepcopy
-from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +24,7 @@ from src.training.trainer import Trainer
 from src.utils.checkpoints import get_experiment_fingerprint
 from src.utils.config import load_config
 from src.utils.config_schemas import validate_model_config
+from src.utils.paths import resolve_output_root, write_run_manifest
 from src.utils.seed import set_seed
 
 # One factor at a time, relative to the loaded full configuration.
@@ -103,13 +103,7 @@ def run(args):
         print("Dry-run only. Pass --run to train; no data or artifacts were written.")
         return []
 
-    output = (
-        Path(args.output_dir)
-        if args.output_dir
-        else ROOT
-        / "results/ablations"
-        / datetime.now(timezone.utc).strftime("adaptive-%Y%m%dT%H%M%SZ")
-    )
+    output = resolve_output_root(args.output_dir, kind="ablation")
     if output.exists():
         raise FileExistsError(f"Refusing to overwrite ablation output: {output}")
     processed = Path(base["dataset"]["processed_dir"])
@@ -132,6 +126,17 @@ def run(args):
     code_hash = get_experiment_fingerprint("adaptive_gcl", config_dir=args.config_dir)
     runner_hash = sha256_file(Path(__file__))
     output.mkdir(parents=True, exist_ok=False)
+    write_run_manifest(
+        output,
+        kind="ablation",
+        metadata={
+            "variants": list(planned),
+            "densities": list(args.sparsities),
+            "seeds": list(args.seeds),
+            "epochs": args.epochs,
+            "validation_only": True,
+        },
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     results = []
     for seed in args.seeds:

@@ -8,6 +8,7 @@ import os
 import pickle
 import sys
 import time
+from pathlib import Path
 
 # Ensure project root is in sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -19,21 +20,27 @@ import torch
 import torch.nn.functional as F
 
 from src.data.sparsity import create_sparse_train_set
-from src.data.text_encoder import build_user_history_features, load_training_text, DEFAULT_ENCODER, PINNED_REVISION, format_item_text
-from src.models.adaptive_gcl import AdaptiveGCL
-from src.evaluation.metrics import compute_intra_list_diversity
+from src.data.text_encoder import (
+    DEFAULT_ENCODER,
+    PINNED_REVISION,
+    build_user_history_features,
+    format_item_text,
+    load_training_text,
+)
 from src.evaluation.evaluator import EVALUATION_PROTOCOL
+from src.evaluation.metrics import compute_intra_list_diversity
+from src.models.adaptive_gcl import AdaptiveGCL
 from src.models.directau import DirectAU
 from src.models.lightgcn import LightGCN
 from src.models.xsimgcl import XSimGCL
 from src.serving.ann_indexer import VectorIndexer
 from src.serving.recommendations import recommend_exact
-from src.utils.config import load_config
 from src.utils.checkpoints import (
     get_checkpoint_path,
     get_run_fingerprint,
 )
-
+from src.utils.config import load_config
+from src.utils.paths import PROJECT_ROOT, find_latest_run_root
 
 # Custom CSS
 st.markdown("""
@@ -155,7 +162,13 @@ def load_trained_model(model_name: str, num_users: int, num_items: int, sparsity
             layer_aggregation=ada_cfg.get("layer_aggregation", "learnable"),
         )
 
-    checkpoint_path = get_checkpoint_path(model_name, sparsity, seed)
+    run_root = find_latest_run_root(model_name=model_name, sparsity=sparsity, seed=seed)
+    checkpoint_path = get_checkpoint_path(
+        model_name,
+        sparsity,
+        seed,
+        root=str(run_root) if run_root is not None else "results",
+    )
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(
             f"No checkpoint for {model_name}, sparsity={sparsity}, seed={seed}. "
@@ -384,7 +397,12 @@ def main():
     with tabs[1]:
         st.header("Benchmark Results & Statistical Analysis")
 
-        agg_csv = os.path.join("results", "aggregated", "benchmark_summary.csv")
+        benchmark_root = find_latest_run_root(
+            required_relative_path=os.path.join("aggregated", "benchmark_summary.csv"),
+            preferred_kinds=("benchmark", "train_all"),
+        ) or PROJECT_ROOT / "results"
+        benchmark_root = Path(benchmark_root)
+        agg_csv = benchmark_root / "aggregated" / "benchmark_summary.csv"
 
         if os.path.exists(agg_csv):
             df_res = pd.read_csv(agg_csv)
@@ -393,14 +411,14 @@ def main():
             st.dataframe(df_res, use_container_width=True)
 
             st.subheader("Statistical Significance Tests")
-            sig_csv = os.path.join("results", "aggregated", "statistical_significance.csv")
+            sig_csv = benchmark_root / "aggregated" / "statistical_significance.csv"
             if os.path.exists(sig_csv):
                 df_sig = pd.read_csv(sig_csv)
                 st.dataframe(df_sig, use_container_width=True)
                 st.caption("Xem Holm-adjusted p-value; kết quả dưới 5 seed chỉ mang tính thăm dò.")
 
             st.subheader("LaTeX Export")
-            tex_file = os.path.join("results", "aggregated", "benchmark_table.tex")
+            tex_file = benchmark_root / "aggregated" / "benchmark_table.tex"
             if os.path.exists(tex_file):
                 with open(tex_file, "r", encoding="utf-8") as f:
                     tex_code = f.read()
@@ -410,14 +428,17 @@ def main():
             st.subheader("Visualization Charts")
             c1, c2, c3 = st.columns(3)
             with c1:
-                if os.path.exists("results/figures/recall_10_by_model.png"):
-                    st.image("results/figures/recall_10_by_model.png", caption="Recall@10")
+                figure = benchmark_root / "figures" / "recall_10_by_model.png"
+                if figure.exists():
+                    st.image(str(figure), caption="Recall@10")
             with c2:
-                if os.path.exists("results/figures/diversity_10_by_model.png"):
-                    st.image("results/figures/diversity_10_by_model.png", caption="Diversity@10")
+                figure = benchmark_root / "figures" / "diversity_10_by_model.png"
+                if figure.exists():
+                    st.image(str(figure), caption="Diversity@10")
             with c3:
-                if os.path.exists("results/figures/novelty_10_by_model.png"):
-                    st.image("results/figures/novelty_10_by_model.png", caption="Novelty@10")
+                figure = benchmark_root / "figures" / "novelty_10_by_model.png"
+                if figure.exists():
+                    st.image(str(figure), caption="Novelty@10")
         else:
             st.info("📁 No benchmark results yet. Run `python scripts/benchmark_all.py` first.")
 
@@ -433,15 +454,17 @@ def main():
 
         c1, c2 = st.columns(2)
         with c1:
-            if os.path.exists("results/figures/alignment_vs_uniformity.png"):
-                st.image("results/figures/alignment_vs_uniformity.png",
+            figure = benchmark_root / "figures" / "alignment_vs_uniformity.png"
+            if figure.exists():
+                st.image(str(figure),
                         caption="Alignment vs Uniformity Pareto Frontier")
             else:
                 st.info("Run `scripts/generate_plots.py` to generate figures")
 
         with c2:
-            if os.path.exists("results/figures/beyond_accuracy_radar.png"):
-                st.image("results/figures/beyond_accuracy_radar.png",
+            figure = benchmark_root / "figures" / "beyond_accuracy_radar.png"
+            if figure.exists():
+                st.image(str(figure),
                         caption="6-Dimensional Radar Profile")
             else:
                 st.info("Run `scripts/generate_plots.py` to generate figures")
@@ -457,20 +480,22 @@ def main():
 
         c1, c2 = st.columns(2)
         with c1:
-            if os.path.exists("results/figures/sparsity_recall_10_curve.png"):
-                st.image("results/figures/sparsity_recall_10_curve.png",
+            figure = benchmark_root / "figures" / "sparsity_recall_10_curve.png"
+            if figure.exists():
+                st.image(str(figure),
                         caption="Sparsity vs Recall@10")
             else:
                 st.info("Run benchmark to generate sparsity curves")
 
         with c2:
-            if os.path.exists("results/figures/subgroup_tail_vs_head.png"):
-                st.image("results/figures/subgroup_tail_vs_head.png",
+            figure = benchmark_root / "figures" / "subgroup_tail_vs_head.png"
+            if figure.exists():
+                st.image(str(figure),
                         caption="Tail vs Head Performance")
             else:
                 st.info("Run benchmark to generate subgroup analysis")
 
-        drop_csv = os.path.join("results", "aggregated", "sparsity_drop25_summary.csv")
+        drop_csv = benchmark_root / "aggregated" / "sparsity_drop25_summary.csv"
         if os.path.exists(drop_csv):
             st.subheader("Performance Degradation at 25% Sparsity")
             st.dataframe(pd.read_csv(drop_csv), use_container_width=True)

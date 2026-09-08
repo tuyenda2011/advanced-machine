@@ -25,6 +25,7 @@ from src.utils.checkpoints import (
     write_run_status,
 )
 from src.utils.logging import setup_logger
+from src.utils.paths import resolve_output_root, write_run_manifest
 
 logger = setup_logger("train_all_models")
 
@@ -75,7 +76,11 @@ def main():
         help="Skip automatic research figure generation after completion",
     )
     parser.add_argument("--dry_run", action="store_true", help="List planned runs without training")
-    parser.add_argument("--output_root", default="results")
+    parser.add_argument(
+        "--output_root",
+        default=None,
+        help="Root for this sweep. Defaults to results/runs/train_all_<timestamp>/.",
+    )
     parser.add_argument("--config_dir", default="configs")
     args = parser.parse_args()
     if len(set(args.models)) != len(args.models):
@@ -86,16 +91,31 @@ def main():
         parser.error("Invalid epochs, seed or sparsity")
     if len(set(sparsity_list)) != len(sparsity_list):
         parser.error("Duplicate sparsities are not allowed")
+    if args.resume and not args.output_root:
+        parser.error("--resume requires an explicit --output_root")
+    args.output_root = str(resolve_output_root(args.output_root, kind="train_all"))
     if args.dry_run:
-        print(json.dumps({"models": args.models, "sparsities": sparsity_list, "seed": args.seed, "epochs": args.epochs, "runs": len(args.models)*len(sparsity_list)}, indent=2))
+        print(json.dumps({"models": args.models, "sparsities": sparsity_list, "seed": args.seed, "epochs": args.epochs, "runs": len(args.models)*len(sparsity_list), "output_root": args.output_root}, indent=2))
         return
     start_total_time = time.perf_counter()
 
+    write_run_manifest(
+        args.output_root,
+        kind="train_all",
+        metadata={
+            "models": list(args.models),
+            "densities": sparsity_list,
+            "seed": args.seed,
+            "epochs": args.epochs,
+            "validation_only": False,
+        },
+    )
+
     print("=" * 85)
-    print("🚀 GRAPH RECSYS SUITE: SEQUENTIAL 4-MODEL MULTI-SPARSITY RUNNER")
-    print(f"📅 Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"🎯 Target Models: {', '.join([m.upper() for m in args.models])}")
-    print(f"📊 Sparsity Levels: {', '.join([f'{int(s*100)}%' for s in sparsity_list])} | Seed: {args.seed}")
+    print("GRAPH RECSYS SUITE: SEQUENTIAL 4-MODEL MULTI-SPARSITY RUNNER")
+    print(f"Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Target Models: {', '.join([m.upper() for m in args.models])}")
+    print(f"Sparsity Levels: {', '.join([f'{int(s*100)}%' for s in sparsity_list])} | Seed: {args.seed}")
     print(f"⏱️ Epochs per Model: {args.epochs}")
     print("=" * 85, flush=True)
 
@@ -177,7 +197,7 @@ def main():
     # Display comparison table
     if completed_runs:
         print("\n" + "=" * 105)
-        print("🏆 4-MODEL BENCHMARK RESULTS COMPARISON")
+        print("4-MODEL BENCHMARK RESULTS COMPARISON")
         print("=" * 105)
 
         summary_rows = []
@@ -219,20 +239,20 @@ def main():
         )
         all_models_csv = os.path.join(agg_dir, comparison_filename)
         summary_df.to_csv(all_models_csv, index=False)
-        print(f"\n📁 Saved comparative table to: {all_models_csv}")
+        print(f"\nSaved comparative table to: {all_models_csv}")
 
     # Generate research figures unless disabled
-    if not args.no_plots and args.output_root == "results":
-        print("\n📊 Generating research comparison figures & learning curves...", flush=True)
+    if not args.no_plots:
+        print("\nGenerating research comparison figures & learning curves...", flush=True)
         try:
             from scripts.generate_plots import main as generate_figures
-            generate_figures()
-            print("✅ Figures saved to results/figures/", flush=True)
+            generate_figures(input_root=args.output_root, output_root=args.output_root)
+            print(f"[OK] Figures saved to {os.path.join(args.output_root, 'figures')}/", flush=True)
         except Exception as e:
             logger.warning(f"Could not generate plots: {e}")
 
     print("\n" + "=" * 85)
-    print(f"🎉 ALL {len(completed_runs)} RUNS FINISHED IN {total_elapsed/60:.2f} MINUTES!")
+    print(f"ALL {len(completed_runs)} RUNS FINISHED IN {total_elapsed/60:.2f} MINUTES!")
     print("=" * 85, flush=True)
 
 

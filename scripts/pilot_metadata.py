@@ -7,7 +7,6 @@ import importlib.util
 import json
 import pickle
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +28,7 @@ from src.models.adaptive_gcl import AdaptiveGCL
 from src.training.trainer import Trainer
 from src.utils.checkpoints import get_experiment_fingerprint
 from src.utils.config import load_config
+from src.utils.paths import resolve_output_root, write_run_manifest
 from src.utils.seed import set_seed
 
 
@@ -173,14 +173,19 @@ def run(args):
     )
     if args.prepare_only:
         return
-    output = (
-        Path(args.output_dir)
-        if args.output_dir
-        else ROOT
-        / "results/pilots"
-        / datetime.now(timezone.utc).strftime("metadata-%Y%m%dT%H%M%SZ")
-    )
+    output = resolve_output_root(args.output_dir, kind="pilot")
     output.mkdir(parents=True, exist_ok=False)
+    write_run_manifest(
+        output,
+        kind="pilot",
+        metadata={
+            "variants": list(args.variants),
+            "densities": list(args.sparsities),
+            "seed": args.seed,
+            "epochs": args.epochs,
+            "validation_only": True,
+        },
+    )
     (output / "reference.json").write_text(
         json.dumps(identity, indent=2), encoding="utf-8"
     )
