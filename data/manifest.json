@@ -28,15 +28,15 @@
     },
     {
       "path": "data/processed/mappings.pkl",
-      "sha256": "b770dbc88b3e5a49874ddc0cad8dbf823f24572255729d822f1485c32ded0051"
+      "sha256": "070e326a7135727eda18f3af38b9bd5d98436bb8b07734f8bf3406d9235a5a5c"
     },
     {
       "path": "data/processed/item_text_embeddings.pt",
-      "sha256": "4d6e6ccd9dc0a21366424c03b5697fb2d42110a163e5c7d5e476f30f85402e6d"
+      "sha256": "8946cd45401d5b55dff816422457a5c2dda658dc685a92281b6cac6a05e5c21a"
     },
     {
       "path": "data/processed/item_text_embeddings.pt.json",
-      "sha256": "325fd672e9ff7d12c114f615924fbe6c015537ca071197bd68c02ef47a0b5f10"
+      "sha256": "e2b618ac8b4e8926febcf0c8c3cbc1e20db548b9de813380a33e2d2a14cf1c0e"
     },
     {
       "path": "data/processed/disliked_interactions.parquet",
@@ -80,12 +80,12 @@
     "metadata_quality": {
       "num_items": 44843,
       "missing_or_fallback_titles": 888,
-      "missing_or_unknown_brands": 22423,
+      "missing_or_unknown_brands": 7988,
       "generic_or_missing_categories": 0,
       "missing_title_fraction": 0.019802421782663962,
-      "missing_brand_fraction": 0.500033450036795,
-      "complete_metadata": 22400,
-      "partial_metadata": 22443,
+      "missing_brand_fraction": 0.17813259594585554,
+      "complete_metadata": 36835,
+      "partial_metadata": 8008,
       "no_usable_text": 0,
       "category_only_text": 868
     },
@@ -220,12 +220,32 @@
       "sha256": "2a65656f4101c5fd3ca5c44c7769455597aa908be7954fcde1992d85b70c71e6",
       "applied": 18,
       "entries": 38
+    },
+    "metadata_resolution": {
+      "raw_meta_records": 498196,
+      "raw_meta_records_with_brand": 137962,
+      "filtered_asin_count": 44843,
+      "filtered_asin_matched": 44843,
+      "matched_items_with_brand": 22382,
+      "processed_brands_before": 37039,
+      "processed_brands_after": 36855,
+      "brand_sources": {
+        "metadata": 22382,
+        "title_fallback": 14435,
+        "missing": 7988,
+        "override": 38
+      },
+      "title_sources": {
+        "metadata": 43955,
+        "missing": 888
+      },
+      "fallback_policy": "official_brand_frequency_ge3_length_ge4_title_prefix_v1"
     }
   },
   "text_features": {
     "format_version": 3,
     "metadata_policy": "title_or_brand_or_specific_category_v1",
-    "input_fingerprint": "a55e2b22270ab59f6ec6d73d7491b4507753060d4ca073ad200f6fa745dd38f6",
+    "input_fingerprint": "a14db356fb4ca4070e8c4266eea25932cc06ba7fadd647822e76bfa23d024f1a",
     "model_name": "sentence-transformers/all-MiniLM-L6-v2",
     "revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
     "resolved_revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
@@ -234,7 +254,7 @@
       44843,
       384
     ],
-    "sha256": "4d6e6ccd9dc0a21366424c03b5697fb2d42110a163e5c7d5e476f30f85402e6d",
+    "sha256": "8946cd45401d5b55dff816422457a5c2dda658dc685a92281b6cac6a05e5c21a",
     "software_versions": {
       "sentence-transformers": "6.0.0",
       "transformers": "5.15.1",

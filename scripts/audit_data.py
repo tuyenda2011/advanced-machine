@@ -195,6 +195,9 @@ def main(processed_dir=None, manifest_path=None) -> int:
     sparsity_report = {}
     for ratio in (1.0, 0.75, 0.5, 0.25):
         sparse = create_sparse_train_set(train, ratio, seed=42)
+        repeated = create_sparse_train_set(train, ratio, seed=42)
+        if not sparse.equals(repeated):
+            errors.append(f"Sparsity {ratio}: sampling is not reproducible")
         coverage_ok = set(sparse["u_idx"]) == train_users and set(sparse["i_idx"]) == train_items
         count_ok = len(sparse) == round(len(train) * ratio)
         sparsity_report[str(ratio)] = {"edges": len(sparse), "coverage_preserved": coverage_ok, "exact_count": count_ok}
@@ -219,6 +222,23 @@ def main(processed_dir=None, manifest_path=None) -> int:
     }
     report_path = processed_dir / "audit_report.json"
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    from src.data.quality_report import quality_report
+    quality = quality_report(frames["train"], frames["validation"], frames["test"], mappings["item_metadata"])
+    quality["metadata"] = mappings.get("stats", {}).get("metadata_resolution", {})
+    quality["metadata_quality_after"] = metadata_quality
+    quality["brand_coverage"] = 1 - metadata_quality["missing_brand_fraction"]
+    quality["title_coverage"] = 1 - metadata_quality["missing_title_fraction"]
+    quality["sparsity_levels"] = sparsity_report
+    quality_path = processed_dir / "data_quality_report.json"
+    if quality_path.exists():
+        previous = json.loads(quality_path.read_text(encoding="utf-8"))
+        for key, value in quality.items():
+            if isinstance(value, dict) and isinstance(previous.get(key), dict):
+                quality[key] = {**previous[key], **value}
+        previous.update(quality)
+        quality = previous
+    quality_path.write_text(json.dumps(quality, indent=2), encoding="utf-8")
 
     print("=== DATA AUDIT ===")
     print(json.dumps(report, indent=2))

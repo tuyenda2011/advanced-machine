@@ -100,6 +100,7 @@ def get_df_from_json_gz(path: str, desc: str | None = None) -> pd.DataFrame:
                         }
                     )
                 continue
+            record["raw_row_id"] = ledger["total_lines"] - 1
             data.append(record)
             ledger["parsed_rows"] += 1
     if ledger["invalid_lines"]:

@@ -5,6 +5,11 @@ stages:
       - scripts/prepare_data.py
       - src/data/loader.py
       - src/data/preprocessing.py
+      - src/data/metadata_resolution.py
+      - src/data/metadata_overrides.py
+      - src/data/quality_report.py
+      - scripts/audit_data.py
+      - data/metadata_overrides.csv
       - src/data/splitter.py
       - src/data/text_encoder.py
       - src/data/negative_collector.py
@@ -21,6 +26,7 @@ stages:
       - data/processed/item_text_embeddings.pt
       - data/processed/item_text_embeddings.pt.json
       - data/processed/disliked_interactions.parquet
+      - data/processed/data_quality_report.json
 
   audit:
     cmd: python scripts/audit_data.py

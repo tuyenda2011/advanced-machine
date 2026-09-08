@@ -217,8 +217,10 @@ def main():
     top_k_list = config["evaluation"]["top_k"]
     eval_batch_size = config["evaluation"]["eval_batch_size"]
     candidate_items = set(train_df_sparse["i_idx"].unique())
-    val_warm = val_df[val_df["i_idx"].isin(candidate_items)].reset_index(drop=True)
-    test_warm = None if test_df is None else test_df[test_df["i_idx"].isin(candidate_items)].reset_index(drop=True)
+    from src.data.quality_report import warm_cohort
+    val_warm, val_cohort = warm_cohort(train_df_sparse, val_df)
+    test_warm, test_cohort = (None, None) if test_df is None else warm_cohort(train_df_sparse, test_df)
+    logger.info("Evaluation protocol: warm-start; validation cohort=%s; test cohort=%s", val_cohort, test_cohort)
     logger.info(
         f"Warm-start evaluation targets: val={len(val_warm):,}/{len(val_df):,}, "
         f"test={len(test_warm) if test_warm is not None else 'not read'}"
@@ -349,6 +351,9 @@ def main():
     results["text_policy"] = "masked_text" if args.model == "adaptive_gcl" else None
     results["evaluation_protocol"] = EVALUATION_PROTOCOL
     results["evaluation_metadata"] = {
+        "main_metric_cohort": "warm_start_users_and_items",
+        "validation_cohort": val_cohort,
+        "test_cohort": test_cohort,
         "history_mask_policy": "full_train_for_val_full_train_plus_val_for_test",
         "sparsity_scope": "model_training_graph_only",
         "popularity_reference": "full_train_unique_users",

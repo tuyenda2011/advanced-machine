@@ -43,6 +43,7 @@ def metadata_flags(meta: dict) -> dict:
         UNKNOWN_PLACEHOLDER,
         "electronics product",
         "unknown electronics product",
+        "nan", "none", "null", "n/a",
     }
     title = clean_text(meta.get("title"))
     brand = clean_text(meta.get("brand"))
@@ -71,7 +72,7 @@ def metadata_flags(meta: dict) -> dict:
 
 def summarize_metadata_quality(item_metadata: dict) -> dict:
     """Count missing/fallback fields without treating placeholders as real text."""
-    missing_values = {"", "unknown", UNKNOWN_PLACEHOLDER}
+    missing_values = {"", "unknown", UNKNOWN_PLACEHOLDER, "nan", "none", "null", "n/a"}
     titles = brands = generic_categories = 0
     for meta in item_metadata.values():
         title = str(meta.get("title", "")).strip()
@@ -163,7 +164,10 @@ def preprocess_amazon_electronics(
     )
 
     # 1. Filter implicit positive feedback
-    df = ratings_df[ratings_df["rating"] >= positive_threshold].copy()
+    interaction_columns = ["user_id", "item_id", "rating", "timestamp"]
+    if "raw_row_id" in ratings_df:
+        interaction_columns.append("raw_row_id")
+    df = ratings_df.loc[ratings_df["rating"] >= positive_threshold, interaction_columns].copy()
     logger.info(
         f"Retained {len(df)} positive interactions out of {len(ratings_df)} total ratings."
     )
@@ -171,7 +175,7 @@ def preprocess_amazon_electronics(
     # 2. De-duplication: For identical (user_id, item_id), keep the most recent
     # interaction; tie-break by highest rating (spec: [timestamp DESC, rating DESC]).
     initial_len = len(df)
-    df = df.sort_values(by=["timestamp", "rating"], ascending=[False, False])
+    df = df.sort_values(by=["timestamp", "rating"], ascending=[False, False], kind="stable")
     df = df.drop_duplicates(subset=["user_id", "item_id"], keep="first").copy()
     num_dups = initial_len - len(df)
     ledger: dict[str, Any] = {

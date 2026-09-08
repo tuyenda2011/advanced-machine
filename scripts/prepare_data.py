@@ -2,9 +2,12 @@ import argparse
 import json
 import os
 import pickle
+import shutil
 import sys
+import tempfile
 from datetime import datetime, timezone
 from importlib.metadata import version
+from pathlib import Path
 
 # Ensure project root is in sys.path when script is executed directly
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -166,6 +169,13 @@ def main():
     data_cfg = config["dataset"]
     if args.output_dir:
         data_cfg["processed_dir"] = args.output_dir
+    destination = Path(data_cfg["processed_dir"]).resolve()
+    destination_manifest = Path(args.manifest_path or os.path.join(REPO_ROOT, "data/manifest.json")).resolve()
+    stage_root = Path(REPO_ROOT) / ".tmp"
+    stage_root.mkdir(exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix="prepare-", dir=stage_root))
+    data_cfg["processed_dir"] = str(staging)
+    args.manifest_path = str(staging / "manifest.json")
 
     # 1. Download data
     dataset_dir = download_amazon_electronics(
@@ -190,6 +200,8 @@ def main():
                                  "metadata": items_df.attrs.get("ingestion_ledger", {})}
 
     stats["metadata_overrides"] = apply_brand_overrides(item_metadata)
+    from src.data.metadata_resolution import resolve_metadata
+    stats["metadata_resolution"] = resolve_metadata(item_metadata, items_df, os.path.join(REPO_ROOT, "data/metadata_overrides.csv"))
     stats["metadata_quality"] = summarize_metadata_quality(item_metadata)
 
     # 4. Validate cleaned metadata & interactions
@@ -307,9 +319,41 @@ def main():
     )
 
     logger.info(f"All processed data and mappings saved to {processed_dir}")
+    from src.data.quality_report import quality_report
+    report = quality_report(train_df, val_df, test_df, item_metadata)
+    report["metadata"] = stats["metadata_resolution"]
+    report["metadata_quality_after"] = stats["metadata_quality"]
+    report["ratings"] = {"total_raw_reviews": len(ratings_df),
+                         "positive_reviews": int((ratings_df["overall"] >= 4).sum()),
+                         "ratings_below_4": int((ratings_df["overall"] < 4).sum()),
+                         "positive_ratio": float((ratings_df["overall"] >= 4).mean())}
+    with open(os.path.join(processed_dir, "data_quality_report.json"), "w", encoding="utf-8") as stream:
+        json.dump(report, stream, indent=2)
     logger.info("Dataset statistics summary:")
     for k, v in stats.items():
         logger.info(f"  {k}: {v}")
+
+    from scripts.audit_data import main as audit_dataset
+    if audit_dataset(staging, staging / "manifest.json"):
+        raise ValueError(f"Staged dataset failed audit; active data untouched. Inspect {staging}")
+    staged_manifest = json.loads((staging / "manifest.json").read_text(encoding="utf-8"))
+    for entry in staged_manifest["artifacts"]:
+        entry["path"] = os.path.relpath(destination / Path(entry["path"]).name, REPO_ROOT).replace("\\", "/")
+    (staging / "manifest.json").write_text(json.dumps(staged_manifest, indent=2), encoding="utf-8")
+    destination.mkdir(parents=True, exist_ok=True)
+    destination_manifest.parent.mkdir(parents=True, exist_ok=True)
+    backup = staging / "backup"
+    backup.mkdir()
+    for source in list(staging.iterdir()):
+        if not source.is_file():
+            continue
+        target = destination_manifest if source.name == "manifest.json" else destination / source.name
+        if target.exists():
+            shutil.copy2(target, backup / source.name)
+        os.replace(source, target)
+    if (staging / "csv").exists():
+        shutil.copytree(staging / "csv", destination / "csv", dirs_exist_ok=True)
+    logger.info("Validated dataset published to %s; backup=%s", destination, backup)
 
 
 
