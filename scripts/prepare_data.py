@@ -10,14 +10,21 @@ from importlib.metadata import version
 from pathlib import Path
 
 # Ensure project root is in sys.path when script is executed directly
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-sys.path.insert(0, REPO_ROOT)
+REPO_ROOT = Path(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.insert(0, str(REPO_ROOT))
 
 import pandas as pd
 
+from src.data.bundle import rollback_bundle
 from src.data.loader import download_amazon_electronics, load_raw_data
 from src.data.metadata_overrides import apply_brand_overrides
+from src.data.metadata_resolution import write_brand_review_queue
 from src.data.negative_collector import extract_explicit_negative_interactions
+from src.data.pipeline import (
+    find_existing_full_bundle,
+    publish_legacy_staging,
+    run_metadata_only,
+)
 from src.data.preprocessing import (
     preprocess_amazon_electronics,
     summarize_metadata_quality,
@@ -31,9 +38,11 @@ from src.data.splitter import (
 )
 from src.data.text_encoder import PINNED_REVISION, encode_item_metadata
 from src.data.validation import (
+    summarize_raw_metadata_fields,
     validate_interactions,
     validate_metadata,
     validate_processed_interactions,
+    validate_raw_metadata,
 )
 from src.utils.config import load_config
 from src.utils.logging import setup_logger
@@ -72,6 +81,10 @@ def write_dataset_manifest(
         artifact_names += ["item_text_embeddings.pt", "item_text_embeddings.pt.json"]
     if os.path.exists(os.path.join(processed_dir, "disliked_interactions.parquet")):
         artifact_names.append("disliked_interactions.parquet")
+    if os.path.exists(os.path.join(processed_dir, "brand_review_queue.csv")):
+        artifact_names.append("brand_review_queue.csv")
+    if os.path.exists(os.path.join(processed_dir, "brand_review_sample.csv")):
+        artifact_names.append("brand_review_sample.csv")
     artifacts = [
         {"path": os.path.relpath(os.path.join(processed_dir, name), REPO_ROOT).replace("\\", "/"),
          "sha256": sha256_file(os.path.join(processed_dir, name))}
@@ -124,7 +137,8 @@ def write_dataset_manifest(
         },
         "text_features": {
             **text_provenance,
-            "encoder": "sentence-transformers/all-MiniLM-L6-v2",
+            "encoder": data_cfg.get("text_encoder", "sentence-transformers/all-MiniLM-L6-v2"),
+            "revision": data_cfg.get("text_encoder_revision", PINNED_REVISION),
             "shape": list(text_tensors.shape) if text_tensors is not None else None,
             "normalized": "usable_rows_unit_norm; masked_rows_zero" if text_tensors is not None else None,
         },
@@ -138,8 +152,64 @@ def write_dataset_manifest(
     logger.info(f"Dataset manifest written to {manifest_path}")
 
 
+def publish_validated_staging(staging, destination, destination_manifest, stage_root):
+    """Swap a complete validated directory and manifest as one transaction."""
+    staging = Path(staging)
+    destination = Path(destination)
+    destination_manifest = Path(destination_manifest)
+    if destination.resolve() == staging.resolve():
+        raise ValueError("Staging and destination must be different directories")
+    if destination_manifest.resolve().parent == destination.resolve():
+        raise ValueError("Manifest must be outside the processed artifact directory")
+
+    transaction = Path(tempfile.mkdtemp(prefix="publish-", dir=stage_root))
+    backup = transaction / "backup"
+    backup.mkdir()
+    previous_data = backup / "processed"
+    previous_manifest = backup / "manifest.json"
+    try:
+        if destination.exists():
+            os.replace(destination, previous_data)
+        if destination_manifest.exists():
+            shutil.copy2(destination_manifest, previous_manifest)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(staging, destination)
+        destination_manifest.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(destination / "manifest.json", destination_manifest)
+    except OSError:
+        failed = transaction / "failed"
+        failed.mkdir()
+        if destination.exists():
+            os.replace(destination, failed / "processed")
+        if previous_data.exists():
+            os.replace(previous_data, destination)
+        if previous_manifest.exists():
+            shutil.copy2(previous_manifest, destination_manifest)
+        raise
+    return backup
+
+
 def main():
     parser = argparse.ArgumentParser(description="Download and preprocess Amazon Electronics dataset")
+    parser.add_argument(
+        "--mode",
+        choices=("full", "metadata-only"),
+        default="full",
+        help="Build the full bundle or rebuild only metadata-dependent artifacts",
+    )
+    parser.add_argument(
+        "--bundle",
+        help="Base bundle for --mode metadata-only (default: data/current.json)",
+    )
+    parser.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="Build and audit a bundle in .tmp/data-pipeline without activating it",
+    )
+    parser.add_argument(
+        "--work_dir",
+        help="Stable staging output for DVC or CI (must be under .tmp/data-pipeline)",
+    )
     parser.add_argument("--config_dir", type=str, default="configs", help="Path to config dir")
     parser.add_argument("--output_dir", help="Optional staging directory for processed artifacts")
     parser.add_argument("--manifest_path", help="Manifest output (required with --output_dir)")
@@ -159,7 +229,19 @@ def main():
         "--export_csv",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Export human-readable inspection CSV files to data/processed/csv/ (default: True)",
+        help="Export human-readable inspection CSV files into the bundle (default: True)",
+    )
+    parser.add_argument(
+        "--csv_max_rows",
+        type=int,
+        default=500_000,
+        help="Maximum rows per CSV file before deterministic part splitting",
+    )
+    parser.add_argument(
+        "--inspection_rows",
+        type=int,
+        default=1_000,
+        help="Rows per split in inspection_sample.csv",
     )
     args = parser.parse_args()
     if args.output_dir and not args.manifest_path:
@@ -167,13 +249,49 @@ def main():
 
     config = load_config("lightgcn", args.config_dir)
     data_cfg = config["dataset"]
+    if args.mode == "metadata-only":
+        if args.output_dir or args.manifest_path:
+            parser.error("--output_dir/--manifest_path are legacy options and cannot be combined with --mode metadata-only")
+        dataset_dir = download_amazon_electronics(
+            data_cfg["raw_dir"],
+            reviews_url=data_cfg.get("reviews_url", "http://snap.stanford.edu/data/amazon/productGraph/categoryFiles/reviews_Electronics_5.json.gz"),
+            meta_url=data_cfg.get("meta_url", "http://snap.stanford.edu/data/amazon/productGraph/categoryFiles/meta_Electronics.json.gz"),
+        )
+        _, items_df = load_raw_data(dataset_dir)
+        validate_raw_metadata(items_df, raise_on_error=True)
+        result = run_metadata_only(
+            bundle=args.bundle,
+            raw_items=items_df,
+            overrides_path=REPO_ROOT / data_cfg.get("metadata_overrides_path", "data/metadata_overrides.csv"),
+            encoder=data_cfg.get("text_encoder", "sentence-transformers/all-MiniLM-L6-v2"),
+            revision=data_cfg.get("text_encoder_revision", PINNED_REVISION),
+            publish=not args.no_publish,
+        )
+        logger.info("Metadata-only bundle ready at %s", result)
+        return
+
+    if args.output_dir or args.manifest_path:
+        logger.warning(
+            "--output_dir/--manifest_path are legacy staging options; normal active output is data/processed (with an immutable archive under data/versions)."
+        )
     if args.output_dir:
         data_cfg["processed_dir"] = args.output_dir
-    destination = Path(data_cfg["processed_dir"]).resolve()
-    destination_manifest = Path(args.manifest_path or os.path.join(REPO_ROOT, "data/manifest.json")).resolve()
-    stage_root = Path(REPO_ROOT) / ".tmp"
-    stage_root.mkdir(exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix="prepare-", dir=stage_root))
+    stage_root = Path(REPO_ROOT) / ".tmp" / "data-pipeline" / "staging"
+    if args.work_dir:
+        requested_work = Path(args.work_dir)
+        if not requested_work.is_absolute():
+            requested_work = REPO_ROOT / requested_work
+        work_root = (REPO_ROOT / ".tmp" / "data-pipeline").resolve()
+        if work_root not in requested_work.resolve().parents:
+            parser.error("--work_dir must be inside .tmp/data-pipeline")
+        stage_root = requested_work.resolve().parent
+        if requested_work.exists():
+            shutil.rmtree(requested_work)
+        staging = requested_work
+        stage_root.mkdir(parents=True, exist_ok=True)
+    else:
+        stage_root.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix="prepare-", dir=stage_root))
     data_cfg["processed_dir"] = str(staging)
     args.manifest_path = str(staging / "manifest.json")
 
@@ -183,10 +301,43 @@ def main():
         reviews_url=data_cfg.get("reviews_url", "http://snap.stanford.edu/data/amazon/productGraph/categoryFiles/reviews_Electronics_5.json.gz"),
         meta_url=data_cfg.get("meta_url", "http://snap.stanford.edu/data/amazon/productGraph/categoryFiles/meta_Electronics.json.gz")
     )
+    source_files = [
+        Path(dataset_dir) / "reviews_Electronics_5.json.gz",
+        Path(dataset_dir) / "meta_Electronics.json.gz",
+    ]
+    overrides_path = REPO_ROOT / data_cfg.get("metadata_overrides_path", "data/metadata_overrides.csv")
+    build_options = {
+        "bundle_layout_version": 3,
+        "extract_text_embeddings": args.extract_text_embeddings,
+        "extract_hard_negatives": args.extract_hard_negatives,
+        "export_csv": args.export_csv,
+        "csv_max_rows": args.csv_max_rows,
+        "inspection_rows": args.inspection_rows,
+    }
+    if not args.no_publish:
+        existing = find_existing_full_bundle(
+            source_files=source_files,
+            config=config,
+            overrides_path=overrides_path,
+            encoder=data_cfg.get("text_encoder", "sentence-transformers/all-MiniLM-L6-v2"),
+            revision=data_cfg.get("text_encoder_revision", PINNED_REVISION),
+            policy_version="metadata_policy_v2",
+            build_options=build_options,
+            data_root=REPO_ROOT / "data",
+        )
+        if existing is not None:
+            logger.info("No-op: verified bundle already exists at %s", existing.root)
+            # Re-activate the verified archive so current.json and the
+            # familiar data/processed view remain on the same build.
+            rollback_bundle(existing.root, data_root=REPO_ROOT / "data")
+            shutil.rmtree(staging, ignore_errors=True)
+            return
 
     # 2. Load raw data
     ratings_df, items_df = load_raw_data(dataset_dir)
     validate_interactions(ratings_df, raise_on_error=True)
+    validate_raw_metadata(items_df, raise_on_error=True)
+    raw_metadata_quality = summarize_raw_metadata_fields(items_df)
 
     # 3. Preprocess
     df, user2id, item2id, item_metadata, stats = preprocess_amazon_electronics(
@@ -198,10 +349,11 @@ def main():
     )
     stats["ingestion_ledger"] = {"reviews": ratings_df.attrs.get("ingestion_ledger", {}),
                                  "metadata": items_df.attrs.get("ingestion_ledger", {})}
+    stats["raw_metadata_quality"] = raw_metadata_quality
 
-    stats["metadata_overrides"] = apply_brand_overrides(item_metadata)
+    stats["metadata_overrides"] = apply_brand_overrides(item_metadata, overrides_path)
     from src.data.metadata_resolution import resolve_metadata
-    stats["metadata_resolution"] = resolve_metadata(item_metadata, items_df, os.path.join(REPO_ROOT, "data/metadata_overrides.csv"))
+    stats["metadata_resolution"] = resolve_metadata(item_metadata, items_df, overrides_path)
     stats["metadata_quality"] = summarize_metadata_quality(item_metadata)
 
     # 4. Validate cleaned metadata & interactions
@@ -240,6 +392,21 @@ def main():
 
     processed_dir = data_cfg["processed_dir"]
     os.makedirs(processed_dir, exist_ok=True)
+    train_counts = train_df["i_idx"].value_counts().to_dict()
+    queue_info = write_brand_review_queue(
+        item_metadata,
+        items_df,
+        train_counts,
+        os.path.join(processed_dir, "brand_review_queue.csv"),
+        sample_path=os.path.join(processed_dir, "brand_review_sample.csv"),
+    )
+    queue_info["path"] = os.path.relpath(
+        Path(processed_dir) / "brand_review_queue.csv", REPO_ROOT
+    ).replace("\\", "/")
+    queue_info["sample_path"] = os.path.relpath(
+        Path(processed_dir) / "brand_review_sample.csv", REPO_ROOT
+    ).replace("\\", "/")
+    stats["brand_review_queue"] = queue_info
 
     # 7. Optional: Extract explicit hard negatives (1-2 stars)
     user_disliked_map = {}
@@ -263,9 +430,9 @@ def main():
         text_tensors = encode_item_metadata(
             item_metadata=item_metadata,
             num_items=len(item2id),
-            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            model_name=data_cfg.get("text_encoder", "sentence-transformers/all-MiniLM-L6-v2"),
             save_path=text_emb_path,
-            revision=PINNED_REVISION,
+            revision=data_cfg.get("text_encoder_revision", PINNED_REVISION),
         )
 
     # 9. Save processed artifacts
@@ -322,11 +489,16 @@ def main():
     from src.data.quality_report import quality_report
     report = quality_report(train_df, val_df, test_df, item_metadata)
     report["metadata"] = stats["metadata_resolution"]
+    report["raw_metadata_quality"] = raw_metadata_quality
     report["metadata_quality_after"] = stats["metadata_quality"]
-    report["ratings"] = {"total_raw_reviews": len(ratings_df),
-                         "positive_reviews": int((ratings_df["overall"] >= 4).sum()),
-                         "ratings_below_4": int((ratings_df["overall"] < 4).sum()),
-                         "positive_ratio": float((ratings_df["overall"] >= 4).mean())}
+    positive_threshold = data_cfg["positive_rating_threshold"]
+    report["ratings"] = {
+        "total_raw_reviews": len(ratings_df),
+        "positive_threshold": positive_threshold,
+        "positive_reviews": int((ratings_df["overall"] >= positive_threshold).sum()),
+        "ratings_below_threshold": int((ratings_df["overall"] < positive_threshold).sum()),
+        "positive_ratio": float((ratings_df["overall"] >= positive_threshold).mean()),
+    }
     with open(os.path.join(processed_dir, "data_quality_report.json"), "w", encoding="utf-8") as stream:
         json.dump(report, stream, indent=2)
     logger.info("Dataset statistics summary:")
@@ -336,24 +508,26 @@ def main():
     from scripts.audit_data import main as audit_dataset
     if audit_dataset(staging, staging / "manifest.json"):
         raise ValueError(f"Staged dataset failed audit; active data untouched. Inspect {staging}")
-    staged_manifest = json.loads((staging / "manifest.json").read_text(encoding="utf-8"))
-    for entry in staged_manifest["artifacts"]:
-        entry["path"] = os.path.relpath(destination / Path(entry["path"]).name, REPO_ROOT).replace("\\", "/")
-    (staging / "manifest.json").write_text(json.dumps(staged_manifest, indent=2), encoding="utf-8")
-    destination.mkdir(parents=True, exist_ok=True)
-    destination_manifest.parent.mkdir(parents=True, exist_ok=True)
-    backup = staging / "backup"
-    backup.mkdir()
-    for source in list(staging.iterdir()):
-        if not source.is_file():
-            continue
-        target = destination_manifest if source.name == "manifest.json" else destination / source.name
-        if target.exists():
-            shutil.copy2(target, backup / source.name)
-        os.replace(source, target)
-    if (staging / "csv").exists():
-        shutil.copytree(staging / "csv", destination / "csv", dirs_exist_ok=True)
-    logger.info("Validated dataset published to %s; backup=%s", destination, backup)
+    bundle = publish_legacy_staging(
+        staging,
+        source_files=source_files,
+        config=config,
+        overrides_path=overrides_path,
+        publish=not args.no_publish,
+        data_root=REPO_ROOT / "data",
+        encoder=data_cfg.get("text_encoder", "sentence-transformers/all-MiniLM-L6-v2"),
+        revision=data_cfg.get("text_encoder_revision", PINNED_REVISION),
+        policy_version="metadata_policy_v2",
+        max_csv_rows=args.csv_max_rows,
+        inspection_rows=args.inspection_rows,
+        seed=data_cfg.get("split_seed", 42),
+        export_csv=args.export_csv,
+        build_options=build_options,
+    )
+    if args.no_publish:
+        logger.info("Validated bundle staging kept at %s", bundle)
+    else:
+        logger.info("Validated dataset bundle published at %s", bundle.root)
 
 
 

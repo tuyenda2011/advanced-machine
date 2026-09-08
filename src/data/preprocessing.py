@@ -13,7 +13,7 @@ def clean_text(text: Any) -> str:
     """Clean and unescape HTML entities and remove raw HTML tags from text."""
     if text is None or not isinstance(text, (str, bytes)):
         return UNKNOWN_PLACEHOLDER
-    text_str = str(text)
+    text_str = text.decode("utf-8", errors="replace") if isinstance(text, bytes) else text
     # Decode HTML entities like &amp;, &#39;, &quot;
     text_str = html.unescape(text_str)
     # Remove HTML tags
@@ -25,6 +25,31 @@ def clean_text(text: Any) -> str:
 
 UNKNOWN_PLACEHOLDER = "unknown item"
 
+# Values that indicate an absent metadata field after normalisation.  Keep this
+# list shared by all metadata diagnostics so a placeholder cannot be counted as
+# present in one report and missing in another.
+MISSING_TEXT_VALUES = frozenset(
+    {
+        "",
+        "unknown",
+        UNKNOWN_PLACEHOLDER,
+        "electronics product",
+        "unknown electronics product",
+        "nan",
+        "none",
+        "null",
+        "n/a",
+    }
+)
+
+
+def is_missing_text(value: Any) -> bool:
+    """Return whether a raw or cleaned value is an absent placeholder."""
+    if value is None:
+        return True
+    cleaned = clean_text(value).casefold()
+    return cleaned in MISSING_TEXT_VALUES
+
 METADATA_FLAGS = (
     "has_title",
     "has_brand",
@@ -32,29 +57,20 @@ METADATA_FLAGS = (
     "has_specific_category",
     "has_usable_text",
 )
-METADATA_POLICY = "title_or_brand_or_specific_category_v1"
+METADATA_POLICY = "title_or_brand_or_specific_category_v2"
 
 
 def metadata_flags(meta: dict) -> dict:
     """Classify cleaned source fields, never imputed labels."""
-    missing = {
-        "",
-        "unknown",
-        UNKNOWN_PLACEHOLDER,
-        "electronics product",
-        "unknown electronics product",
-        "nan", "none", "null", "n/a",
-    }
     title = clean_text(meta.get("title"))
     brand = clean_text(meta.get("brand"))
     category = clean_text(meta.get("categories"))
-    has_title = (
-        title.lower() not in missing and title != f"Item {meta.get('original_id', '')}"
-    )
-    has_brand = brand.lower() not in missing
-    has_category = category.lower() not in missing
+    has_title = not is_missing_text(title) and title.casefold() != f"item {meta.get('original_id', '')}".casefold()
+    has_brand = not is_missing_text(brand)
+    has_category = not is_missing_text(category)
     specific = has_category and any(
-        c.strip().lower() not in missing | {"electronics"} for c in category.split(">")
+        not is_missing_text(c.strip()) and c.strip().casefold() != "electronics"
+        for c in category.split(">")
     )
     return dict(
         zip(
@@ -72,19 +88,12 @@ def metadata_flags(meta: dict) -> dict:
 
 def summarize_metadata_quality(item_metadata: dict) -> dict:
     """Count missing/fallback fields without treating placeholders as real text."""
-    missing_values = {"", "unknown", UNKNOWN_PLACEHOLDER, "nan", "none", "null", "n/a"}
     titles = brands = generic_categories = 0
     for meta in item_metadata.values():
-        title = str(meta.get("title", "")).strip()
-        titles += (
-            title.lower() in missing_values
-            or title == f"Item {meta.get('original_id', '')}"
-        )
-        brands += str(meta.get("brand", "")).strip().lower() in missing_values
-        generic_categories += str(meta.get("categories", "")).strip() in {
-            "",
-            "Electronics",
-        }
+        flags = metadata_flags(meta)
+        titles += not flags["has_title"]
+        brands += not flags["has_brand"]
+        generic_categories += not flags["has_category"] or not flags["has_specific_category"]
     count = len(item_metadata)
     flags = [metadata_flags(meta) for meta in item_metadata.values()]
     complete = sum(

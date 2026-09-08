@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 import pandas as pd
 import torch
 
+from src.data.bundle import BundleError, resolve_bundle
 from src.data.preprocessing import METADATA_FLAGS
 from src.data.provenance import sha256_file
 from src.data.sparsity import create_sparse_train_set
@@ -155,7 +156,11 @@ def make_model(variant, snapshot, config, mappings, sparse, features, item_mask)
 
 def run(args):
     snapshot = Path(args.legacy_snapshot).resolve()
-    processed = ROOT / "data/processed"
+    try:
+        bundle = resolve_bundle(args.bundle)
+    except BundleError as exc:
+        raise FileNotFoundError(f"Cannot resolve dataset bundle: {exc}") from exc
+    processed = bundle.train_dir
     mappings, legacy, identity = prepare_reference(
         snapshot, processed, ROOT / "data/cache/metadata-legacy-v1"
     )
@@ -219,7 +224,10 @@ def run(args):
             )
             code_hash = hashlib.sha256(
                 (
-                    get_experiment_fingerprint("adaptive_gcl")
+                    get_experiment_fingerprint(
+                        "adaptive_gcl",
+                        manifest_path=bundle.manifest_path,
+                    )
                     + sha256_file(Path(__file__))
                     + json.dumps(identity, sort_keys=True)
                 ).encode()
@@ -280,6 +288,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--legacy_snapshot", required=True, help="Trusted local code/manifest snapshot"
+    )
+    parser.add_argument(
+        "--bundle", help="Dataset bundle path or data/current.json (default: active bundle)"
     )
     parser.add_argument("--prepare_only", action="store_true")
     parser.add_argument("--output_dir")

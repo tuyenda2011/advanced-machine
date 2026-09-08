@@ -1,7 +1,7 @@
 """Audit processed recommendation data and fail on invalid benchmark inputs."""
 
-import json
 import argparse
+import json
 import pickle
 import sys
 from pathlib import Path
@@ -12,20 +12,65 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
+from src.data.bundle import (
+    BundleError,
+    DatasetBundle,
+    refresh_manifest_inventory,
+    resolve_bundle,
+)
 from src.data.preprocessing import summarize_metadata_quality
 from src.data.provenance import sha256_file
 from src.data.sparsity import create_sparse_train_set
 from src.data.splitter import summarize_split_timing, verify_no_leakage
-from src.data.text_encoder import get_text_input_fingerprint, load_verified_text_cache, get_item_text_mask
+from src.data.text_encoder import (
+    get_item_text_mask,
+    get_text_input_fingerprint,
+    load_verified_text_cache,
+)
 from src.data.validation import validate_processed_interactions
-
 
 PROCESSED_DIR = REPO_ROOT / "data" / "processed"
 EXPECTED_RATIOS = {"train": 0.8, "validation": 0.1, "test": 0.1}
 
 
-def main(processed_dir=None, manifest_path=None) -> int:
-    processed_dir = Path(processed_dir) if processed_dir else PROCESSED_DIR
+def main(processed_dir=None, manifest_path=None, bundle=None, report_dir=None) -> int:
+    resolved_bundle: DatasetBundle | None = None
+    if (
+        bundle is None
+        and processed_dir is None
+        and (REPO_ROOT / "data" / "current.json").exists()
+        and not (REPO_ROOT / "data" / "processed").is_dir()
+    ):
+        bundle = REPO_ROOT / "data" / "current.json"
+    if bundle is not None:
+        try:
+            resolved_bundle = resolve_bundle(bundle, require_build_dir=False)
+        except BundleError as exc:
+            print(f"AUDIT FAILED: {exc}")
+            return 1
+    processed_dir = Path(processed_dir) if processed_dir else (
+        resolved_bundle.train_dir if resolved_bundle is not None else PROCESSED_DIR
+    )
+    source_report_dir = (
+        resolved_bundle.reports_dir
+        if resolved_bundle is not None
+        else (processed_dir / "reports" if (processed_dir / "reports").is_dir() else processed_dir)
+    )
+    requested_report_dir = Path(report_dir) if report_dir else None
+    report_dir = requested_report_dir or source_report_dir
+    # Published bundles are immutable.  A re-audit must never invalidate the
+    # pointer by rewriting files whose hashes are recorded in the manifest.
+    if resolved_bundle is not None and resolved_bundle.root.parent.name == "versions" and requested_report_dir is None:
+        report_dir = (
+            REPO_ROOT / ".tmp" / "data-pipeline" / "audit" /
+            resolved_bundle.build_id
+        )
+    report_dir.mkdir(parents=True, exist_ok=True)
+    manifest_file = (
+        resolved_bundle.manifest_path
+        if resolved_bundle is not None
+        else Path(manifest_path or REPO_ROOT / "data" / "manifest.json")
+    )
     errors = []
     warnings = []
 
@@ -48,7 +93,7 @@ def main(processed_dir=None, manifest_path=None) -> int:
     }
     with open(required["mappings"], "rb") as file:
         mappings = pickle.load(file)
-    with open(manifest_path or REPO_ROOT / "data" / "manifest.json", encoding="utf-8") as file:
+    with open(manifest_file, encoding="utf-8") as file:
         manifest = json.load(file)
 
     for name, frame in frames.items():
@@ -112,6 +157,7 @@ def main(processed_dir=None, manifest_path=None) -> int:
 
     metadata_quality = summarize_metadata_quality(mappings["item_metadata"])
     statistics = manifest.get("statistics", {})
+    raw_metadata_quality = statistics.get("raw_metadata_quality")
     for source, ledger in statistics.get("ingestion_ledger", {}).items():
         if ledger["total_lines"] != ledger["parsed_rows"] + ledger["blank_lines"] + ledger["invalid_lines"]:
             errors.append(f"{source}: ingestion counts do not reconcile")
@@ -167,11 +213,32 @@ def main(processed_dir=None, manifest_path=None) -> int:
     if not expected_names.issubset({Path(entry["path"]).name for entry in artifacts}):
         errors.append("Manifest is missing required processed-artifact hashes")
     for artifact in artifacts:
-        path = REPO_ROOT / artifact["path"]
+        artifact_path = Path(artifact["path"])
+        if resolved_bundle is None or (
+            resolved_bundle.legacy and artifact_path.parts[:1] == ("data",)
+        ):
+            path = REPO_ROOT / artifact_path
+        else:
+            path = resolved_bundle.root / artifact_path
         if not path.is_file() or sha256_file(path) != artifact["sha256"]:
             errors.append(f"Artifact digest mismatch: {artifact['path']}")
 
     negative_path = processed_dir / "disliked_interactions.parquet"
+    optional_status = manifest.get("optional_artifacts", {})
+    for name, status in optional_status.items():
+        if name == "csv":
+            csv_root = (
+                resolved_bundle.root / "csv"
+                if resolved_bundle is not None
+                else processed_dir / "csv"
+            )
+            exists = csv_root.is_dir() and any(csv_root.iterdir())
+        else:
+            exists = (processed_dir / name).is_file()
+        if status == "present" and not exists:
+            errors.append(f"Optional artifact marked present but missing: {name}")
+        if status == "disabled" and exists:
+            errors.append(f"Optional artifact marked disabled but exists: {name}")
     if negative_path.exists():
         negatives = pd.read_parquet(negative_path)
         cutoffs = negatives["u_idx"].map(train_max)
@@ -191,6 +258,28 @@ def main(processed_dir=None, manifest_path=None) -> int:
         if actual_map != saved_map:
             errors.append("Explicit dislike table disagrees with mappings.pkl")
         timing["negatives_at_training_cutoff"] = int((negatives["timestamp"] == cutoffs).sum())
+
+    queue_path = source_report_dir / "brand_review_queue.csv"
+    sample_path = source_report_dir / "brand_review_sample.csv"
+    if queue_path.exists():
+        queue = pd.read_csv(queue_path)
+        queue_columns = {
+            "asin", "title", "current_brand", "brand_candidate", "brand_rule",
+            "brand_source", "train_interactions",
+        }
+        missing_queue_columns = queue_columns - set(queue.columns)
+        if missing_queue_columns:
+            errors.append(f"brand review queue missing columns: {sorted(missing_queue_columns)}")
+        if len(queue) > num_items:
+            errors.append("brand review queue contains more rows than mapped items")
+    if sample_path.exists():
+        sample = pd.read_csv(sample_path)
+        sample_columns = {"asin", "sample_group", "verified_brand", "review_status"}
+        missing_sample_columns = sample_columns - set(sample.columns)
+        if missing_sample_columns:
+            errors.append(f"brand review sample missing columns: {sorted(missing_sample_columns)}")
+        if len(sample) > 300:
+            errors.append("brand review sample exceeds the 200 fallback + 100 candidate limit")
 
     sparsity_report = {}
     for ratio in (1.0, 0.75, 0.5, 0.25):
@@ -220,17 +309,27 @@ def main(processed_dir=None, manifest_path=None) -> int:
         "errors": errors,
         "warnings": warnings,
     }
-    report_path = processed_dir / "audit_report.json"
+    report_path = report_dir / "audit_report.json"
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
     from src.data.quality_report import quality_report
     quality = quality_report(frames["train"], frames["validation"], frames["test"], mappings["item_metadata"])
     quality["metadata"] = mappings.get("stats", {}).get("metadata_resolution", {})
     quality["metadata_quality_after"] = metadata_quality
+    if raw_metadata_quality is not None:
+        quality["raw_metadata_quality"] = raw_metadata_quality
+    if queue_path.exists():
+        quality["brand_review_queue"] = {
+            "rows": len(queue),
+            "candidate_rows": int(queue["brand_candidate"].fillna("").astype(str).str.strip().ne("").sum())
+            if "brand_candidate" in queue.columns else 0,
+        }
+    if sample_path.exists():
+        quality["brand_review_sample"] = {"rows": len(sample), "seed": 42}
     quality["brand_coverage"] = 1 - metadata_quality["missing_brand_fraction"]
     quality["title_coverage"] = 1 - metadata_quality["missing_title_fraction"]
     quality["sparsity_levels"] = sparsity_report
-    quality_path = processed_dir / "data_quality_report.json"
+    quality_path = report_dir / "data_quality_report.json"
     if quality_path.exists():
         previous = json.loads(quality_path.read_text(encoding="utf-8"))
         for key, value in quality.items():
@@ -239,6 +338,18 @@ def main(processed_dir=None, manifest_path=None) -> int:
         previous.update(quality)
         quality = previous
     quality_path.write_text(json.dumps(quality, indent=2), encoding="utf-8")
+    from src.data.export import quality_summary_frame
+
+    quality_summary_frame(quality).to_csv(
+        report_dir / "data_quality_summary.csv",
+        index=False,
+        encoding="utf-8-sig",
+        lineterminator="\n",
+    )
+    if resolved_bundle is not None and not resolved_bundle.legacy and resolved_bundle.root.parent.name != "versions":
+        # Staging/DVC outputs are mutable until publication; keep their
+        # manifest checksums aligned with the reports just generated.
+        refresh_manifest_inventory(resolved_bundle.root)
 
     print("=== DATA AUDIT ===")
     print(json.dumps(report, indent=2))
@@ -250,5 +361,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--processed_dir")
     parser.add_argument("--manifest_path")
+    parser.add_argument("--bundle", help="Bundle path or current.json to audit")
+    parser.add_argument(
+        "--report_dir",
+        help="Optional directory for audit/quality reports; source review queues remain in the bundle",
+    )
     args = parser.parse_args()
-    sys.exit(main(args.processed_dir, args.manifest_path))
+    sys.exit(main(args.processed_dir, args.manifest_path, args.bundle, args.report_dir))

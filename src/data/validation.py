@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from src.data.preprocessing import MISSING_TEXT_VALUES
+
 logger = logging.getLogger(__name__)
 
 RAW_COLUMN_ALIASES = {
@@ -93,6 +95,81 @@ def _fallback_validate_metadata(df: pd.DataFrame) -> list[str]:
         if dup:
             violations.append(f"original_id: {dup} duplicated entries")
 
+    return violations
+
+
+def summarize_raw_metadata_fields(df: pd.DataFrame) -> dict:
+    """Report missing raw metadata without treating it as an interaction error."""
+    fields = {}
+    for column in ("title", "brand", "categories"):
+        if column not in df.columns:
+            fields[column] = {
+                "column_present": False,
+                "missing_or_placeholder": len(df),
+                "null_or_blank": len(df),
+                "placeholder": 0,
+            }
+            continue
+
+        values = df[column]
+
+        def is_null_or_blank(value):
+            if value is None:
+                return True
+            if isinstance(value, (list, dict)):
+                return len(value) == 0
+            try:
+                missing = pd.isna(value)
+                if isinstance(missing, bool) and missing:
+                    return True
+                if hasattr(missing, "item") and bool(missing.item()):
+                    return True
+            except (TypeError, ValueError):
+                pass
+            return isinstance(value, (str, bytes)) and not str(value).strip()
+
+        def is_placeholder(value):
+            if not isinstance(value, (str, bytes)):
+                return False
+            text = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+            return text.strip().casefold() in MISSING_TEXT_VALUES
+
+        null_or_blank = values.map(is_null_or_blank)
+        placeholder = values.map(is_placeholder)
+        fields[column] = {
+            "column_present": True,
+            "missing_or_placeholder": int((null_or_blank | placeholder).sum()),
+            "null_or_blank": int(null_or_blank.sum()),
+            "placeholder": int(placeholder.sum()),
+        }
+    return {"rows": len(df), "fields": fields}
+
+
+def validate_raw_metadata(
+    df: pd.DataFrame,
+    raise_on_error: bool = True,
+) -> list[str]:
+    """Validate identity integrity before metadata is joined to filtered items.
+
+    Title, brand and categories may be absent in the source and are reported by
+    :func:`summarize_raw_metadata_fields`; only the ASIN identity is required to
+    be present and unique.
+    """
+    violations = []
+    if "asin" not in df.columns:
+        violations.append("metadata missing required column: asin")
+    else:
+        null_asin = df["asin"].isna() | df["asin"].astype(str).str.strip().eq("")
+        if null_asin.any():
+            violations.append(f"asin: {int(null_asin.sum())} null/empty values")
+        duplicates = int(df["asin"].duplicated().sum())
+        if duplicates:
+            violations.append(f"asin: {duplicates} duplicated entries")
+
+    if violations and raise_on_error:
+        raise ValidationError(_format_violations(violations))
+    if violations:
+        logger.error("Raw metadata validation issues:\n%s", _format_violations(violations))
     return violations
 
 
@@ -209,7 +286,7 @@ def validate_metadata(
     if GE_AVAILABLE:
         try:
             violations = _ge_validate(df, METADATA_EXPECTATIONS, "metadata", html_report_dir)
-        except Exception as exc:  # pragma: no cover
+        except (AttributeError, ImportError, RuntimeError, TypeError, ValueError) as exc:  # pragma: no cover
             logger.warning("Great Expectations failed (%s); falling back to pandas validator.", exc)
             violations = _fallback_validate_metadata(df)
     else:

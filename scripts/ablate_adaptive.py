@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 import pandas as pd
 import torch
 
+from src.data.bundle import BundleError, resolve_bundle
 from src.data.provenance import sha256_file
 from src.data.sparsity import create_sparse_train_set
 from src.data.text_encoder import build_user_history_features, load_training_text
@@ -106,7 +107,15 @@ def run(args):
     output = resolve_output_root(args.output_dir, kind="ablation")
     if output.exists():
         raise FileExistsError(f"Refusing to overwrite ablation output: {output}")
-    processed = Path(base["dataset"]["processed_dir"])
+    configured_processed = Path(base["dataset"].get("processed_dir", "data/processed"))
+    if not configured_processed.is_absolute():
+        configured_processed = (ROOT / configured_processed).resolve()
+    use_active_bundle = configured_processed == (ROOT / "data" / "processed").resolve()
+    try:
+        bundle = resolve_bundle(args.bundle) if args.bundle or (use_active_bundle and (ROOT / "data" / "current.json").exists()) else None
+    except BundleError as exc:
+        raise RuntimeError(f"Dataset bundle is invalid: {exc}") from exc
+    processed = bundle.train_dir if bundle is not None else Path(base["dataset"]["processed_dir"])
     # Only load trusted, locally prepared mappings. Test split is never loaded.
     with (processed / "mappings.pkl").open("rb") as stream:
         mappings = pickle.load(stream)
@@ -123,7 +132,11 @@ def run(args):
             "item_text_embeddings.pt.json",
         )
     }
-    code_hash = get_experiment_fingerprint("adaptive_gcl", config_dir=args.config_dir)
+    code_hash = get_experiment_fingerprint(
+        "adaptive_gcl",
+        config_dir=args.config_dir,
+        manifest_path=bundle.manifest_path if bundle is not None else None,
+    )
     runner_hash = sha256_file(Path(__file__))
     output.mkdir(parents=True, exist_ok=False)
     write_run_manifest(
@@ -225,6 +238,7 @@ def parse_args(argv=None):
     parser.add_argument("--run", action="store_true")
     parser.add_argument("--config_dir", default="configs")
     parser.add_argument("--output_dir")
+    parser.add_argument("--bundle", help="Bundle path or data/current.json")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--seeds", nargs="+", type=int, default=[42])
     parser.add_argument(

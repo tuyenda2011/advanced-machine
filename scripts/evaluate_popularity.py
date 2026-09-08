@@ -10,12 +10,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pandas as pd
 
+from src.data.bundle import BundleError, resolve_bundle
 from src.data.sparsity import create_sparse_train_set
 from src.evaluation.evaluator import EVALUATION_PROTOCOL, Evaluator
 from src.evaluation.metrics import compute_topk_metrics
 from src.evaluation.popularity import popularity_predictions
 from src.utils.checkpoints import get_run_fingerprint
 from src.utils.config import load_config
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def main():
@@ -24,6 +27,7 @@ def main():
     parser.add_argument("--sparsity", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--config_dir", default="configs")
+    parser.add_argument("--bundle", default=None, help="Bundle path or data/current.json")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     if not 0 < args.sparsity <= 1 or args.seed < 0:
@@ -32,7 +36,11 @@ def main():
     if output.exists():
         raise FileExistsError(output)
     config = load_config("lightgcn", args.config_dir)
-    processed = Path(config["dataset"]["processed_dir"])
+    try:
+        bundle = resolve_bundle(args.bundle) if args.bundle or (ROOT / "data" / "current.json").exists() else None
+    except BundleError as exc:
+        raise RuntimeError(f"Dataset bundle is invalid: {exc}") from exc
+    processed = bundle.train_dir if bundle is not None else Path(config["dataset"]["processed_dir"])
     train = pd.read_parquet(processed / "train.parquet")
     targets = pd.read_parquet(processed / f"{args.split}.parquet")
     with (processed / "mappings.pkl").open("rb") as handle:
@@ -50,7 +58,8 @@ def main():
     result = {"model_name": "mostpopular", "split": args.split, "seed": args.seed,
               "sparsity": args.sparsity, "evaluation_protocol": EVALUATION_PROTOCOL,
               "candidate_items": len(candidates), "users": len(evaluator.eval_users),
-              "reference_fingerprint": get_run_fingerprint("lightgcn", args.sparsity, args.seed, config, args.config_dir),
+              "reference_fingerprint": get_run_fingerprint("lightgcn", args.sparsity, args.seed, config, args.config_dir,
+                                                            manifest_path=bundle.manifest_path if bundle is not None else None),
               "baseline_code_sha256": hashlib.sha256(Path(__file__).read_bytes() + Path("src/evaluation/popularity.py").read_bytes()).hexdigest(),
               "policy": "sparse_train_unique_users; item_id_ascending_ties",
               "metrics": compute_topk_metrics(evaluator.ground_truth, predictions, evaluator.k_list)}

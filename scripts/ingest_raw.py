@@ -3,8 +3,9 @@
 Usage:
     python scripts/ingest_raw.py --source data/source [--move] [--run-id 20260823]
 
-The manifest (``data/manifest.json``) captures per-file checksums, sizes and
-run parameters so every downstream stage can pin itself to an exact snapshot.
+Each snapshot owns ``manifest.json`` and ``data/raw/current.json`` points to
+the selected snapshot with a manifest checksum, so downstream stages can pin
+the exact raw inputs.
 """
 
 import argparse
@@ -18,7 +19,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SOURCE = REPO_ROOT / "data" / "source"
 RAW_ROOT = REPO_ROOT / "data" / "raw"
-MANIFEST_PATH = REPO_ROOT / "data" / "manifest.json"
+RAW_POINTER_PATH = REPO_ROOT / "data" / "raw" / "current.json"
 
 
 def sha256_file(path: Path) -> str:
@@ -33,7 +34,7 @@ def sha256_file(path: Path) -> str:
 def ingest(source: Path, move: bool = False, run_id: str | None = None) -> dict:
     """Copy (or move) raw files into a timestamped folder and write the manifest.
 
-    Returns the manifest dictionary that was persisted to ``MANIFEST_PATH``.
+    Returns the manifest dictionary that was persisted inside the raw snapshot.
     """
     files = sorted(
         p for p in source.iterdir()
@@ -72,9 +73,19 @@ def ingest(source: Path, move: bool = False, run_id: str | None = None) -> dict:
         "files": entries,
     }
 
-    MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
-    MANIFEST_PATH.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    print(f"Manifest written: {MANIFEST_PATH.relative_to(REPO_ROOT)} ({len(entries)} files)")
+    manifest_path = target_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    pointer = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "snapshot_path": target_dir.relative_to(RAW_ROOT).as_posix(),
+        "manifest_sha256": sha256_file(manifest_path),
+    }
+    RAW_POINTER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = RAW_POINTER_PATH.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(pointer, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(RAW_POINTER_PATH)
+    print(f"Manifest written: {manifest_path.relative_to(REPO_ROOT)} ({len(entries)} files)")
     return manifest
 
 

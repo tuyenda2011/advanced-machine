@@ -1,6 +1,5 @@
 import logging
 import os
-from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -9,12 +8,12 @@ logger = logging.getLogger(__name__)
 
 def extract_explicit_negative_interactions(
     ratings_df: pd.DataFrame,
-    user2id: Dict[str, int],
-    item2id: Dict[str, int],
+    user2id: dict[str, int],
+    item2id: dict[str, int],
     negative_threshold: float = 2.0,
-    save_path: str = "data/processed/disliked_interactions.parquet",
-    user_train_cutoffs: Optional[Dict[int, int]] = None,
-) -> Tuple[pd.DataFrame, Dict[int, List[int]]]:
+    save_path: str | None = None,
+    user_train_cutoffs: dict[int, int] | None = None,
+) -> tuple[pd.DataFrame, dict[int, list[int]]]:
     """Extract explicit negative interactions (rating <= negative_threshold) for mapped users and items.
 
     Args:
@@ -22,7 +21,7 @@ def extract_explicit_negative_interactions(
         user2id: Map of valid user strings to contiguous integer indices.
         item2id: Map of valid item strings to contiguous integer indices.
         negative_threshold: Ratings below or equal to this are considered explicit dislikes (e.g., 1.0, 2.0).
-        save_path: File path to save the disliked interaction table.
+        save_path: Optional file path to save the disliked interaction table.
 
     Returns:
         Tuple of (disliked_df with [u_idx, i_idx, rating, timestamp], user_disliked_dict {u_idx: [i_idx, ...]}).
@@ -61,7 +60,7 @@ def extract_explicit_negative_interactions(
     logger.info(f"Retained {len(neg_df):,} unique explicit negative interactions for mapped 5-core graph.")
 
     # Build user-to-disliked-items map
-    user_disliked: Dict[int, List[int]] = {}
+    user_disliked: dict[int, list[int]] = {}
     for u_idx, group in neg_df.groupby("u_idx"):
         user_disliked[int(u_idx)] = group["i_idx"].tolist()
 

@@ -4,6 +4,10 @@ dataset:
   meta_url: "http://snap.stanford.edu/data/amazon/productGraph/categoryFiles/meta_Electronics.json.gz"
   raw_dir: "data/raw"
   processed_dir: "data/processed"
+  bundle_pointer: "data/current.json"
+  metadata_overrides_path: "data/metadata_overrides.csv"
+  text_encoder: "sentence-transformers/all-MiniLM-L6-v2"
+  text_encoder_revision: "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
   positive_rating_threshold: 4.0
   min_user_interactions: 5
   min_item_interactions: 5

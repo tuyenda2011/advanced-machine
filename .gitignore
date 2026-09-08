@@ -33,7 +33,10 @@ data/raw/
 data/cache/
 data/processed/
 data/source/
+data/versions/
+data/.bundle.lock
 !data/manifest.json
+!data/current.json
 artifacts/checkpoints/
 results/
 *.pt

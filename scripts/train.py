@@ -1,11 +1,14 @@
 import argparse
+import hashlib
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
 
 # Ensure project root is in sys.path when script is executed directly
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Force UTF-8 encoding for Windows Command Prompt/PowerShell
 if hasattr(sys.stdout, "reconfigure"):
@@ -17,6 +20,7 @@ import pickle
 
 import pandas as pd
 
+from src.data.bundle import BundleError, resolve_bundle
 from src.data.sparsity import create_sparse_train_set
 from src.data.text_encoder import build_user_history_features, load_training_text
 from src.evaluation.evaluator import EVALUATION_PROTOCOL, Evaluator
@@ -57,7 +61,7 @@ def append_to_model_results_csv(results: dict, model_name: str, sparsity: float,
     head_m = sub_m["Head (Active)"]
 
     row = {
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         "model": model_name,
         "experiment_fingerprint": results["experiment_fingerprint"],
         "evaluation_protocol": results["evaluation_protocol"],
@@ -125,6 +129,11 @@ def main():
     parser.add_argument("--resume", action="store_true", help="Resume training from latest saved checkpoint")
     parser.add_argument("--config_dir", type=str, default="configs", help="Config directory")
     parser.add_argument(
+        "--bundle",
+        default=None,
+        help="Optional bundle/archive path; default uses active data/processed view",
+    )
+    parser.add_argument(
         "--output_root",
         default=None,
         help="Root for this run. Defaults to results/runs/train_<model>_<density>_<seed>_<timestamp>/.",
@@ -163,8 +172,25 @@ def main():
         if args.diagnostics_sample_size < 1:
             parser.error("diagnostics_sample_size must be positive")
         config.setdefault("evaluation", {})["diagnostics_sample_size"] = args.diagnostics_sample_size
+    configured_processed = Path(config["dataset"]["processed_dir"])
+    use_active_bundle = args.bundle is not None or (
+        args.bundle is None
+        and configured_processed.as_posix().replace("\\", "/") == "data/processed"
+        and (REPO_ROOT / "data" / "current.json").exists()
+    )
+    bundle = None
+    if use_active_bundle:
+        try:
+            bundle = resolve_bundle(args.bundle)
+        except BundleError as exc:
+            raise FileNotFoundError(f"Dataset bundle is invalid: {exc}") from exc
     config["experiment_fingerprint"] = get_run_fingerprint(
-        args.model, args.sparsity, args.seed, config, args.config_dir
+        args.model,
+        args.sparsity,
+        args.seed,
+        config,
+        args.config_dir,
+        manifest_path=bundle.manifest_path if bundle is not None else None,
     )
     config["history_dir"] = get_model_output_dir("history", args.model, args.output_root)
 
@@ -188,15 +214,37 @@ def main():
         overwrite=False,
     )
 
-    # 4. Load dataset processed files
-    processed_dir = config["dataset"]["processed_dir"]
+    # 4. Load one pinned dataset bundle. Explicit config paths remain a
+    # compatibility adapter for synthetic tests and isolated legacy fixtures.
+    if use_active_bundle:
+        processed_dir = str(bundle.train_dir)
+        config["dataset"]["bundle_id"] = bundle.build_id
+        config["dataset"]["bundle_path"] = str(bundle.root)
+        run_manifest_path = Path(args.output_root) / "run_manifest.json"
+        if run_manifest_path.is_file():
+            run_manifest = json.loads(run_manifest_path.read_text(encoding="utf-8"))
+            run_manifest.setdefault("parameters", {}).update(
+                {
+                    "bundle_id": bundle.build_id,
+                    "bundle_path": str(bundle.root),
+                    "manifest_sha256": hashlib.sha256(
+                        bundle.manifest_path.read_bytes()
+                    ).hexdigest(),
+                }
+            )
+            run_manifest_path.write_text(
+                json.dumps(run_manifest, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+    else:
+        processed_dir = str(configured_processed)
     train_path = os.path.join(processed_dir, "train.parquet")
     val_path = os.path.join(processed_dir, "val.parquet")
     test_path = os.path.join(processed_dir, "test.parquet")
     mappings_path = os.path.join(processed_dir, "mappings.pkl")
 
     if not os.path.exists(train_path):
-        raise FileNotFoundError(f"Processed dataset not found at {processed_dir}. Run prepare_data.py first.")
+        raise FileNotFoundError(f"Dataset artifacts not found at {processed_dir}. Run prepare_data.py first.")
 
     train_df = pd.read_parquet(train_path)
     val_df = pd.read_parquet(val_path)
@@ -342,7 +390,12 @@ def main():
     results["max_epochs"] = config["training"]["epochs"]
     results["experiment_fingerprint"] = config["experiment_fingerprint"]
     results["experiment_family"] = get_run_fingerprint(
-        args.model, args.sparsity, None, config, args.config_dir
+        args.model,
+        args.sparsity,
+        None,
+        config,
+        args.config_dir,
+        manifest_path=bundle.manifest_path if bundle is not None else None,
     )
     results["effective_config"] = config
     results["scoring_metric"] = model.scoring_metric
@@ -398,7 +451,7 @@ def main():
                 prev_best = json.load(f)
             if prev_best.get("experiment_family") == results["experiment_family"] and prev_best.get("monitor_value", float("-inf")) >= current_val_ndcg:
                 is_new_global_best = False
-        except Exception:
+        except Exception:  # noqa: BLE001 - a malformed previous best must not block training.
             is_new_global_best = True
 
     if is_new_global_best and os.path.exists(checkpoint_path):

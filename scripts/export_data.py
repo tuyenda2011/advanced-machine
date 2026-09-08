@@ -3,7 +3,7 @@ import os
 import pickle
 import sqlite3
 import sys
-from typing import Optional
+from pathlib import Path
 
 # Ensure project root is in sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -11,9 +11,12 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 import pandas as pd
 from tqdm import tqdm
 
+from src.data.bundle import BundleError, resolve_bundle
+from src.data.export import export_bundle_csvs
 from src.utils.logging import setup_logger
 
 logger = setup_logger("export_data")
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def enrich_with_metadata(df: pd.DataFrame, mappings: dict) -> pd.DataFrame:
@@ -127,9 +130,43 @@ def main():
         default="data/exported",
         help="Destination directory for exported files",
     )
+    parser.add_argument(
+        "--bundle",
+        default=None,
+        help="Bundle path or data/current.json (default: active bundle when available)",
+    )
     args = parser.parse_args()
+    fmt = args.format.lower()
 
-    processed_dir = "data/processed"
+    bundle = None
+    if args.bundle is not None or (ROOT / "data" / "current.json").exists():
+        try:
+            bundle = resolve_bundle(args.bundle)
+        except BundleError as exc:
+            logger.error("Dataset bundle is invalid: %s", exc)
+            return
+
+    standard_csv_exported = False
+    if bundle is not None and fmt in {"csv", "all"}:
+        train_df, val_df, test_df, mappings = bundle.load()
+        disliked_path = bundle.artifact("disliked_interactions.parquet", required=False)
+        disliked = pd.read_parquet(disliked_path) if disliked_path.exists() else None
+        export_bundle_csvs(
+            bundle_root=bundle.root,
+            train=train_df,
+            val=val_df,
+            test=test_df,
+            mappings=mappings,
+            disliked=disliked,
+            output_root=args.output_dir,
+            seed=42,
+        )
+        standard_csv_exported = True
+        logger.info("Standard bundle CSV export completed in '%s'", args.output_dir)
+        if fmt == "csv":
+            return
+
+    processed_dir = str(bundle.train_dir) if bundle is not None else "data/processed"
     train_path = os.path.join(processed_dir, "train.parquet")
     val_path = os.path.join(processed_dir, "val.parquet")
     test_path = os.path.join(processed_dir, "test.parquet")
@@ -158,8 +195,7 @@ def main():
         "test": test_df,
     }
 
-    fmt = args.format.lower()
-    if fmt == "csv" or fmt == "all":
+    if (fmt == "csv" or fmt == "all") and not standard_csv_exported:
         export_to_csv(df_dict, args.output_dir)
     if fmt == "excel" or fmt == "all":
         export_to_excel(df_dict, args.output_dir, sample_size=args.sample_size)

@@ -16,6 +16,7 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+from src.data.bundle import BundleError, resolve_bundle
 from src.evaluation.run_validation import (
     FULL_METRIC_PATHS,
 )
@@ -95,6 +96,11 @@ def main():
         help="Root for this benchmark. Defaults to results/runs/benchmark_<timestamp>/.",
     )
     parser.add_argument("--config_dir", default="configs")
+    parser.add_argument(
+        "--bundle",
+        default=None,
+        help="Dataset bundle path or data/current.json (default: active pointer)",
+    )
     args = parser.parse_args()
     if len(set(args.models)) != len(args.models):
         parser.error("Duplicate models are not allowed")
@@ -120,10 +126,17 @@ def main():
     if args.resume and not args.output_root:
         parser.error("--resume requires an explicit --output_root")
     args.output_root = str(resolve_output_root(args.output_root, kind="benchmark"))
+    bundle = None
+    if args.bundle:
+        try:
+            bundle = resolve_bundle(args.bundle)
+        except BundleError as exc:
+            parser.error(f"Dataset bundle is invalid: {exc}")
+    bundle_manifest = bundle.manifest_path if bundle is not None else None
     logger.info(f"Planned {len(models)*len(sparsity_levels)*len(seeds)} runs: "
                 f"{len(models)} models x {len(sparsity_levels)} sparsities x {len(seeds)} seeds, {epochs} epochs")
     if args.dry_run:
-        print(json.dumps({"models": models, "sparsities": sparsity_levels, "seeds": seeds, "epochs": epochs, "runs": len(models)*len(sparsity_levels)*len(seeds), "output_root": args.output_root}, indent=2))
+        print(json.dumps({"models": models, "sparsities": sparsity_levels, "seeds": seeds, "epochs": epochs, "runs": len(models)*len(sparsity_levels)*len(seeds), "output_root": args.output_root, "bundle": args.bundle}, indent=2))
         return
 
     write_run_manifest(
@@ -135,6 +148,7 @@ def main():
             "seeds": seeds,
             "epochs": epochs,
             "validation_only": False,
+            "bundle": args.bundle,
         },
     )
 
@@ -170,7 +184,7 @@ def main():
 
         # Check if run file exists and contains new metrics
         if os.path.exists(run_file):
-            current_fingerprint = get_run_fingerprint(model, sparsity, seed, config_dir=args.config_dir)
+            current_fingerprint = get_run_fingerprint(model, sparsity, seed, config_dir=args.config_dir, manifest_path=bundle_manifest)
             try:
                 with open(run_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
@@ -211,6 +225,8 @@ def main():
             str(epochs),
         ]
         cmd.extend(["--output_root", args.output_root, "--config_dir", args.config_dir])
+        if args.bundle:
+            cmd.extend(["--bundle", args.bundle])
         if args.resume:
             cmd.append("--resume")
 
@@ -234,7 +250,7 @@ def main():
         if os.path.exists(run_file):
             with open(run_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            current_fingerprint = get_run_fingerprint(model, sparsity, seed, config_dir=args.config_dir)
+            current_fingerprint = get_run_fingerprint(model, sparsity, seed, config_dir=args.config_dir, manifest_path=bundle_manifest)
             run_errors = validate_run_result(
                 data, model, sparsity, seed, epochs, current_fingerprint
             )
@@ -478,7 +494,7 @@ def main():
         from scripts.generate_plots import main as generate_all_figures
         logger.info("Automatically generating research publication figures...")
         generate_all_figures(input_root=args.output_root, output_root=args.output_root)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - plotting is optional after benchmark completion.
         logger.warning(f"Could not automatically generate figures: {e}")
 
     logger.info("Comprehensive benchmark suite completed successfully!")

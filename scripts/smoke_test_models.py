@@ -21,6 +21,7 @@ MODELS = ("lightgcn", "xsimgcl", "directau", "adaptive_gcl")
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.benchmark_all import validate_run_result
+from src.data.bundle import BundleError, resolve_bundle
 from src.utils.checkpoints import (
     get_model_output_dir,
     get_run_fingerprint,
@@ -61,6 +62,11 @@ def parse_args():
         help="Output directory. Defaults to results/runs/smoke_<timestamp> for the 5-epoch check, otherwise evaluation_<timestamp>.",
     )
     parser.add_argument("--config_dir", default="configs")
+    parser.add_argument(
+        "--bundle",
+        default=None,
+        help="Optional bundle/archive path; default uses active data/processed view",
+    )
     parser.add_argument(
         "--with_test",
         action="store_true",
@@ -126,6 +132,8 @@ def build_command(args, model, output_root):
         command.append("--validation_only")
     if args.resume:
         command.append("--resume")
+    if args.bundle:
+        command.extend(["--bundle", str(resolve_project_path(args.bundle))])
     return command
 
 
@@ -142,8 +150,18 @@ def read_result(model, args, output_root):
     with path.open("r", encoding="utf-8") as handle:
         result = json.load(handle)
     config_dir = resolve_project_path(args.config_dir)
+    bundle = None
+    if args.bundle:
+        try:
+            bundle = resolve_bundle(resolve_project_path(args.bundle))
+        except BundleError as exc:
+            raise ValueError(f"Dataset bundle is invalid: {exc}") from exc
     expected_fingerprint = get_run_fingerprint(
-        model, args.density, args.seed, config_dir=str(config_dir)
+        model,
+        args.density,
+        args.seed,
+        config_dir=str(config_dir),
+        manifest_path=bundle.manifest_path if bundle is not None else None,
     )
     errors = validate_run_result(
         result,
@@ -191,6 +209,7 @@ def save_summary(output_root, rows, args, run_kind):
         "validation_only": not args.with_test,
         "run_kind": run_kind,
         "models": list(args.models),
+        "bundle": args.bundle,
         "runs": rows,
     }
     json_path = output_root / f"{run_kind}_summary.json"
@@ -222,6 +241,7 @@ def main():
             "seed": args.seed,
             "epochs": args.epochs,
             "validation_only": not args.with_test,
+            "bundle": args.bundle,
             "runs": [" ".join(command) for command in commands],
         }, indent=2))
         return 0
@@ -241,6 +261,7 @@ def main():
             "seed": args.seed,
             "epochs": args.epochs,
             "validation_only": not args.with_test,
+            "bundle": args.bundle,
         },
     )
 

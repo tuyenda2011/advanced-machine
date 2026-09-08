@@ -4,18 +4,42 @@ import hashlib
 import json
 import os
 from copy import deepcopy
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _active_manifest_path() -> Path:
+    """Resolve the manifest pinned by current.json without legacy fallback."""
+    pointer = REPO_ROOT / "data" / "current.json"
+    if not pointer.exists():
+        return REPO_ROOT / "data" / "manifest.json"
+    try:
+        payload = json.loads(pointer.read_text(encoding="utf-8"))
+        relative = payload["bundle_path"]
+    except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Active dataset pointer is invalid") from exc
+    manifest = (REPO_ROOT / "data" / relative).resolve() / "manifest.json"
+    if REPO_ROOT / "data" not in manifest.parents or not manifest.is_file():
+        raise RuntimeError("Active dataset manifest is missing")
+    expected = payload.get("manifest_sha256")
+    actual = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    if expected != actual:
+        raise RuntimeError("Active dataset manifest checksum does not match current.json")
+    return manifest
 
 
 def get_experiment_fingerprint(
     model_name: str,
     config_dir: str = "configs",
+    manifest_path: str | Path | None = None,
 ) -> str:
     """Hash the data manifest, model config, and core implementation files."""
     paths = [
-        "data/manifest.json",
+        Path(manifest_path).resolve() if manifest_path is not None else _active_manifest_path(),
         os.path.join(config_dir, "common.yaml"),
         os.path.join(config_dir, f"{model_name}.yaml"),
-        os.path.join("src", "models", f"{model_name}.py"),
+        REPO_ROOT / "src" / "models" / f"{model_name}.py",
         os.path.join("src", "models", "base.py"),
         os.path.join("scripts", "train.py"),
         os.path.join("src", "training", "trainer.py"),
@@ -45,8 +69,13 @@ def get_experiment_fingerprint(
     ]
     digest = hashlib.sha256()
     for path in paths:
-        digest.update(path.replace("\\", "/").encode("utf-8"))
-        with open(path, "rb") as file:
+        target = path if isinstance(path, Path) else REPO_ROOT / path
+        try:
+            display_path = target.relative_to(REPO_ROOT).as_posix()
+        except ValueError:
+            display_path = target.as_posix()
+        digest.update(display_path.encode("utf-8"))
+        with target.open("rb") as file:
             digest.update(file.read())
     return digest.hexdigest()
 
@@ -56,7 +85,14 @@ def get_model_output_dir(section: str, model_name: str, root: str = "results") -
     return os.path.join(path, "masked_text") if model_name == "adaptive_gcl" else path
 
 
-def get_run_fingerprint(model_name, sparsity=1.0, seed=42, config=None, config_dir="configs"):
+def get_run_fingerprint(
+    model_name,
+    sparsity=1.0,
+    seed=42,
+    config=None,
+    config_dir="configs",
+    manifest_path: str | Path | None = None,
+):
     """Hash learning settings, excluding epoch budget and output paths.
 
     Pass seed=None for a family identity shared by independent seeds.
@@ -67,9 +103,19 @@ def get_run_fingerprint(model_name, sparsity=1.0, seed=42, config=None, config_d
     effective = deepcopy(config)
     for key in ("experiment_fingerprint", "history_dir", "validation_only", "ablation_variant"):
         effective.pop(key, None)
+    dataset = effective.get("dataset")
+    if isinstance(dataset, dict):
+        for key in (
+            "processed_dir",
+            "bundle_pointer",
+            "metadata_overrides_path",
+            "bundle_id",
+            "bundle_path",
+        ):
+            dataset.pop(key, None)
     effective.setdefault("training", {}).pop("epochs", None)
     effective["training"]["seed"] = seed
-    identity = {"code_and_data": get_experiment_fingerprint(model_name, config_dir),
+    identity = {"code_and_data": get_experiment_fingerprint(model_name, config_dir, manifest_path),
                 "config": effective, "sparsity": sparsity, "seed": seed}
     return hashlib.sha256(json.dumps(identity, sort_keys=True, allow_nan=False).encode()).hexdigest()
 

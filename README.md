@@ -28,7 +28,7 @@
 
 Pipeline update (07/09/2026): new runs select checkpoints by **validation NDCG@20** and use protocol `profile_monitor_scoring_v5`. DirectAU defaults to `reference_lgcn` (LightGCN encoder, raw-dot full-sort, normalized alignment/uniformity loss); the earlier cosine implementation is a separate `project_cosine` profile. Old runs are not comparable or resumable under the new identity.
 
-Start with the [implementation status and user-run commands](docs/improvement-implementation.md): validation-only pilots, MostPopular, resume, ablations and a 12-run final benchmark preview. Numerical regression checks are evidence about implementation, not improved recommendation quality or reproduction of paper scores. Real-data experiments remain pending.
+Start with the [implementation status and user-run commands](docs/improvement-implementation.md): validation-only pilots, MostPopular, resume, ablations and a 12-run final benchmark preview. Numerical regression checks are evidence about implementation, not improved recommendation quality or reproduction of paper scores. The current data bundle is built and audited; model training/evaluation remains a separate step.
 
 ```bash
 # Clone repository
@@ -38,15 +38,39 @@ cd advanced-machine
 # Install dependencies
 pip install -r requirements.txt
 
-# Prepare data
-python scripts/prepare_data.py
+# Prepare data into an audited immutable bundle and activate it
+python scripts/prepare_data.py --mode full
 
-# Train models
+# Inspect the active bundle (or pass a published bundle path with --bundle)
+python scripts/audit_data.py
+
+# Rebuild metadata, text features and reports after editing overrides;
+# split Parquet, IDs and dislikes remain pinned to the selected base bundle
+python scripts/prepare_data.py --mode metadata-only --bundle data/current.json
+
+# Activate an older verified version without deleting any published data
+python scripts/rollback_data.py build_<id>
+
+# Export a separate, inspectable CSV view; the bundle remains immutable
+python scripts/export_data.py --bundle data/current.json --format csv --output_dir data/exported/current
+
+# Train models from the active processed directory
 python scripts/train.py --model lightgcn --epochs 50
 
 # Launch dashboard
 streamlit run app/streamlit_app.py
 ```
+
+The active training files are under `data/processed/` (`train.parquet`,
+`val.parquet`, `test.parquet`, mappings and text features). Human-readable CSVs
+and reports are under `data/processed/csv/` and `data/processed/reports/`.
+An immutable archive can be kept under `data/versions/<build_id>/` for
+provenance and rollback; normal training and demo commands do not require that
+path.
+Import `u_idx`, `i_idx`, and ASIN columns as
+Text in Excel so leading zeros and long IDs are preserved. Editing an export
+does not change training data; verified corrections belong in
+`data/metadata_overrides.csv` and are applied through the metadata-only command.
 
 ---
 
@@ -65,7 +89,7 @@ streamlit run app/streamlit_app.py
 
 Preprocessing filters positive feedback, deduplicates user–item pairs, and runs 5-core pruning to convergence before splitting. Timestamp ties use a seeded user–item hash, independent of input row order; day-level timestamps cannot establish strict intraday chronology. No validation/test edges are relocated into training.
 
-`data/manifest.json` records source/artifact SHA-256 hashes, metadata quality, split timing, and encoder provenance. Text caches require matching ordered item/text/encoder fingerprints and tensor checksums. Run `python scripts/audit_data.py` to check processed artifacts, temporal ordering, explicit dislikes, and coverage at all four sparsity levels. Missing metadata and cold targets remain explicit audit warnings, not silently repaired facts.
+`data/current.json` pins the active `data/processed/` view and its build ID/hash. A published archive may also be kept under `data/versions/<build_id>/` for provenance and rollback. Each archive keeps Parquet training artifacts in `train/`, human-readable CSV views in `csv/`, reports in `reports/`, and a manifest with source/artifact SHA-256 hashes, metadata quality, split timing, and encoder provenance. Text caches require matching ordered item/text/encoder fingerprints and tensor checksums. Run `python scripts/audit_data.py` to check the active processed view (or add `--bundle <path>` for a specific archived version). Missing metadata and cold targets remain explicit audit warnings, not silently repaired facts.
 
 Metadata-aware training uses source-derived flags (`has_title`, `has_brand`, `has_category`, `has_specific_category`, `has_usable_text`). A real title, brand, or specific category makes text usable. Only usable text is encoded; other tensor rows are zero and must be masked in item fusion, user-history pooling, and semantic SSL. All 44,843 items in the current snapshot still have usable text; this is not a claim that all metadata is complete. MiniLM is pinned to commit `1110a243fdf4706b3f48f1d95db1a4f5529b4d41`. Training and demo reject missing flags or incompatible caches.
 

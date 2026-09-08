@@ -1,5 +1,6 @@
 import ast
 import gzip
+import hashlib
 import json
 import logging
 import os
@@ -15,6 +16,55 @@ DEFAULT_REVIEWS_URL = "http://snap.stanford.edu/data/amazon/productGraph/categor
 DEFAULT_META_URL = "http://snap.stanford.edu/data/amazon/productGraph/categoryFiles/meta_Electronics.json.gz"
 
 
+def _sha256_file(path: str | os.PathLike[str]) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _active_raw_snapshot(raw_root: str | os.PathLike[str]) -> str | None:
+    """Return the verified immutable raw snapshot selected by current.json.
+
+    A present but invalid pointer is an error.  The legacy
+    ``raw/amazon-electronics`` directory is used only when no pointer exists,
+    which keeps old local checkouts usable during the migration.
+    """
+    root = os.path.abspath(os.fspath(raw_root))
+    pointer_path = os.path.join(root, "current.json")
+    if not os.path.exists(pointer_path):
+        return None
+    try:
+        with open(pointer_path, encoding="utf-8") as stream:
+            pointer = json.load(stream)
+        if pointer.get("schema_version") != 1:
+            raise ValueError("unsupported raw pointer schema")
+        relative = pointer["snapshot_path"]
+        if os.path.isabs(relative):
+            raise ValueError("snapshot_path must be relative")
+        snapshot = os.path.realpath(os.path.join(root, relative))
+        if os.path.commonpath([root, snapshot]) != root:
+            raise ValueError("snapshot_path escapes raw directory")
+        manifest_path = os.path.join(snapshot, "manifest.json")
+        if not os.path.isfile(manifest_path):
+            raise ValueError("raw snapshot manifest is missing")
+        if pointer.get("manifest_sha256") != _sha256_file(manifest_path):
+            raise ValueError("raw snapshot manifest checksum does not match current.json")
+        required = {
+            "reviews_Electronics_5.json.gz",
+            "meta_Electronics.json.gz",
+        }
+        if not required.issubset(
+            name for name in os.listdir(snapshot)
+            if os.path.isfile(os.path.join(snapshot, name))
+        ):
+            raise ValueError("raw snapshot is missing one or more required files")
+        return snapshot
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Invalid raw snapshot pointer: {pointer_path}") from exc
+
+
 class DownloadProgressBar(tqdm):
     def update_to(self, b=1, bsize=1, tsize=None):
         if tsize is not None:
@@ -28,6 +78,10 @@ def download_amazon_electronics(
     meta_url: str = DEFAULT_META_URL,
 ) -> str:
     """Download Amazon Electronics reviews and metadata with visual download progress bars."""
+    snapshot = _active_raw_snapshot(raw_dir)
+    if snapshot is not None:
+        logger.info("Using immutable raw snapshot at %s", snapshot)
+        return snapshot
     os.makedirs(raw_dir, exist_ok=True)
     dataset_dir = os.path.join(raw_dir, "amazon-electronics")
     os.makedirs(dataset_dir, exist_ok=True)
@@ -127,3 +181,16 @@ def load_raw_data(dataset_dir: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     items_df = get_df_from_json_gz(meta_path, desc="Loading Metadata (498K)")
 
     return ratings_df, items_df
+
+
+def resolve_dataset_bundle(bundle: str | os.PathLike[str] | None = None):
+    """Resolve the active processed view, pinned to one verified bundle."""
+    from src.data.bundle import resolve_bundle
+
+    return resolve_bundle(bundle)
+
+
+def load_processed_bundle(bundle: str | os.PathLike[str] | None = None):
+    """Load all processed artifacts from one pinned bundle."""
+    resolved = resolve_dataset_bundle(bundle)
+    return resolved, resolved.load()

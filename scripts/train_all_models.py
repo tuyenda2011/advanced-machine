@@ -4,7 +4,7 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Ensure project root is in sys.path when script is executed directly
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -19,6 +19,7 @@ import pandas as pd
 from tabulate import tabulate
 
 from scripts.benchmark_all import validate_run_result
+from src.data.bundle import BundleError, resolve_bundle
 from src.utils.checkpoints import (
     get_model_output_dir,
     get_run_fingerprint,
@@ -82,6 +83,11 @@ def main():
         help="Root for this sweep. Defaults to results/runs/train_all_<timestamp>/.",
     )
     parser.add_argument("--config_dir", default="configs")
+    parser.add_argument(
+        "--bundle",
+        default=None,
+        help="Optional bundle/archive path; default uses active data/processed view",
+    )
     args = parser.parse_args()
     if len(set(args.models)) != len(args.models):
         parser.error("Duplicate models are not allowed")
@@ -94,8 +100,15 @@ def main():
     if args.resume and not args.output_root:
         parser.error("--resume requires an explicit --output_root")
     args.output_root = str(resolve_output_root(args.output_root, kind="train_all"))
+    bundle = None
+    if args.bundle:
+        try:
+            bundle = resolve_bundle(args.bundle)
+        except BundleError as exc:
+            parser.error(f"Dataset bundle is invalid: {exc}")
+    bundle_manifest = bundle.manifest_path if bundle is not None else None
     if args.dry_run:
-        print(json.dumps({"models": args.models, "sparsities": sparsity_list, "seed": args.seed, "epochs": args.epochs, "runs": len(args.models)*len(sparsity_list), "output_root": args.output_root}, indent=2))
+        print(json.dumps({"models": args.models, "sparsities": sparsity_list, "seed": args.seed, "epochs": args.epochs, "runs": len(args.models)*len(sparsity_list), "output_root": args.output_root, "bundle": args.bundle}, indent=2))
         return
     start_total_time = time.perf_counter()
 
@@ -108,12 +121,13 @@ def main():
             "seed": args.seed,
             "epochs": args.epochs,
             "validation_only": False,
+            "bundle": args.bundle,
         },
     )
 
     print("=" * 85)
     print("GRAPH RECSYS SUITE: SEQUENTIAL 4-MODEL MULTI-SPARSITY RUNNER")
-    print(f"Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Start Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print(f"Target Models: {', '.join([m.upper() for m in args.models])}")
     print(f"Sparsity Levels: {', '.join([f'{int(s*100)}%' for s in sparsity_list])} | Seed: {args.seed}")
     print(f"⏱️ Epochs per Model: {args.epochs}")
@@ -148,6 +162,8 @@ def main():
             str(args.epochs),
         ]
         cmd.extend(["--output_root", args.output_root, "--config_dir", args.config_dir])
+        if args.bundle:
+            cmd.extend(["--bundle", args.bundle])
         if args.resume:
             cmd.append("--resume")
 
@@ -178,7 +194,7 @@ def main():
                     sp,
                     args.seed,
                     args.epochs,
-                    get_run_fingerprint(model_name, sp, args.seed, config_dir=args.config_dir),
+                    get_run_fingerprint(model_name, sp, args.seed, config_dir=args.config_dir, manifest_path=bundle_manifest),
                 )
                 if run_errors:
                     raise ValueError("; ".join(run_errors))
@@ -248,7 +264,7 @@ def main():
             from scripts.generate_plots import main as generate_figures
             generate_figures(input_root=args.output_root, output_root=args.output_root)
             print(f"[OK] Figures saved to {os.path.join(args.output_root, 'figures')}/", flush=True)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - plotting is optional after training.
             logger.warning(f"Could not generate plots: {e}")
 
     print("\n" + "=" * 85)

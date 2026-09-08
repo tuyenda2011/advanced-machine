@@ -6,7 +6,7 @@ otherwise falls back to basic Python validation.
 
 import logging
 import math
-from typing import Any, Dict, List, Literal
+from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,7 @@ class ConfigValidator:
     """Simple config validator that works with or without pydantic."""
 
     @staticmethod
-    def validate_split_ratios(v: List[float]) -> List[float]:
+    def validate_split_ratios(v: list[float]) -> list[float]:
         """Validate split ratios sum to 1.0."""
         if len(v) != 3:
             raise ValueError("split_ratios must have exactly 3 elements (train, val, test)")
@@ -67,7 +67,7 @@ class ConfigValidator:
         return batch_size
 
     @staticmethod
-    def validate_sparsity_levels(levels: List[float]) -> List[float]:
+    def validate_sparsity_levels(levels: list[float]) -> list[float]:
         """Validate sparsity levels are in valid range."""
         if not levels:
             raise ValueError("sparsity levels cannot be empty")
@@ -84,15 +84,19 @@ if PYDANTIC_AVAILABLE:
         meta_url: str
         raw_dir: str = "data/raw"
         processed_dir: str = "data/processed"
+        bundle_pointer: str = "data/current.json"
+        metadata_overrides_path: str = "data/metadata_overrides.csv"
+        text_encoder: str = "sentence-transformers/all-MiniLM-L6-v2"
+        text_encoder_revision: str = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
         positive_rating_threshold: float = Field(default=4.0, ge=1.0, le=5.0)
         min_user_interactions: int = Field(default=5, ge=1)
         min_item_interactions: int = Field(default=5, ge=1)
-        split_ratios: List[float] = Field(default=[0.8, 0.1, 0.1])
+        split_ratios: list[float] = Field(default=[0.8, 0.1, 0.1])
         split_seed: int = Field(default=42, ge=0)
 
         @field_validator("split_ratios")
         @classmethod
-        def validate_split_ratios(cls, v: List[float]) -> List[float]:
+        def validate_split_ratios(cls, v: list[float]) -> list[float]:
             if len(v) != 3:
                 raise ValueError("split_ratios must have exactly 3 elements")
             if not abs(sum(v) - 1.0) < 1e-6:
@@ -131,7 +135,7 @@ if PYDANTIC_AVAILABLE:
         hard_neg_margin: float = Field(default=0.5, ge=0)
 
 
-def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
+def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     """Validate config and raise ValueError immediately on invalid settings.
 
     Args:
@@ -196,7 +200,7 @@ def validate_config(config: Dict[str, Any]) -> Dict[str, Any]:
     return config
 
 
-def validate_model_config(config: Dict[str, Any], model_name: str) -> Dict[str, Any]:
+def validate_model_config(config: dict[str, Any], model_name: str) -> dict[str, Any]:
     """Validate model-specific config.
 
     Args:

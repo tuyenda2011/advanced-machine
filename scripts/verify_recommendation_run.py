@@ -22,6 +22,7 @@ import torch
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.data.bundle import BundleError, resolve_bundle
 from src.data.graph import get_norm_adj_tensor
 from src.data.sparsity import create_sparse_train_set
 from src.data.text_encoder import build_user_history_features, load_training_text
@@ -147,6 +148,7 @@ def parse_args():
     parser.add_argument("--split", choices=("validation", "test"), default="validation")
     parser.add_argument("--max_users", type=int, default=2048, help="Users to audit; use 0 for all users.")
     parser.add_argument("--config_dir", default="configs")
+    parser.add_argument("--bundle", default=None, help="Bundle path or data/current.json")
     parser.add_argument("--device", default="cpu", choices=("cpu", "cuda"))
     return parser.parse_args()
 
@@ -169,9 +171,17 @@ def main() -> int:
     set_seed(args.seed)
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
 
-    processed_dir = Path(config["dataset"]["processed_dir"])
-    if not processed_dir.is_absolute():
-        processed_dir = PROJECT_ROOT / processed_dir
+    bundle_arg = args.bundle or config.get("dataset", {}).get("bundle_path")
+    try:
+        bundle = resolve_bundle(bundle_arg) if bundle_arg or (PROJECT_ROOT / "data" / "current.json").exists() else None
+    except BundleError as exc:
+        raise RuntimeError(f"Dataset bundle is invalid: {exc}") from exc
+    if bundle is not None:
+        processed_dir = bundle.train_dir
+    else:
+        processed_dir = Path(config["dataset"]["processed_dir"])
+        if not processed_dir.is_absolute():
+            processed_dir = PROJECT_ROOT / processed_dir
     train_df = pd.read_parquet(processed_dir / "train.parquet")
     val_df = pd.read_parquet(processed_dir / "val.parquet")
     test_df = pd.read_parquet(processed_dir / "test.parquet")
@@ -214,7 +224,14 @@ def main() -> int:
     )
     metrics10 = _independent_metrics(predictions, target_rows, 10)
     metrics20 = _independent_metrics(predictions, target_rows, 20)
-    current_fp = get_run_fingerprint(args.model, args.density, args.seed, config=config, config_dir=str(config_dir))
+    current_fp = get_run_fingerprint(
+        args.model,
+        args.density,
+        args.seed,
+        config=config,
+        config_dir=str(config_dir),
+        manifest_path=bundle.manifest_path if bundle is not None else None,
+    )
     current_fingerprint_matches = current_fp == result.get("experiment_fingerprint")
     integrity_ok = mask_violations == 0 and repeat_rows == 0 and checkpoint_identity_ok
     if not integrity_ok:

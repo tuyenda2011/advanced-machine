@@ -4,6 +4,8 @@ Advanced Graph Contrastive Learning Dashboard
 Interactive Research Suite for Recommendation Systems
 """
 
+import hashlib
+import json
 import os
 import pickle
 import sys
@@ -17,8 +19,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import torch
-import torch.nn.functional as F
 
+from src.data.bundle import BundleError, resolve_bundle
 from src.data.sparsity import create_sparse_train_set
 from src.data.text_encoder import (
     DEFAULT_ENCODER,
@@ -34,6 +36,20 @@ from src.models.directau import DirectAU
 from src.models.lightgcn import LightGCN
 from src.models.xsimgcl import XSimGCL
 from src.serving.ann_indexer import VectorIndexer
+from src.serving.metadata_display import (
+    ALL_BRANDS_LABEL,
+    ALL_CATEGORIES_LABEL,
+    brand_filter_value,
+    category_filter_value,
+    display_brand,
+    display_brand_source,
+    display_category,
+    display_title,
+    format_brand_filter,
+    format_category_filter,
+    metadata_counts,
+    unique_filter_options,
+)
 from src.serving.recommendations import recommend_exact
 from src.utils.checkpoints import (
     get_checkpoint_path,
@@ -89,10 +105,89 @@ st.set_page_config(
 # ==============================================================================
 # Helper Functions
 # ==============================================================================
+class MissingCheckpointError(FileNotFoundError):
+    """Raised when a requested model has not been trained for this run."""
+
+
+class CheckpointCompatibilityError(RuntimeError):
+    """Raised when a checkpoint does not match the current code/data identity."""
+
+
+class TextCacheCompatibilityError(RuntimeError):
+    """Raised when the content embedding cache is stale or invalid."""
+
+
+def load_demo_text(processed_dir: str, mappings: dict):
+    """Load the verified text artifact and expose a Demo-specific error."""
+    try:
+        if (
+            str(processed_dir).replace("\\", "/") == "data/processed"
+            and (PROJECT_ROOT / "data" / "current.json").exists()
+        ):
+            processed_dir = str(resolve_bundle().train_dir)
+        return load_training_text(processed_dir, mappings)
+    except (BundleError, ValueError) as exc:
+        raise TextCacheCompatibilityError(
+            "Text embedding cache không tương thích với metadata hiện tại. "
+            "Hãy chạy lại prepare_data.py."
+        ) from exc
+
+
+def _file_state(path: str | Path) -> dict[str, int | str] | None:
+    """Return a cheap cache token for a file without loading large artifacts."""
+    target = Path(path)
+    if not target.exists():
+        return None
+    stat = target.stat()
+    return {
+        "path": str(target.resolve()),
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def get_processed_data_cache_token(
+    processed_dir: str | None = None,
+    manifest_path: str | Path | None = None,
+) -> str:
+    """Hash manifest and artifact states before entering Streamlit cache."""
+    if processed_dir is None or str(processed_dir).replace("\\", "/") == "data/processed":
+        resolved = resolve_bundle()
+        processed = resolved.train_dir
+        manifest = resolved.manifest_path
+    else:
+        processed = Path(processed_dir)
+        manifest = Path(manifest_path or "data/manifest.json")
+    manifest_hash = (
+        hashlib.sha256(manifest.read_bytes()).hexdigest()
+        if manifest.exists()
+        else "missing"
+    )
+    files = [
+        processed / name
+        for name in (
+            "train.parquet",
+            "val.parquet",
+            "test.parquet",
+            "mappings.pkl",
+            "item_text_embeddings.pt",
+            "item_text_embeddings.pt.json",
+            "disliked_interactions.parquet",
+        )
+    ]
+    payload = {
+        "processed_dir": str(processed.resolve()),
+        "manifest_sha256": manifest_hash,
+        "files": [_file_state(path) for path in files],
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
 @st.cache_data
-def load_processed_data():
+def load_processed_data_cached(processed_dir: str, cache_token: str):
     """Load preprocessed data with caching."""
-    processed_dir = "data/processed"
     train_path = os.path.join(processed_dir, "train.parquet")
     val_path = os.path.join(processed_dir, "val.parquet")
     test_path = os.path.join(processed_dir, "test.parquet")
@@ -111,8 +206,37 @@ def load_processed_data():
     return train_df, val_df, test_df, mappings
 
 
+def load_processed_data(
+    processed_dir: str | None = None,
+    manifest_path: str | Path | None = None,
+):
+    """Load processed artifacts using a token computed before the cached call."""
+    try:
+        if processed_dir is None or str(processed_dir).replace("\\", "/") == "data/processed":
+            resolved = resolve_bundle()
+            processed = resolved.train_dir
+            manifest = resolved.manifest_path
+        else:
+            processed = Path(processed_dir)
+            manifest = Path(manifest_path or "data/manifest.json")
+        cache_token = get_processed_data_cache_token(str(processed), manifest)
+    except BundleError:
+        return None, None, None, None
+    return load_processed_data_cached(str(processed), cache_token)
+
+
 @st.cache_resource
-def load_trained_model(model_name: str, num_users: int, num_items: int, sparsity: float = 1.0, seed: int = 42):
+def load_trained_model_cached(
+    model_name: str,
+    num_users: int,
+    num_items: int,
+    sparsity: float,
+    seed: int,
+    data_token: str,
+    checkpoint_path: str,
+    checkpoint_token: str,
+    run_token: str,
+):
     """Load trained model with caching."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     config = load_config(model_name, "configs")
@@ -120,6 +244,12 @@ def load_trained_model(model_name: str, num_users: int, num_items: int, sparsity
     num_layers = config["model"]["num_layers"]
     train_df, _, _, mappings = load_processed_data()
     train_df_sparse = create_sparse_train_set(train_df, sparsity, seed)
+
+    if not os.path.exists(checkpoint_path):
+        raise MissingCheckpointError(
+            f"Chưa có checkpoint cho {model_name}, density={sparsity}, seed={seed}. "
+            "Hãy train đúng cấu hình này trước khi mở Demo."
+        )
 
     if model_name == "lightgcn":
         model = LightGCN(num_users, num_items, embedding_dim=emb_dim, num_layers=num_layers)
@@ -141,7 +271,15 @@ def load_trained_model(model_name: str, num_users: int, num_items: int, sparsity
         )
     elif model_name == "adaptive_gcl":
         ada_cfg = config.get("adaptive_gcl", {})
-        text_features, item_text_mask = load_training_text(config["dataset"]["processed_dir"], mappings)
+        try:
+            text_dir = str(resolve_bundle().train_dir)
+        except BundleError as exc:
+            raise TextCacheCompatibilityError(
+                "Không tìm thấy bundle dữ liệu đang hoạt động. Hãy chạy prepare_data.py."
+            ) from exc
+        text_features, item_text_mask = load_demo_text(
+            text_dir, mappings
+        )
         text_dim = text_features.shape[1]
         user_history_features, user_text_mask = build_user_history_features(
             train_df_sparse, text_features, num_users, item_text_mask
@@ -162,28 +300,32 @@ def load_trained_model(model_name: str, num_users: int, num_items: int, sparsity
             layer_aggregation=ada_cfg.get("layer_aggregation", "learnable"),
         )
 
-    run_root = find_latest_run_root(model_name=model_name, sparsity=sparsity, seed=seed)
-    checkpoint_path = get_checkpoint_path(
-        model_name,
-        sparsity,
-        seed,
-        root=str(run_root) if run_root is not None else "results",
-    )
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(
-            f"No checkpoint for {model_name}, sparsity={sparsity}, seed={seed}. "
-            "Train this exact run before opening it in the dashboard."
-        )
-
-    if os.path.exists(checkpoint_path):
+    try:
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
         expected_fingerprint = get_run_fingerprint(model_name, sparsity, seed, config)
         stored_fingerprint = ckpt.get("config", {}).get("experiment_fingerprint")
         if stored_fingerprint != expected_fingerprint:
-            raise RuntimeError(
-                "Checkpoint is stale for the current data/config/code. Retrain the model."
+            raise CheckpointCompatibilityError(
+                f"Checkpoint của {model_name} đã cũ so với data/config hiện tại. "
+                "Hãy train lại model này trước khi dùng Demo."
             )
         model.load_state_dict(ckpt["model_state_dict"])
+    except CheckpointCompatibilityError:
+        raise
+    except (
+        RuntimeError,
+        ValueError,
+        KeyError,
+        TypeError,
+        AttributeError,
+        EOFError,
+        OSError,
+        pickle.PickleError,
+    ) as exc:
+        raise CheckpointCompatibilityError(
+            f"Không thể đọc checkpoint của {model_name}. "
+            "Checkpoint có thể hỏng hoặc không tương thích; hãy train lại model."
+        ) from exc
 
     model.to(device)
     model.eval()
@@ -197,15 +339,70 @@ def load_trained_model(model_name: str, num_users: int, num_items: int, sparsity
     return model, u_embeds, i_embeds, device
 
 
-# ==============================================================================
+def get_checkpoint_cache_token(
+    model_name: str, sparsity: float = 1.0, seed: int = 42
+) -> dict:
+    """Return checkpoint and run identity used as a model-cache key."""
+    config = load_config(model_name, "configs")
+    run_root = find_latest_run_root(
+        model_name=model_name, sparsity=sparsity, seed=seed
+    )
+    checkpoint_path = get_checkpoint_path(
+        model_name,
+        sparsity,
+        seed,
+        root=str(run_root) if run_root is not None else "results",
+    )
+    return {
+        "checkpoint_path": str(Path(checkpoint_path).resolve()),
+        "checkpoint_state": _file_state(checkpoint_path),
+        "run_fingerprint": get_run_fingerprint(model_name, sparsity, seed, config),
+    }
+
+
+def load_trained_model(
+    model_name: str,
+    num_users: int,
+    num_items: int,
+    sparsity: float = 1.0,
+    seed: int = 42,
+):
+    """Load a model after computing data, checkpoint and config cache tokens."""
+    data_token = get_processed_data_cache_token()
+    checkpoint = get_checkpoint_cache_token(model_name, sparsity, seed)
+    if checkpoint["checkpoint_state"] is None:
+        raise MissingCheckpointError(
+            f"Chưa có checkpoint cho {model_name}, density={sparsity}, seed={seed}. "
+            "Hãy train đúng cấu hình này trước khi mở Demo."
+        )
+    return load_trained_model_cached(
+        model_name,
+        num_users,
+        num_items,
+        sparsity,
+        seed,
+        data_token,
+        checkpoint["checkpoint_path"],
+        json.dumps(checkpoint["checkpoint_state"], sort_keys=True),
+        checkpoint["run_fingerprint"],
+    )
+
+
+def clear_dashboard_cache() -> None:
+    """Clear only dashboard data and model caches."""
+    load_processed_data_cached.clear()
+    load_trained_model_cached.clear()
+
+
+# ===============================================================================
 # Main Application
-# ==============================================================================
+# ===============================================================================
 def main():
     st.title("⚡ Graph Contrastive Learning Dashboard")
     st.caption("Interactive Research Suite for Top-K Recommendation Systems")
 
     # Load data
-    train_df, val_df, test_df, mappings = load_processed_data()
+    train_df, _val_df, _test_df, mappings = load_processed_data()
 
     if train_df is None:
         st.error("⚠️ Dataset not found. Please run `python scripts/prepare_data.py` first.")
@@ -264,8 +461,11 @@ def main():
                 for _, row in history_items.iterrows():
                     info = item_metadata.get(row["i_idx"], {})
                     h_data.append({
-                        "Product": info.get("title", "Unknown")[:50],
-                        "Brand": info.get("brand", "Unknown"),
+                        "ASIN": info.get("original_id", "Unknown ASIN"),
+                        "Product": display_title(info, max_length=50),
+                        "Brand": display_brand(info),
+                        "Brand source": display_brand_source(info),
+                        "Category": display_category(info, max_length=50),
                     })
                 st.dataframe(pd.DataFrame(h_data), use_container_width=True, hide_index=True)
 
@@ -282,21 +482,35 @@ def main():
 
         col_brand, col_cat, col_ann = st.columns(3)
         with col_brand:
-            brands = ["All Brands"] + sorted([
-                v.get("brand", "") for v in item_metadata.values()
-                if v.get("brand") and v.get("brand") != "Unknown"
-            ])[:50]
-            selected_brand = st.selectbox("Filter by Brand", options=brands, index=0)
+            brands = [ALL_BRANDS_LABEL] + unique_filter_options(
+                item_metadata, brand_filter_value
+            )
+            selected_brand = st.selectbox(
+                "Filter by Brand",
+                options=brands,
+                index=0,
+                format_func=format_brand_filter,
+            )
 
         with col_cat:
-            cats = ["All Categories"] + sorted([
-                v.get("categories", "").split(" > ")[-1]
-                for v in item_metadata.values() if v.get("categories")
-            ])[:50]
-            selected_cat = st.selectbox("Filter by Category", options=cats, index=0)
+            cats = [ALL_CATEGORIES_LABEL] + unique_filter_options(
+                item_metadata, category_filter_value
+            )
+            selected_cat = st.selectbox(
+                "Filter by Category",
+                options=cats,
+                index=0,
+                format_func=format_category_filter,
+            )
 
         with col_ann:
             use_ann = st.checkbox("Use ANN Search", value=True)
+
+        counts = metadata_counts(item_metadata.values())
+        st.caption(
+            f"Metadata: {counts['missing_titles']:,} sản phẩm chưa có title; "
+            f"{counts['missing_brands']:,} chưa rõ hãng. Các item này vẫn được giữ trong catalog."
+        )
 
         st.divider()
 
@@ -306,7 +520,13 @@ def main():
                 st.warning("Please select at least one model")
             else:
                 seen_items = set(user_history["i_idx"])
-                diversity_features, diversity_mask = load_training_text("data/processed", mappings)
+                try:
+                    diversity_features, diversity_mask = load_demo_text(
+                        "data/processed", mappings
+                    )
+                except TextCacheCompatibilityError as exc:
+                    st.error(str(exc))
+                    st.stop()
 
                 for model_name in selected_models:
                     config = model_configs[model_name]
@@ -322,15 +542,17 @@ def main():
                         u_vec = u_embeds[u_idx:u_idx + 1]
 
                         # Build filter
-                        has_filter = (selected_brand != "All Brands") or (selected_cat != "All Categories")
+                        has_filter = (
+                            selected_brand != ALL_BRANDS_LABEL
+                            or selected_cat != ALL_CATEGORIES_LABEL
+                        )
 
                         def make_filter_fn(brand, cat):
                             def filter_fn(meta):
-                                if brand != "All Brands" and meta.get("brand") != brand:
-                                    return False
-                                if cat != "All Categories" and cat not in meta.get("categories", ""):
-                                    return False
-                                return True
+                                return (
+                                    (brand == ALL_BRANDS_LABEL or brand_filter_value(meta) == brand)
+                                    and (cat == ALL_CATEGORIES_LABEL or category_filter_value(meta) == cat)
+                                )
                             return filter_fn
 
                         if use_ann and not has_filter:
@@ -372,8 +594,11 @@ def main():
                             info = item_metadata.get(idx, {})
                             rec_data.append({
                                 "Rank": rank,
-                                "Product": info.get("title", "Unknown")[:45] + "...",
-                                "Brand": info.get("brand", "Unknown"),
+                                "ASIN": info.get("original_id", "Unknown ASIN"),
+                                "Product": display_title(info, max_length=45),
+                                "Brand": display_brand(info),
+                                "Brand source": display_brand_source(info),
+                                "Category": display_category(info, max_length=45),
                                 "Score": f"{score:.3f}",
                             })
 
@@ -388,8 +613,14 @@ def main():
                         with m3:
                             st.metric("Novelty", f"{novelty_bits:.2f} bits")
 
-                    except Exception as e:
-                        st.error(f"Error loading {config['name']}: {str(e)}")
+                    except MissingCheckpointError as exc:
+                        st.warning(str(exc))
+                    except TextCacheCompatibilityError as exc:
+                        st.error(str(exc))
+                    except CheckpointCompatibilityError as exc:
+                        st.error(str(exc))
+                    except Exception as e:  # noqa: BLE001 - UI boundary must keep other models usable.
+                        st.error(f"Error loading {config['name']}: {e!s}")
 
     # ===========================================================================
     # TAB 2: Benchmark Results
@@ -545,7 +776,10 @@ def main():
                         if hasattr(model, "zero_shot_embed"):
                             item_zero_shot = model.zero_shot_embed(text_vec).to(device)
                         else:
-                            item_zero_shot = F.normalize(torch.randn((1, 64), device=device), dim=-1)
+                            raise CheckpointCompatibilityError(
+                                "Model adaptive_gcl hiện tại không hỗ trợ zero-shot; "
+                                "hãy train lại đúng phiên bản model."
+                            )
 
                         user_scores = torch.matmul(u_embeds, item_zero_shot.T).squeeze(-1)
                         topk_users, topk_scores = torch.topk(user_scores, k=10)
@@ -567,8 +801,14 @@ def main():
 
                         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-                    except Exception as ex:
-                        st.error(f"Error: {str(ex)}")
+                    except MissingCheckpointError as ex:
+                        st.warning(str(ex))
+                    except TextCacheCompatibilityError as ex:
+                        st.error(str(ex))
+                    except CheckpointCompatibilityError as ex:
+                        st.error(str(ex))
+                    except Exception as ex:  # noqa: BLE001 - UI boundary reports inference failures.
+                        st.error(f"Error: {ex!s}")
 
     # ===========================================================================
     # TAB 6: Theoretical Foundations
@@ -608,7 +848,7 @@ def main():
             with st.expander(f"📐 {info['name']}"):
                 st.markdown(f"**{info['desc']}**")
                 st.latex(info['formula'])
-                st.markdown(f"**Loss:**")
+                st.markdown("**Loss:**")
                 st.latex(info['loss'])
 
         st.subheader("Computational Complexity")
@@ -624,6 +864,12 @@ def main():
 
     st.divider()
     st.caption("⚡ Advanced Graph Contrastive Learning Suite | Course Project")
+
+    with st.sidebar:
+        st.subheader("Dữ liệu và cache")
+        if st.button("Tải lại dữ liệu / model cache"):
+            clear_dashboard_cache()
+            st.rerun()
 
 
 if __name__ == "__main__":

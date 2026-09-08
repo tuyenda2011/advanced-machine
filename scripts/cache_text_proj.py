@@ -1,7 +1,7 @@
 """Cache projected item text embeddings with SHA-256 checksum invalidation.
 
 Usage:
-    python scripts/cache_text_proj.py [--text-features data/processed/item_text_embeddings.pt] [--out data/cache/item_proj.pt]
+    python scripts/cache_text_proj.py [--bundle data/current.json] [--out data/cache/item_proj.pt]
 
 Ensures projection is computed once and auto-invalidated whenever input features change.
 """
@@ -13,10 +13,13 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Tuple
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import torch
-import torch.nn as nn
+from torch import nn
+
+from src.data.bundle import BundleError, resolve_bundle
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +33,7 @@ def compute_tensor_sha256(tensor: torch.Tensor) -> str:
 def load_cached_projection(
     cache_path: str | Path,
     current_text_features: torch.Tensor,
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     """Load cached projection tensor if cache exists and SHA-256 matches current input features.
 
     Returns:
@@ -66,7 +69,7 @@ def load_cached_projection(
         logger.info(f"Cache hit! Successfully loaded projected embeddings from {cache_path}")
         return proj_text
 
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - any corrupt cache is a cache miss.
         logger.warning(f"Failed to load cache from {cache_path} ({exc}). Invalidating cache.")
         return None
 
@@ -138,7 +141,7 @@ def main(argv=None):
     parser.add_argument(
         "--text-features",
         type=Path,
-        default=Path("data/processed/item_text_embeddings.pt"),
+        default=None,
         help="Path to item text embeddings .pt file",
     )
     parser.add_argument(
@@ -158,10 +161,20 @@ def main(argv=None):
         action="store_true",
         help="Force recomputation even if cache is valid",
     )
+    parser.add_argument(
+        "--bundle",
+        help="Bundle path or data/current.json when --text-features is omitted",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    cache_projection_pipeline(args.text_features, args.out, embedding_dim=args.dim, force=args.force)
+    text_features = args.text_features
+    if text_features is None:
+        try:
+            text_features = resolve_bundle(args.bundle).artifact("item_text_embeddings.pt")
+        except BundleError as exc:
+            parser.error(f"Dataset bundle is invalid: {exc}")
+    cache_projection_pipeline(text_features, args.out, embedding_dim=args.dim, force=args.force)
 
 
 if __name__ == "__main__":
