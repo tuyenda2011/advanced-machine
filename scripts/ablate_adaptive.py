@@ -7,6 +7,7 @@ import json
 import pickle
 import sys
 from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,7 +19,11 @@ import torch
 from src.data.bundle import BundleError, resolve_bundle
 from src.data.provenance import sha256_file
 from src.data.sparsity import create_sparse_train_set
-from src.data.text_encoder import build_user_history_features, load_training_text
+from src.data.text_encoder import (
+    build_user_history_features,
+    load_text_view,
+    load_training_text,
+)
 from src.evaluation.evaluator import Evaluator
 from src.models.adaptive_gcl import AdaptiveGCL
 from src.training.trainer import Trainer
@@ -30,14 +35,38 @@ from src.utils.seed import set_seed
 
 # One factor at a time, relative to the loaded full configuration.
 VARIANTS = {
+    "previous_bounded": {"layer_aggregation": "learnable", "user_semantic_gate": False, "ssl_target": "projected"},
+    "without_layer_anchor": {"layer_aggregation": "learnable"},
+    "without_user_gate": {"user_semantic_gate": False},
+    "projected_ssl_target": {"ssl_target": "projected"},
+    "bounded_residual": {"fusion_mode": "bounded_residual", "residual_alpha_init": 0.1},
+    "bounded_residual_ssl_001": {
+        "fusion_mode": "bounded_residual", "residual_alpha_init": 0.1, "ssl_reg": 0.01,
+    },
     "full": {},
     "no_item_text": {"use_item_text": False},
     "no_user_text": {"user_semantic_weight": 0.0},
     "no_ssl": {"ssl_reg": 0.0},
+    "ssl_001": {"ssl_reg": 0.01},
+    "ssl_003": {"ssl_reg": 0.03},
+    "residual_alpha_01": {
+        "fusion_mode": "residual",
+        "residual_alpha_init": 0.1,
+    },
+    "residual_alpha_01_ssl_001": {
+        "fusion_mode": "residual",
+        "residual_alpha_init": 0.1,
+        "ssl_reg": 0.01,
+    },
     "mean_layers": {"layer_aggregation": "mean"},
     "user_weight_025": {"user_semantic_weight": 0.25},
     "mlp_decay_1e4": {"mlp_weight_decay": 1e-4},
     "no_dislikes": {"hard_neg_alpha": 0.0},
+    "no_all_text": {
+        "use_item_text": False,
+        "user_semantic_weight": 0.0,
+        "ssl_reg": 0.0,
+    },
     "no_dropout": {"node_dropout": 0.0},
     "interaction_only": {"use_item_text": False, "user_semantic_weight": 0.0,
                          "ssl_reg": 0.0, "layer_aggregation": "mean",
@@ -52,7 +81,7 @@ def variant_config(base: dict, variant: str) -> dict:
     return validate_model_config(config, "adaptive_gcl")
 
 
-def build_model(config, mappings, sparse, features, mask):
+def build_model(config, mappings, sparse, features, mask, ssl_mask=None):
     users, items = len(mappings["user2id"]), len(mappings["item2id"])
     profiles, user_mask = build_user_history_features(sparse, features, users, mask)
     ada = config["adaptive_gcl"]
@@ -63,6 +92,7 @@ def build_model(config, mappings, sparse, features, mask):
         num_layers=config["model"]["num_layers"],
         text_dim=features.shape[1],
         text_features=features,
+        ssl_item_mask=ssl_mask if ssl_mask is not None else mask,
         user_history_features=profiles,
         item_text_mask=mask,
         user_text_mask=user_mask,
@@ -74,6 +104,11 @@ def build_model(config, mappings, sparse, features, mask):
         use_item_text=ada["use_item_text"],
         user_semantic_weight=ada["user_semantic_weight"],
         layer_aggregation=ada["layer_aggregation"],
+        user_semantic_gate=ada.get("user_semantic_gate", False),
+        ssl_target=ada.get("ssl_target", "projected"),
+        fusion_mode=ada.get("fusion_mode", "convex"),
+        residual_alpha_init=ada.get("residual_alpha_init", 0.1),
+        residual_alpha_max=ada.get("residual_alpha_max", 1.0),
     )
 
 
@@ -104,7 +139,11 @@ def run(args):
         print("Dry-run only. Pass --run to train; no data or artifacts were written.")
         return []
 
-    output = resolve_output_root(args.output_dir, kind="ablation")
+    if args.output_dir:
+        output = resolve_output_root(args.output_dir, kind="ablation")
+    else:
+        stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
+        output = ROOT / "results" / "experiments" / "adaptivegcl_early_decline" / stamp
     if output.exists():
         raise FileExistsError(f"Refusing to overwrite ablation output: {output}")
     configured_processed = Path(base["dataset"].get("processed_dir", "data/processed"))
@@ -119,7 +158,22 @@ def run(args):
     # Only load trusted, locally prepared mappings. Test split is never loaded.
     with (processed / "mappings.pkl").open("rb") as stream:
         mappings = pickle.load(stream)
-    features, mask = load_training_text(processed, mappings)
+    feature_view = base.get("adaptive_gcl", {}).get("feature_view", "shared")
+    if feature_view == "shared":
+        features, mask = load_training_text(processed, mappings)
+        ssl_mask = mask.clone()
+        feature_hashes = {}
+    else:
+        features, mask, ssl_mask, _view_metadata = load_text_view(
+            processed, mappings, feature_view
+        )
+        feature_path = processed / "adaptivegcl_text_embeddings.pt"
+        feature_hashes = {
+            "adaptivegcl_text_embeddings.pt": sha256_file(feature_path),
+            "adaptivegcl_text_embeddings.pt.json": sha256_file(
+                Path(str(feature_path) + ".json")
+            ),
+        }
     train = pd.read_parquet(processed / "train.parquet")
     val = pd.read_parquet(processed / "val.parquet")
     data_hashes = {
@@ -132,6 +186,7 @@ def run(args):
             "item_text_embeddings.pt.json",
         )
     }
+    data_hashes.update(feature_hashes)
     code_hash = get_experiment_fingerprint(
         "adaptive_gcl",
         config_dir=args.config_dir,
@@ -139,7 +194,7 @@ def run(args):
     )
     runner_hash = sha256_file(Path(__file__))
     output.mkdir(parents=True, exist_ok=False)
-    write_run_manifest(
+    manifest_path = write_run_manifest(
         output,
         kind="ablation",
         metadata={
@@ -149,6 +204,22 @@ def run(args):
             "epochs": args.epochs,
             "validation_only": True,
         },
+    )
+    root_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    root_manifest.setdefault("parameters", {}).update(
+        {
+            "feature_view": feature_view,
+            "bundle_id": bundle.build_id if bundle is not None else None,
+            "manifest_sha256": (
+                sha256_file(bundle.manifest_path) if bundle is not None else None
+            ),
+            "code_sha256": code_hash,
+            "runner_sha256": runner_hash,
+            "data_sha256": data_hashes,
+        }
+    )
+    manifest_path.write_text(
+        json.dumps(root_manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     results = []
@@ -170,6 +241,8 @@ def run(args):
                 set_seed(seed)
                 config = deepcopy(template)
                 config["training"].update(epochs=args.epochs, seed=seed)
+                config.setdefault("evaluation", {})["model_diagnostics"] = True
+                config["adaptive_gcl"]["feature_view"] = feature_view
                 identity = {
                     "config": deepcopy(config),
                     "variant": name,
@@ -195,7 +268,7 @@ def run(args):
                 (run_dir / "config.json").write_text(
                     json.dumps(config, indent=2), encoding="utf-8"
                 )
-                model = build_model(config, mappings, sparse, features, mask)
+                model = build_model(config, mappings, sparse, features, mask, ssl_mask)
                 trainer = Trainer(
                     model,
                     sparse,
@@ -216,6 +289,12 @@ def run(args):
                     sparsity=ratio,
                     seed=seed,
                     fingerprint=fingerprint,
+                    fusion_mode=config["adaptive_gcl"].get("fusion_mode", "convex"),
+                    residual_alpha=(
+                        float(model.residual_alpha.item())
+                        if model.residual_alpha is not None
+                        else None
+                    ),
                     validation_users=len(evaluator.eval_users),
                     requested_epochs=args.epochs,
                 )
@@ -226,11 +305,72 @@ def run(args):
                 (output / "summary.json").write_text(
                     json.dumps(results, indent=2), encoding="utf-8"
                 )
+                _write_experiment_tables(output, results)
                 del trainer, model
                 gc.collect()
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
     return results
+
+
+def _write_experiment_tables(output: Path, results: list[dict]) -> None:
+    """Write review-friendly comparisons without touching the data bundle."""
+    rows = []
+    diagnostic_rows = []
+    for result in results:
+        val = result.get("val_metrics", {})
+        history = result.get("history", [])
+        last = history[-1] if history else {}
+        rows.append(
+            {
+                "variant": result.get("variant"),
+                "fusion_mode": result.get("fusion_mode"),
+                "residual_alpha": result.get("residual_alpha"),
+                "seed": result.get("seed"),
+                "sparsity": result.get("sparsity"),
+                "best_epoch": result.get("best_epoch"),
+                "best_val_ndcg20": val.get("NDCG@20"),
+                "recall10": val.get("Recall@10"),
+                "ndcg10": val.get("NDCG@10"),
+                "last_val_ndcg20": last.get("val_ndcg_20"),
+                "total_train_time": result.get("total_train_time"),
+                "fingerprint": result.get("fingerprint"),
+            }
+        )
+        for record in history:
+            diagnostic_rows.append(
+                {
+                    "variant": result.get("variant"),
+                    "seed": result.get("seed"),
+                    "sparsity": result.get("sparsity"),
+                    "epoch": record.get("epoch"),
+                    **{
+                        key.removeprefix("diagnostic_"): value
+                        for key, value in record.items()
+                        if key.startswith("diagnostic_")
+                    },
+                }
+            )
+    pd.DataFrame(rows).to_csv(output / "comparison.csv", index=False)
+    pd.DataFrame(diagnostic_rows).to_csv(output / "diagnostics.csv", index=False)
+    report = output / "cause_analysis.md"
+    lines = [
+        "# AdaptiveGCL early-decline evidence report",
+        "",
+        "This report is generated from validation-only runs. It does not claim a causal explanation by itself.",
+        "",
+        "## Evidence to inspect",
+        "",
+        "- Compare `best_val_ndcg20` and `best_epoch` in `comparison.csv` before comparing loss values.",
+        "- Use `diagnostics.csv` to inspect gate contribution, effective rank, semantic profile coverage, and SSL eligibility.",
+        "- Compare one variant at a time with the `full` row at the same seed and sparsity.",
+        "- A lower loss with lower NDCG is evidence of objective/ranking misalignment, not proof of metadata causality.",
+        "",
+        "## Decision status",
+        "",
+        "The runner records evidence only. Keep the full configuration unless a paired validation comparison supports a change; reserve test metrics for the locked candidate.",
+    ]
+    report.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def parse_args(argv=None):
@@ -248,7 +388,7 @@ def parse_args(argv=None):
         "--variants",
         nargs="+",
         choices=list(VARIANTS),
-        default=["full", "no_user_text", "no_ssl"],
+        default=["full", "no_ssl", "no_user_text", "no_item_text", "no_dislikes"],
     )
     args = parser.parse_args(argv)
     if args.epochs < 1 or any(seed < 0 or seed >= 2**32 for seed in args.seeds):

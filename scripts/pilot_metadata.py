@@ -150,6 +150,10 @@ def make_model(variant, snapshot, config, mappings, sparse, features, item_mask)
             use_item_text=ada.get("use_item_text", True),
             user_semantic_weight=ada.get("user_semantic_weight", 0.5),
             layer_aggregation=ada.get("layer_aggregation", "learnable"),
+            fusion_mode=ada.get("fusion_mode", "convex"),
+            residual_alpha_init=ada.get("residual_alpha_init", 0.1),
+            residual_alpha_max=ada.get("residual_alpha_max", 1.0),
+            ssl_item_mask=item_mask,
         )
     return model
 

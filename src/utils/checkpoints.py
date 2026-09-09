@@ -67,6 +67,10 @@ def get_experiment_fingerprint(
         os.path.join("src", "losses", "debiased_infonce.py"),
         os.path.join("src", "losses", "hard_bpr.py"),
     ]
+    if model_name == "adaptive_gcl":
+        # The quality-controlled feature view and SSL eligibility policy are
+        # part of AdaptiveGCL's executable identity.
+        paths.append(os.path.join("src", "data", "adaptive_metadata.py"))
     digest = hashlib.sha256()
     for path in paths:
         target = path if isinstance(path, Path) else REPO_ROOT / path

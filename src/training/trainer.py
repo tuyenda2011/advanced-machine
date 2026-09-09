@@ -452,7 +452,8 @@ class Trainer:
                 auxiliary = {}
                 if self.model_name == "adaptive_gcl":
                     if self.model.ssl_reg > 0:
-                        semantic_pairs += int(self.model.item_text_mask[torch.unique(pos_batch)].sum().item())
+                        ssl_mask = getattr(self.model, "ssl_item_text_mask", self.model.item_text_mask)
+                        semantic_pairs += int(ssl_mask[torch.unique(pos_batch)].sum().item())
                     if hard_item_array is not None and hard_item_available is not None:
                         available = hard_item_available[batch_idx]
                         hard_pair_count += int(np.count_nonzero(available))

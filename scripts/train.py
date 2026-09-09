@@ -21,8 +21,13 @@ import pickle
 import pandas as pd
 
 from src.data.bundle import BundleError, resolve_bundle
+from src.data.provenance import sha256_file
 from src.data.sparsity import create_sparse_train_set
-from src.data.text_encoder import build_user_history_features, load_training_text
+from src.data.text_encoder import (
+    build_user_history_features,
+    load_text_view,
+    load_training_text,
+)
 from src.evaluation.evaluator import EVALUATION_PROTOCOL, Evaluator
 from src.models.adaptive_gcl import AdaptiveGCL
 from src.models.directau import DirectAU
@@ -333,15 +338,53 @@ def main():
         )
     elif args.model == "adaptive_gcl":
         ada_cfg = config.get("adaptive_gcl", {})
-        if args.validation_only:
-            text_features, item_text_mask = load_training_text(processed_dir, mappings)
+        feature_view = ada_cfg.get("feature_view", "shared")
+        feature_artifact_hashes = {}
+        if feature_view == "shared":
+            if args.validation_only:
+                text_features, item_text_mask = load_training_text(processed_dir, mappings)
+            else:
+                text_features, item_text_mask = diversity_features, diversity_mask
+            ssl_item_mask = item_text_mask
         else:
-            text_features, item_text_mask = diversity_features, diversity_mask
+            text_features, item_text_mask, ssl_item_mask, view_metadata = load_text_view(
+                processed_dir, mappings, feature_view
+            )
+            feature_path = Path(processed_dir) / "adaptivegcl_text_embeddings.pt"
+            feature_sidecar_path = Path(str(feature_path) + ".json")
+            config["adaptive_gcl"]["feature_view_metadata"] = {
+                key: value
+                for key, value in view_metadata.items()
+                if key in {"feature_view", "metadata_policy", "source_metadata_policy", "input_fingerprint"}
+            }
+            feature_artifact_hashes = {
+                "embedding_sha256": sha256_file(feature_path),
+                "sidecar_sha256": sha256_file(feature_sidecar_path),
+            }
+            config["adaptive_gcl"]["feature_view_metadata"].update(
+                feature_artifact_hashes
+            )
+            # The feature artifact is part of the run identity. Recompute after
+            # loading it so a changed derived view cannot reuse a checkpoint.
+            config["experiment_fingerprint"] = get_run_fingerprint(
+                args.model,
+                args.sparsity,
+                args.seed,
+                config,
+                args.config_dir,
+                manifest_path=bundle.manifest_path if bundle is not None else None,
+            )
         text_dim = text_features.shape[1]
         user_history_features, user_text_mask = build_user_history_features(
             train_df_sparse, text_features, num_users, item_text_mask
         )
         logger.info("Usable text: %s/%s items; semantic profiles: %s/%s users", int(item_text_mask.sum()), num_items, int(user_text_mask.sum()), num_users)
+        logger.info(
+            "AdaptiveGCL architecture: fusion=%s, layers=%s, user_gate=%s, ssl_target=%s, ssl_reg=%s",
+            ada_cfg.get("fusion_mode", "convex"), ada_cfg.get("layer_aggregation", "learnable"),
+            ada_cfg.get("user_semantic_gate", False), ada_cfg.get("ssl_target", "projected"),
+            ada_cfg.get("ssl_reg", 0.1),
+        )
 
         model = AdaptiveGCL(
             num_users,
@@ -357,12 +400,34 @@ def main():
             tau_plus=ada_cfg.get("tau_plus", 0.0),
             user_history_features=user_history_features,
             item_text_mask=item_text_mask,
+            ssl_item_mask=ssl_item_mask,
             user_text_mask=user_text_mask,
             use_item_text=ada_cfg.get("use_item_text", True),
             user_semantic_weight=ada_cfg.get("user_semantic_weight", 0.5),
             layer_aggregation=ada_cfg.get("layer_aggregation", "learnable"),
+            user_semantic_gate=ada_cfg.get("user_semantic_gate", False),
+            ssl_target=ada_cfg.get("ssl_target", "projected"),
+            fusion_mode=ada_cfg.get("fusion_mode", "convex"),
+            residual_alpha_init=ada_cfg.get("residual_alpha_init", 0.1),
+            residual_alpha_max=ada_cfg.get("residual_alpha_max", 1.0),
         )
 
+    if args.model == "adaptive_gcl":
+        run_manifest_path = Path(args.output_root) / "run_manifest.json"
+        if run_manifest_path.is_file():
+            run_manifest = json.loads(run_manifest_path.read_text(encoding="utf-8"))
+            run_manifest.setdefault("parameters", {}).update(
+                {
+                    "feature_view": feature_view,
+                    "feature_view_metadata": config["adaptive_gcl"].get(
+                        "feature_view_metadata", {}
+                    ),
+                }
+            )
+            run_manifest_path.write_text(
+                json.dumps(run_manifest, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
 
     # 8. Train model
     sparsity_tag = f"s{int(args.sparsity * 100)}"
@@ -402,6 +467,19 @@ def main():
     results["encoder"] = "LightGCN"
     results["profile"] = getattr(model, "profile", None)
     results["text_policy"] = "masked_text" if args.model == "adaptive_gcl" else None
+    results["feature_view"] = (
+        config.get("adaptive_gcl", {}).get("feature_view")
+        if args.model == "adaptive_gcl" else None
+    )
+    results["fusion_mode"] = (
+        config.get("adaptive_gcl", {}).get("fusion_mode")
+        if args.model == "adaptive_gcl" else None
+    )
+    results["residual_alpha"] = (
+        float(model.residual_alpha.item())
+        if args.model == "adaptive_gcl" and getattr(model, "residual_alpha", None) is not None
+        else None
+    )
     results["evaluation_protocol"] = EVALUATION_PROTOCOL
     results["evaluation_metadata"] = {
         "main_metric_cohort": "warm_start_users_and_items",

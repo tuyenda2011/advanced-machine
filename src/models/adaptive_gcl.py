@@ -40,6 +40,12 @@ class AdaptiveGCL(BaseRecommender):
         use_item_text: bool = True,
         user_semantic_weight: float = 0.5,
         layer_aggregation: str = "learnable",
+        fusion_mode: str = "convex",
+        residual_alpha_init: float = 0.1,
+        residual_alpha_max: float = 1.0,
+        ssl_item_mask: Optional[torch.Tensor] = None,
+        user_semantic_gate: bool = False,
+        ssl_target: str = "projected",
     ):
         if not isinstance(use_item_text, bool):
             raise ValueError("use_item_text must be a boolean")
@@ -47,17 +53,39 @@ class AdaptiveGCL(BaseRecommender):
             raise ValueError("user_semantic_weight must be finite and nonnegative")
         if not math.isfinite(ssl_reg) or ssl_reg < 0:
             raise ValueError("ssl_reg must be finite and nonnegative")
-        if layer_aggregation not in {"learnable", "mean"}:
-            raise ValueError("layer_aggregation must be learnable or mean")
+        if layer_aggregation not in {"learnable", "mean", "anchored"}:
+            raise ValueError("layer_aggregation must be learnable, mean or anchored")
+        if not isinstance(user_semantic_gate, bool):
+            raise ValueError("user_semantic_gate must be boolean")
+        if ssl_target not in {"projected", "frozen_text"}:
+            raise ValueError("ssl_target must be projected or frozen_text")
+        if fusion_mode not in {"convex", "residual", "bounded_residual"}:
+            raise ValueError("fusion_mode must be convex, residual or bounded_residual")
+        if (
+            not math.isfinite(residual_alpha_init)
+            or not math.isfinite(residual_alpha_max)
+            or residual_alpha_init <= 0
+            or residual_alpha_max <= 0
+            or residual_alpha_init >= residual_alpha_max
+        ):
+            raise ValueError(
+                "residual_alpha_init and residual_alpha_max must be finite with "
+                "0 < residual_alpha_init < residual_alpha_max"
+            )
         super().__init__(num_users, num_items, embedding_dim, num_layers)
         self.use_item_text = use_item_text
         self.user_semantic_weight = user_semantic_weight
         self.layer_aggregation = layer_aggregation
+        self.user_semantic_gate = user_semantic_gate
+        self.ssl_target = ssl_target
         self.text_dim = text_dim
         self.ssl_temp = ssl_temp
         self.ssl_reg = ssl_reg
         self.dirichlet_reg = dirichlet_reg
         self.node_dropout = node_dropout
+        self.fusion_mode = fusion_mode
+        self.residual_alpha_init = residual_alpha_init
+        self.residual_alpha_max = residual_alpha_max
         self.debiased_ssl = DebiasedInfoNCELoss(
             temperature=ssl_temp,
             tau_plus=tau_plus,
@@ -91,6 +119,12 @@ class AdaptiveGCL(BaseRecommender):
 
         # Global layer logits, shared by all nodes; keep the state_dict key.
         self.layer_attention_weights = nn.Parameter(torch.zeros(num_layers + 1))
+        if fusion_mode in {"residual", "bounded_residual"}:
+            initial_ratio = residual_alpha_init / residual_alpha_max
+            initial_logit = math.log(initial_ratio / (1.0 - initial_ratio))
+            # Deterministic scalar initialization; convex mode keeps its
+            # original parameter set and RNG sequence.
+            self.residual_alpha_logit = nn.Parameter(torch.tensor(initial_logit))
 
         # Register item text features as buffer if provided
         if text_features is not None and item_text_mask is None:
@@ -99,6 +133,7 @@ class AdaptiveGCL(BaseRecommender):
             raise ValueError("user_text_mask is required with user_history_features")
         for label, mask, count in (
             ("item", item_text_mask, num_items),
+            ("ssl_item", ssl_item_mask if ssl_item_mask is not None else item_text_mask, num_items),
             ("user", user_text_mask, num_users),
         ):
             if mask is not None and (
@@ -140,6 +175,15 @@ class AdaptiveGCL(BaseRecommender):
             self.register_buffer("user_history_features", None, persistent=False)
 
         self._init_adaptive_weights()
+        # Optional heads are initialized after legacy parameters so their
+        # addition does not change the shared control's initialization.
+        if user_semantic_gate:
+            self.user_gate = nn.Linear(embedding_dim * 2, 1)
+            nn.init.zeros_(self.user_gate.weight)
+            nn.init.constant_(self.user_gate.bias, math.log(0.1 / 0.9))
+        if ssl_target == "frozen_text":
+            self.ssl_graph_proj = nn.Linear(embedding_dim, text_dim, bias=False)
+            nn.init.xavier_uniform_(self.ssl_graph_proj.weight)
 
     def optimizer_param_groups(self, mlp_weight_decay: float = 0.0) -> list[dict]:
         """Adam L2 on MLP matrices only; ID regularization remains in BPR."""
@@ -148,7 +192,7 @@ class AdaptiveGCL(BaseRecommender):
         decay: list[nn.Parameter] = []
         no_decay: list[nn.Parameter] = []
         for name, parameter in self.named_parameters():
-            is_mlp = name.startswith(("text_proj.", "gate_mlp.", "user_semantic_mlp."))
+            is_mlp = name.startswith(("text_proj.", "gate_mlp.", "user_semantic_mlp.", "user_gate.", "ssl_graph_proj."))
             (decay if is_mlp and parameter.ndim == 2 else no_decay).append(parameter)
         return [
             {"params": no_decay, "weight_decay": 0.0},
@@ -178,45 +222,112 @@ class AdaptiveGCL(BaseRecommender):
         ):
             raise ValueError("Invalid updated text features/mask")
         self.item_text_mask = item_text_mask.to(device)
+        # Keep the legacy setter's single-mask behavior; callers with a
+        # separate SSL policy can override it explicitly via set_ssl_item_mask.
+        self.ssl_item_text_mask = item_text_mask.to(device)
         self.register_buffer(
             "text_features", text_features.float().to(device), persistent=False
         )
+
+    def set_ssl_item_mask(self, ssl_item_mask: torch.Tensor) -> None:
+        """Update the item eligibility mask used by semantic SSL only."""
+        if ssl_item_mask.dtype != torch.bool or ssl_item_mask.shape != (self.num_items,):
+            raise ValueError("Invalid ssl item text mask")
+        self.ssl_item_text_mask = ssl_item_mask.to(self.user_embedding.weight.device)
+
+    @property
+    def residual_alpha(self) -> torch.Tensor | None:
+        """Return the learned residual scale, or ``None`` for convex fusion."""
+        if self.fusion_mode not in {"residual", "bounded_residual"}:
+            return None
+        return self.residual_alpha_max * torch.sigmoid(self.residual_alpha_logit)
+
+    def _fusion_components(
+        self,
+        item_indices: torch.Tensor | None = None,
+        cached_proj_text: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Compute item fusion and its contributions with one shared formula."""
+        if item_indices is None:
+            item_indices = torch.arange(
+                self.num_items, device=self.item_embedding.weight.device
+            )
+        item_id = self.item_embedding.weight[item_indices]
+        if not self.use_item_text:
+            return (
+                item_id,
+                torch.ones_like(item_id),
+                item_id,
+                torch.zeros_like(item_id),
+                None,
+            )
+        if cached_proj_text is not None:
+            proj_text = cached_proj_text[item_indices]
+        else:
+            proj_text = self.text_proj(self.text_features[item_indices])
+        gate_input = torch.cat([item_id, proj_text], dim=-1)
+        gate = self.gate_mlp(gate_input)
+        usable = self.item_text_mask[item_indices][:, None]
+        gate = torch.where(usable, gate, torch.ones_like(gate))
+        if self.fusion_mode in {"residual", "bounded_residual"}:
+            alpha = self.residual_alpha
+            if self.fusion_mode == "bounded_residual":
+                proj_text = self._bound_semantic_norm(proj_text, item_id)
+            text_contribution = alpha * (1.0 - gate) * proj_text
+            text_contribution = torch.where(
+                usable, text_contribution, torch.zeros_like(text_contribution)
+            )
+            id_contribution = item_id
+        else:
+            id_contribution = gate * item_id
+            text_contribution = (1.0 - gate) * proj_text
+        fused = id_contribution + text_contribution
+        return fused, gate, id_contribution, text_contribution, proj_text
 
     def get_gated_item_embeddings(
         self, cached_proj_text: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute adaptively gated initial item representations and gating weights."""
-        i_id_emb = self.item_embedding.weight
-        if not self.use_item_text:
-            return i_id_emb, torch.ones_like(i_id_emb)
-        if cached_proj_text is not None:
-            proj_text = cached_proj_text
-        else:
-            proj_text = self.text_proj(self.text_features)
+        fused, gate, _, _, _ = self._fusion_components(
+            cached_proj_text=cached_proj_text
+        )
+        return fused, gate
 
-        # Compute element-wise adaptive gate g in (0, 1)
-        gate_input = torch.cat([i_id_emb, proj_text], dim=-1)
-        g = self.gate_mlp(gate_input)
+    @staticmethod
+    def _bound_semantic_norm(semantic: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+        """Cap each semantic row by its ID norm without growing small rows.
 
-        # Fused item embedding: g * ID + (1 - g) * Text
-        fused_items = g * i_id_emb + (1.0 - g) * proj_text
-        fused_items = torch.where(self.item_text_mask[:, None], fused_items, i_id_emb)
-        g = torch.where(self.item_text_mask[:, None], g, torch.ones_like(g))
-        return fused_items, g
+        Detach the ID budget so semantic gradients cannot enlarge it directly.
+        Keep the semantic norm differentiable to remove the radial incentive
+        to grow a projection that has already reached the cap.
+        """
+        budget = reference.detach().norm(dim=-1, keepdim=True)
+        scale = (budget / semantic.norm(dim=-1, keepdim=True).clamp_min(1e-12)).clamp(max=1.0)
+        return semantic * scale
+
+    def _user_semantic_contribution(self, user_id, user_sem, usable):
+        if self.fusion_mode == "bounded_residual":
+            user_sem = self._bound_semantic_norm(user_sem, user_id)
+        if self.user_semantic_gate:
+            gate = torch.sigmoid(self.user_gate(torch.cat([
+                F.normalize(user_id, dim=-1), F.normalize(user_sem, dim=-1)
+            ], dim=-1)))
+            user_sem = gate * user_sem
+        return self.user_semantic_weight * torch.where(
+            usable[:, None], user_sem, torch.zeros_like(user_sem)
+        )
 
     def get_user_initial_embeddings(self) -> torch.Tensor:
         """Compute user initial embeddings, optionally enriched with semantic history."""
         u_emb = self.user_embedding.weight
         if self.user_history_features is not None and self.user_semantic_weight > 0:
             user_sem = self.user_semantic_mlp(self.user_history_features)
-            u_emb = u_emb + self.user_semantic_weight * torch.where(
-                self.user_text_mask[:, None], user_sem, torch.zeros_like(user_sem)
-            )
+            u_emb = u_emb + self._user_semantic_contribution(u_emb, user_sem, self.user_text_mask)
         return u_emb
 
     def zero_shot_embed(self, new_text_features: torch.Tensor) -> torch.Tensor:
         """Experimental text-only embeddings; not evidence of cold-start accuracy."""
-        if not self.use_item_text and self.ssl_reg == 0:
+        if not self.use_item_text and (self.ssl_reg == 0 or self.ssl_target == "frozen_text"):
             raise RuntimeError(
                 "Text projection is inactive in this ablation; zero-shot is unavailable"
             )
@@ -247,25 +358,24 @@ class AdaptiveGCL(BaseRecommender):
             user_indices = user_indices.to(device=device, dtype=torch.long)
 
         diagnostics: dict[str, float] = {}
-        if self.layer_aggregation == "mean":
-            layer_weights = torch.full(
-                (self.num_layers + 1,), 1.0 / (self.num_layers + 1), device=device
-            )
-        else:
-            layer_weights = F.softmax(self.layer_attention_weights, dim=0)
+        layer_weights = self.get_layer_weights()
         entropy = -(layer_weights * torch.log(layer_weights.clamp_min(1e-12))).sum()
         for index, value in enumerate(layer_weights):
             diagnostics[f"layer_weight_{index}"] = float(value.item())
         diagnostics["layer_weight_entropy"] = float(entropy.item())
+        if item_indices.numel():
+            diagnostics["ssl_eligible_item_fraction"] = float(
+                self.ssl_item_text_mask[item_indices].float().mean().item()
+            )
+        if self.residual_alpha is not None:
+            diagnostics["residual_alpha"] = float(self.residual_alpha.item())
+            diagnostics["residual_alpha_max"] = float(self.residual_alpha_max)
 
         if item_indices.numel() and self.use_item_text:
-            item_id = self.item_embedding.weight[item_indices]
-            item_text = self.text_proj(self.text_features[item_indices])
-            gate = self.gate_mlp(torch.cat([item_id, item_text], dim=-1))
+            _, gate, id_contrib, text_contrib, item_text = self._fusion_components(
+                item_indices=item_indices
+            )
             usable = self.item_text_mask[item_indices]
-            gate = torch.where(usable[:, None], gate, torch.ones_like(gate))
-            id_contrib = gate * item_id
-            text_contrib = (1.0 - gate) * item_text
             usable_gate = gate[usable]
             if usable_gate.numel():
                 diagnostics["gate_mean"] = float(usable_gate.mean().item())
@@ -273,10 +383,14 @@ class AdaptiveGCL(BaseRecommender):
                 diagnostics["gate_p90"] = float(torch.quantile(usable_gate, 0.90).item())
                 diagnostics["gate_near_zero_fraction"] = float((usable_gate < 0.1).float().mean().item())
                 diagnostics["gate_near_one_fraction"] = float((usable_gate > 0.9).float().mean().item())
+            item_id = self.item_embedding.weight[item_indices]
             diagnostics["item_id_norm_mean"] = float(item_id.norm(dim=-1).mean().item())
             diagnostics["item_text_norm_mean"] = float(item_text.norm(dim=-1).mean().item())
             diagnostics["item_id_contribution_norm_mean"] = float(id_contrib.norm(dim=-1).mean().item())
             diagnostics["item_text_contribution_norm_mean"] = float(text_contrib.norm(dim=-1).mean().item())
+            diagnostics["item_text_to_id_ratio"] = float(
+                (text_contrib.norm(dim=-1) / item_id.norm(dim=-1).clamp_min(1e-12)).mean().item()
+            )
             diagnostics["usable_item_text_fraction"] = float(usable.float().mean().item())
         else:
             diagnostics["gate_mean"] = 1.0
@@ -284,6 +398,7 @@ class AdaptiveGCL(BaseRecommender):
             diagnostics["gate_p90"] = 1.0
             diagnostics["gate_near_zero_fraction"] = 0.0
             diagnostics["gate_near_one_fraction"] = 1.0
+            diagnostics.setdefault("ssl_eligible_item_fraction", 0.0)
 
         if (
             user_indices.numel()
@@ -293,12 +408,13 @@ class AdaptiveGCL(BaseRecommender):
             user_id = self.user_embedding.weight[user_indices]
             user_sem = self.user_semantic_mlp(self.user_history_features[user_indices])
             usable_users = self.user_text_mask[user_indices]
-            weighted_sem = self.user_semantic_weight * torch.where(
-                usable_users[:, None], user_sem, torch.zeros_like(user_sem)
-            )
+            weighted_sem = self._user_semantic_contribution(user_id, user_sem, usable_users)
             diagnostics["user_id_norm_mean"] = float(user_id.norm(dim=-1).mean().item())
             diagnostics["user_semantic_norm_mean"] = float(user_sem.norm(dim=-1).mean().item())
             diagnostics["user_semantic_weighted_norm_mean"] = float(weighted_sem.norm(dim=-1).mean().item())
+            diagnostics["user_semantic_to_id_ratio"] = float(
+                (weighted_sem.norm(dim=-1) / user_id.norm(dim=-1).clamp_min(1e-12)).mean().item()
+            )
             diagnostics["usable_user_text_fraction"] = float(usable_users.float().mean().item())
         return diagnostics
 
@@ -337,6 +453,15 @@ class AdaptiveGCL(BaseRecommender):
             adj = self._apply_node_dropout(adj)
         return adj
 
+    def get_layer_weights(self) -> torch.Tensor:
+        uniform = torch.full_like(self.layer_attention_weights, 1.0 / (self.num_layers + 1))
+        if self.layer_aggregation == "mean":
+            return uniform
+        learned = F.softmax(self.layer_attention_weights, dim=0)
+        # Half of the mass always covers all graph depths; learned weights
+        # cannot bypass message passing by concentrating entirely on layer 0.
+        return 0.5 * uniform + 0.5 * learned if self.layer_aggregation == "anchored" else learned
+
     def forward(
         self,
         norm_adj: torch.Tensor,
@@ -368,11 +493,8 @@ class AdaptiveGCL(BaseRecommender):
 
         # 4. Global weighted aggregation or fixed uniform aggregation.
         stacked_embs = torch.stack(layer_embs, dim=1)  # (N_nodes, num_layers + 1, dim)
-        if self.layer_aggregation == "mean":
-            final_embs = stacked_embs.mean(dim=1)
-        else:
-            attn_weights = F.softmax(self.layer_attention_weights, dim=0)
-            final_embs = torch.sum(stacked_embs * attn_weights.view(1, -1, 1), dim=1)
+        attn_weights = self.get_layer_weights()
+        final_embs = torch.sum(stacked_embs * attn_weights.view(1, -1, 1), dim=1)
 
         final_users, final_items = torch.split(
             final_embs, [self.num_users, self.num_items], dim=0
@@ -426,12 +548,19 @@ class AdaptiveGCL(BaseRecommender):
             zero = final_items.sum() * 0.0
             return zero, zero
         unique_items = torch.unique(batch_items)
-        unique_items = unique_items[self.item_text_mask[unique_items]]
+        unique_items = unique_items[self.ssl_item_text_mask[unique_items]]
         if unique_items.numel() < 2:
             zero = final_items.sum() * 0.0
             return zero, zero
         graph_i_emb = final_items[unique_items]
 
+        if self.ssl_target == "frozen_text":
+            # The target remains the frozen encoder output. Fusion's learned
+            # projection cannot move both sides of the supervision together.
+            raw_loss = self.debiased_ssl.compute_debiased_contrastive_loss(
+                self.ssl_graph_proj(graph_i_emb), self.text_features[unique_items].detach()
+            )
+            return raw_loss, self.ssl_reg * raw_loss
         if cached_proj_text is not None:
             proj_batch = cached_proj_text[unique_items]
         else:

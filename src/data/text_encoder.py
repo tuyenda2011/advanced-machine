@@ -9,6 +9,11 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 
+from src.data.adaptive_metadata import (
+    ADAPTIVE_TEXT_POLICY,
+    adaptive_text_metadata,
+    semantic_ssl_mask,
+)
 from src.data.preprocessing import METADATA_FLAGS, METADATA_POLICY, metadata_flags
 from src.data.provenance import sha256_file
 
@@ -68,6 +73,89 @@ def load_training_text(processed_dir, mappings):
     return tensor, mask
 
 
+def load_text_view(
+    processed_dir,
+    mappings,
+    view: str = "shared",
+):
+    """Load a verified text view and its SSL eligibility mask.
+
+    ``shared`` is the frozen canonical tensor used for evaluation diversity and
+    all baselines.  ``adaptivegcl_quality`` is an optional derived tensor for
+    AdaptiveGCL only; it excludes unverified title-derived brands and carries a
+    separate category-only SSL mask.
+    """
+    if view in {"shared", "masked_text"}:
+        tensor, item_mask = load_training_text(processed_dir, mappings)
+        return tensor, item_mask, item_mask.clone(), {
+            "feature_view": "shared",
+            "metadata_policy": METADATA_POLICY,
+        }
+    if view != "adaptivegcl_quality":
+        raise ValueError(f"Unknown AdaptiveGCL text view: {view}")
+
+    path = Path(processed_dir) / "adaptivegcl_text_embeddings.pt"
+    metadata_path = Path(str(path) + ".json")
+    derived = adaptive_text_metadata(mappings["item_metadata"])
+    item_mask = get_item_text_mask(derived, len(mappings["item2id"]))
+    fingerprint = get_text_input_fingerprint(
+        derived,
+        len(item_mask),
+        DEFAULT_ENCODER,
+        PINNED_REVISION,
+        policy=ADAPTIVE_TEXT_POLICY,
+    )
+    tensor = load_verified_text_cache(path, fingerprint, item_mask=item_mask)
+    if tensor is None or tensor.shape[1] != 384:
+        raise ValueError(
+            "AdaptiveGCL text view is missing, stale, or incompatible; "
+            "build adaptivegcl_text_embeddings.pt first"
+        )
+    try:
+        sidecar = json.loads(metadata_path.read_text(encoding="utf-8"))
+        ssl_mask = torch.tensor(sidecar["ssl_item_mask"], dtype=torch.bool)
+        if ssl_mask.shape != item_mask.shape:
+            raise ValueError("invalid ssl_item_mask shape")
+        if sidecar.get("feature_view") != "adaptivegcl_quality":
+            raise ValueError("invalid AdaptiveGCL feature view metadata")
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("AdaptiveGCL text view sidecar is invalid") from exc
+    return tensor, item_mask, ssl_mask, sidecar
+
+
+def build_adaptivegcl_text_view(
+    item_metadata: dict[int, dict],
+    num_items: int,
+    *,
+    save_path: str,
+    model_name: str = DEFAULT_ENCODER,
+    revision: str | None = PINNED_REVISION,
+    **kwargs,
+) -> torch.Tensor:
+    """Encode the optional quality-controlled AdaptiveGCL text view."""
+    derived = adaptive_text_metadata(item_metadata)
+    tensor = encode_item_metadata(
+        derived,
+        num_items,
+        model_name=model_name,
+        revision=revision,
+        save_path=save_path,
+        policy=ADAPTIVE_TEXT_POLICY,
+        **kwargs,
+    )
+    sidecar_path = Path(str(save_path) + ".json")
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar.update(
+        {
+            "feature_view": "adaptivegcl_quality",
+            "source_metadata_policy": METADATA_POLICY,
+            "ssl_item_mask": semantic_ssl_mask(derived, num_items),
+        }
+    )
+    sidecar_path.write_text(json.dumps(sidecar, indent=2) + "\n", encoding="utf-8")
+    return tensor
+
+
 def build_user_history_features(
     train_df: pd.DataFrame,
     item_text_features: torch.Tensor,
@@ -106,13 +194,18 @@ def build_user_history_features(
     return (result, counts > 0) if item_text_mask is not None else result
 
 
-def format_item_text(meta: dict) -> str:
+def format_item_text(meta: dict, *, policy: str = METADATA_POLICY) -> str:
     """Format item metadata dictionary into structured semantic text description."""
     from src.data.preprocessing import clean_text
 
     flags = metadata_flags(meta)
     parts = [clean_text(meta.get("title"))] if flags["has_title"] else []
-    if flags["has_brand"]:
+    include_brand = flags["has_brand"]
+    if policy == ADAPTIVE_TEXT_POLICY and meta.get("brand_source") not in {"metadata", "override"}:
+        include_brand = False
+    if policy not in {METADATA_POLICY, ADAPTIVE_TEXT_POLICY}:
+        raise ValueError(f"Unknown metadata text policy: {policy}")
+    if include_brand:
         parts.append(f"Brand: {clean_text(meta['brand'])}")
     if flags["has_specific_category"]:
         parts.append(f"Category: {clean_text(meta['categories'])}")
@@ -121,7 +214,7 @@ def format_item_text(meta: dict) -> str:
 
 
 def get_text_input_fingerprint(
-    item_metadata, num_items, model_name, revision=None
+    item_metadata, num_items, model_name, revision=None, *, policy: str = METADATA_POLICY
 ) -> str:
     if set(item_metadata) != set(range(num_items)):
         raise ValueError(
@@ -129,7 +222,7 @@ def get_text_input_fingerprint(
         )
     payload = {
         "format_version": 3,
-        "metadata_policy": METADATA_POLICY,
+        "metadata_policy": policy,
         "mask": get_item_text_mask(
             item_metadata, num_items, require_flags=False
         ).tolist(),
@@ -139,7 +232,7 @@ def get_text_input_fingerprint(
             [
                 idx,
                 item_metadata[idx].get("original_id"),
-                format_item_text(item_metadata[idx]),
+                format_item_text(item_metadata[idx], policy=policy),
             ]
             for idx in range(num_items)
         ],
@@ -192,6 +285,7 @@ def encode_item_metadata(
     force_recompute: bool = False,
     allow_fallback: bool = False,
     revision: str | None = None,
+    policy: str = METADATA_POLICY,
 ) -> torch.Tensor:
     """Extract dense semantic text embeddings for all mapped items from metadata.
 
@@ -208,7 +302,7 @@ def encode_item_metadata(
         Tensor (num_items, feature_dim): usable rows have unit norm; masked rows are zero.
     """
     fingerprint = get_text_input_fingerprint(
-        item_metadata, num_items, model_name, revision
+        item_metadata, num_items, model_name, revision, policy=policy
     )
     item_mask = get_item_text_mask(item_metadata, num_items, require_flags=False)
     if save_path and not force_recompute:
@@ -229,7 +323,7 @@ def encode_item_metadata(
         if not item_mask[i_idx]:
             continue
         meta = item_metadata.get(i_idx, {})
-        text_corpus.append(format_item_text(meta))
+        text_corpus.append(format_item_text(meta, policy=policy))
 
     logger.info(f"Encoding {len(text_corpus):,} items with {model_name} on {device}...")
     resolved_revision = None
@@ -298,7 +392,7 @@ def encode_item_metadata(
         os.replace(tensor_tmp, save_path)
         metadata = {
             "format_version": 3,
-            "metadata_policy": METADATA_POLICY,
+            "metadata_policy": policy,
             "item_text_mask": item_mask.tolist(),
             "input_fingerprint": fingerprint,
             "model_name": model_name,

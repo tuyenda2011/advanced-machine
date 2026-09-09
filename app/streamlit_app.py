@@ -21,12 +21,14 @@ import streamlit as st
 import torch
 
 from src.data.bundle import BundleError, resolve_bundle
+from src.data.provenance import sha256_file
 from src.data.sparsity import create_sparse_train_set
 from src.data.text_encoder import (
     DEFAULT_ENCODER,
     PINNED_REVISION,
     build_user_history_features,
     format_item_text,
+    load_text_view,
     load_training_text,
 )
 from src.evaluation.evaluator import EVALUATION_PROTOCOL
@@ -172,6 +174,8 @@ def get_processed_data_cache_token(
             "mappings.pkl",
             "item_text_embeddings.pt",
             "item_text_embeddings.pt.json",
+            "adaptivegcl_text_embeddings.pt",
+            "adaptivegcl_text_embeddings.pt.json",
             "disliked_interactions.parquet",
         )
     ]
@@ -277,9 +281,33 @@ def load_trained_model_cached(
             raise TextCacheCompatibilityError(
                 "Không tìm thấy bundle dữ liệu đang hoạt động. Hãy chạy prepare_data.py."
             ) from exc
-        text_features, item_text_mask = load_demo_text(
-            text_dir, mappings
-        )
+        feature_view = ada_cfg.get("feature_view", "shared")
+        if feature_view == "shared":
+            text_features, item_text_mask = load_demo_text(text_dir, mappings)
+            ssl_item_mask = item_text_mask
+        else:
+            try:
+                text_features, item_text_mask, ssl_item_mask, view_metadata = load_text_view(
+                    text_dir, mappings, feature_view
+                )
+            except ValueError as exc:
+                raise TextCacheCompatibilityError(
+                    "AdaptiveGCL feature view khÃ´ng tÆ°Æ¡ng thÃ­ch vá»›i metadata hiá»‡n táº¡i. "
+                    "HÃ£y build_adaptivegcl_text_view.py trÆ°á»›c khi dÃ¹ng Demo."
+                ) from exc
+            feature_path = Path(text_dir) / "adaptivegcl_text_embeddings.pt"
+            feature_sidecar_path = Path(str(feature_path) + ".json")
+            config["adaptive_gcl"]["feature_view_metadata"] = {
+                key: value
+                for key, value in view_metadata.items()
+                if key in {"feature_view", "metadata_policy", "source_metadata_policy", "input_fingerprint"}
+            }
+            config["adaptive_gcl"]["feature_view_metadata"].update(
+                {
+                    "embedding_sha256": sha256_file(feature_path),
+                    "sidecar_sha256": sha256_file(feature_sidecar_path),
+                }
+            )
         text_dim = text_features.shape[1]
         user_history_features, user_text_mask = build_user_history_features(
             train_df_sparse, text_features, num_users, item_text_mask
@@ -294,10 +322,16 @@ def load_trained_model_cached(
             tau_plus=ada_cfg.get("tau_plus", 0.0),
             user_history_features=user_history_features,
             item_text_mask=item_text_mask,
+            ssl_item_mask=ssl_item_mask,
             user_text_mask=user_text_mask,
             use_item_text=ada_cfg.get("use_item_text", True),
             user_semantic_weight=ada_cfg.get("user_semantic_weight", 0.5),
             layer_aggregation=ada_cfg.get("layer_aggregation", "learnable"),
+            user_semantic_gate=ada_cfg.get("user_semantic_gate", False),
+            ssl_target=ada_cfg.get("ssl_target", "projected"),
+            fusion_mode=ada_cfg.get("fusion_mode", "convex"),
+            residual_alpha_init=ada_cfg.get("residual_alpha_init", 0.1),
+            residual_alpha_max=ada_cfg.get("residual_alpha_max", 1.0),
         )
 
     try:

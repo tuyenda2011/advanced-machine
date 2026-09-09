@@ -25,7 +25,11 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.data.bundle import BundleError, resolve_bundle
 from src.data.graph import get_norm_adj_tensor
 from src.data.sparsity import create_sparse_train_set
-from src.data.text_encoder import build_user_history_features, load_training_text
+from src.data.text_encoder import (
+    build_user_history_features,
+    load_text_view,
+    load_training_text,
+)
 from src.models.adaptive_gcl import AdaptiveGCL
 from src.models.directau import DirectAU
 from src.models.lightgcn import LightGCN
@@ -63,9 +67,10 @@ def _build_model(model_name: str, config: dict, num_users: int, num_items: int, 
         )
     elif model_name == "adaptive_gcl":
         cfg = config.get("adaptive_gcl", {})
-        text_features, item_mask = text_data
+        text_features, item_mask, train_sparse, *extra = text_data
+        ssl_item_mask = extra[0] if extra else item_mask
         user_history, user_mask = build_user_history_features(
-            text_data[2], text_features, num_users, item_mask
+            train_sparse, text_features, num_users, item_mask
         )
         model = AdaptiveGCL(
             num_users, num_items, embedding_dim=emb_dim, num_layers=num_layers,
@@ -77,6 +82,10 @@ def _build_model(model_name: str, config: dict, num_users: int, num_items: int, 
             use_item_text=cfg.get("use_item_text", True),
             user_semantic_weight=cfg.get("user_semantic_weight", 0.5),
             layer_aggregation=cfg.get("layer_aggregation", "learnable"),
+            fusion_mode=cfg.get("fusion_mode", "convex"),
+            residual_alpha_init=cfg.get("residual_alpha_init", 0.1),
+            residual_alpha_max=cfg.get("residual_alpha_max", 1.0),
+            ssl_item_mask=ssl_item_mask,
         )
     else:
         raise ValueError(f"Unknown model: {model_name}")
@@ -203,8 +212,19 @@ def main() -> int:
 
     text_data = None
     if args.model == "adaptive_gcl":
-        text_features, item_mask = load_training_text(str(processed_dir), mappings)
-        text_data = (text_features.to(device), item_mask.to(device), sparse_train)
+        if args.model == "adaptive_gcl" and config.get("adaptive_gcl", {}).get("feature_view", "shared") != "shared":
+            text_features, item_mask, ssl_item_mask, _ = load_text_view(
+                str(processed_dir), mappings, config["adaptive_gcl"]["feature_view"]
+            )
+        else:
+            text_features, item_mask = load_training_text(str(processed_dir), mappings)
+            ssl_item_mask = item_mask
+        text_data = (
+            text_features.to(device),
+            item_mask.to(device),
+            sparse_train,
+            ssl_item_mask.to(device),
+        )
     model = _build_model(args.model, config, num_users, num_items, text_data, device)
     _, _, checkpoint = load_checkpoint(
         str(checkpoint_path), model, device=device, expected_fingerprint=None

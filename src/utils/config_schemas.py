@@ -121,10 +121,16 @@ if PYDANTIC_AVAILABLE:
     class AdaptiveGCLConfig(BaseModel):
         """AdaptiveGCL-specific configuration schema."""
         text_policy: Literal["masked_text"] = "masked_text"
+        feature_view: Literal["shared", "adaptivegcl_quality"] = "shared"
+        fusion_mode: Literal["convex", "residual", "bounded_residual"] = "convex"
+        residual_alpha_init: float = Field(default=0.1, gt=0, allow_inf_nan=False)
+        residual_alpha_max: float = Field(default=1.0, gt=0, allow_inf_nan=False)
         text_dim: int = Field(default=384, ge=64, le=1024)
         use_item_text: bool = True
         user_semantic_weight: float = Field(default=0.5, ge=0, allow_inf_nan=False)
-        layer_aggregation: Literal["learnable", "mean"] = "learnable"
+        layer_aggregation: Literal["learnable", "mean", "anchored"] = "learnable"
+        user_semantic_gate: bool = False
+        ssl_target: Literal["projected", "frozen_text"] = "projected"
         mlp_weight_decay: float = Field(default=0.0, ge=0, allow_inf_nan=False)
         ssl_temp: float = Field(default=0.2, gt=0, le=2.0)
         ssl_reg: float = Field(default=0.1, ge=0, le=10.0)
@@ -219,12 +225,39 @@ def validate_model_config(config: dict[str, Any], model_name: str) -> dict[str, 
             raise ValueError("Invalid DirectAU optimizer_weight_decay")
     if model_name == "adaptive_gcl" and "adaptive_gcl" in config:
         ada_cfg = config["adaptive_gcl"]
-        for key, default in (("use_item_text", True), ("user_semantic_weight", 0.5), ("layer_aggregation", "learnable"), ("mlp_weight_decay", 0.0)):
+        for key, default in (("use_item_text", True), ("user_semantic_weight", 0.5), ("layer_aggregation", "learnable"), ("mlp_weight_decay", 0.0), ("feature_view", "shared"), ("fusion_mode", "convex"), ("residual_alpha_init", 0.1), ("residual_alpha_max", 1.0)):
             ada_cfg.setdefault(key, default)
         if not isinstance(ada_cfg.get("use_item_text", True), bool):
             raise ValueError("use_item_text must be a boolean")
-        if ada_cfg.get("layer_aggregation", "learnable") not in {"learnable", "mean"}:
-            raise ValueError("layer_aggregation must be learnable or mean")
+        if ada_cfg.get("layer_aggregation", "learnable") not in {"learnable", "mean", "anchored"}:
+            raise ValueError("layer_aggregation must be learnable, mean or anchored")
+        ada_cfg.setdefault("user_semantic_gate", False)
+        ada_cfg.setdefault("ssl_target", "projected")
+        if not isinstance(ada_cfg["user_semantic_gate"], bool):
+            raise ValueError("user_semantic_gate must be boolean")
+        if ada_cfg["ssl_target"] not in {"projected", "frozen_text"}:
+            raise ValueError("ssl_target must be projected or frozen_text")
+        if ada_cfg.get("feature_view", "shared") not in {"shared", "adaptivegcl_quality"}:
+            raise ValueError("feature_view must be shared or adaptivegcl_quality")
+        if ada_cfg.get("fusion_mode", "convex") not in {"convex", "residual", "bounded_residual"}:
+            raise ValueError("fusion_mode must be convex, residual or bounded_residual")
+        alpha_init = ada_cfg.get("residual_alpha_init", 0.1)
+        alpha_max = ada_cfg.get("residual_alpha_max", 1.0)
+        if (
+            isinstance(alpha_init, bool)
+            or isinstance(alpha_max, bool)
+            or not isinstance(alpha_init, (int, float))
+            or not isinstance(alpha_max, (int, float))
+            or not math.isfinite(alpha_init)
+            or not math.isfinite(alpha_max)
+            or alpha_init <= 0
+            or alpha_max <= 0
+            or alpha_init >= alpha_max
+        ):
+            raise ValueError(
+                "residual_alpha_init and residual_alpha_max must be finite with "
+                "0 < residual_alpha_init < residual_alpha_max"
+            )
         for key, default in (("user_semantic_weight", 0.5), ("mlp_weight_decay", 0.0), ("ssl_reg", 0.1)):
             value = ada_cfg.get(key, default)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:

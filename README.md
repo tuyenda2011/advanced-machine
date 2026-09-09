@@ -330,6 +330,33 @@ python scripts/train.py --model xsimgcl --sparsity 0.75 --seed 2025 --epochs 100
 python scripts/train_all_models.py --all_sparsity
 ```
 
+### AdaptiveGCL metadata audit and ablation
+
+The current AdaptiveGCL default uses bounded residual item fusion, a learned user semantic gate, anchored graph-layer weights, and a frozen-text SSL target. See [architecture and validation notes](docs/adaptivegcl-comprehensive-update.md) for the exact configuration and isolated ablations. This implementation has passed regression checks; its ranking improvement still requires a new experiment.
+
+```bash
+# Inspect metadata groups and SSL eligibility without changing the data bundle
+python scripts/audit_adaptive_metadata.py
+
+# Optional: build the quality-controlled text view (AdaptiveGCL only)
+python scripts/build_adaptivegcl_text_view.py
+# Set adaptive_gcl.feature_view: adaptivegcl_quality in configs/adaptive_gcl.yaml
+
+# Validation-only paired ablation; add --run when you are ready to train
+python scripts/ablate_adaptive.py --epochs 10
+python scripts/ablate_adaptive.py --run --epochs 10
+```
+
+The shared `item_text_embeddings.pt` remains the frozen evaluation/diversity view. The optional `adaptivegcl_quality` view excludes unverified title-derived brands from AdaptiveGCL text and excludes category-only rows from semantic SSL while retaining them for fusion and user history pooling. Ablation outputs are written under `results/experiments/adaptivegcl_early_decline/<timestamp>/`.
+
+For the residual architecture screening plan, use the paired 2×2 matrix without editing the active YAML between runs:
+
+```bash
+python scripts/ablate_adaptive.py --variants full residual_alpha_01 ssl_001 residual_alpha_01_ssl_001 --epochs 10 --seeds 42 --sparsities 1.0 --output_dir results/experiments/adaptivegcl_residual/round1
+```
+
+Add `--run` only when you want to start the four validation-only runs. `fusion_mode: convex` remains the control; residual fusion uses a learned scalar text scale initialized at 0.1.
+
 ### Benchmark Suite
 
 ```bash
