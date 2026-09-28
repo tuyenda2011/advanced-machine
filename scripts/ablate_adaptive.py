@@ -5,6 +5,7 @@ import gc
 import hashlib
 import json
 import pickle
+import platform
 import sys
 from copy import deepcopy
 from datetime import datetime
@@ -29,7 +30,7 @@ from src.models.adaptive_gcl import AdaptiveGCL
 from src.training.trainer import Trainer
 from src.utils.checkpoints import get_experiment_fingerprint
 from src.utils.config import load_config
-from src.utils.config_schemas import validate_model_config
+from src.utils.config_schemas import validate_config, validate_model_config
 from src.utils.paths import resolve_output_root, write_run_manifest
 from src.utils.seed import set_seed
 
@@ -49,6 +50,7 @@ VARIANTS = {
     "no_ssl": {"ssl_reg": 0.0},
     "ssl_001": {"ssl_reg": 0.01},
     "ssl_003": {"ssl_reg": 0.03},
+    "ssl_0003": {"ssl_reg": 0.003},
     "residual_alpha_01": {
         "fusion_mode": "residual",
         "residual_alpha_init": 0.1,
@@ -59,6 +61,7 @@ VARIANTS = {
         "ssl_reg": 0.01,
     },
     "mean_layers": {"layer_aggregation": "mean"},
+    "residual_cap_03": {"residual_alpha_max": 0.3},
     "user_weight_025": {"user_semantic_weight": 0.25},
     "mlp_decay_1e4": {"mlp_weight_decay": 1e-4},
     "no_dislikes": {"hard_neg_alpha": 0.0},
@@ -74,11 +77,30 @@ VARIANTS = {
                          "dirichlet_reg": 0.0, "tau_plus": 0.0},
 }
 
+# Overrides outside the model section stay separate from legacy variants.
+SECTION_VARIANTS = {"lr_0003": {"training": {"learning_rate": 0.0003}}}
+
+# The first validation pass from adaptivegcl-validation-upgrade-plan.md. Keep
+# this list explicit so the default runner cannot silently drift into an old
+# sweep when new exploratory variants are added above.
+P1_VARIANTS = (
+    "full",
+    "no_ssl",
+    "ssl_0003",
+    "mlp_decay_1e4",
+    "lr_0003",
+    "no_dislikes",
+)
+
 
 def variant_config(base: dict, variant: str) -> dict:
     config = deepcopy(base)
-    config["adaptive_gcl"].update(VARIANTS[variant])
-    return validate_model_config(config, "adaptive_gcl")
+    if variant in SECTION_VARIANTS:
+        for section, overrides in SECTION_VARIANTS[variant].items():
+            config.setdefault(section, {}).update(overrides)
+    else:
+        config["adaptive_gcl"].update(VARIANTS[variant])
+    return validate_model_config(validate_config(config), "adaptive_gcl")
 
 
 def build_model(config, mappings, sparse, features, mask, ssl_mask=None):
@@ -115,8 +137,12 @@ def build_model(config, mappings, sparse, features, mask, ssl_mask=None):
 def run(args):
     base = load_config("adaptive_gcl", config_dir=args.config_dir)
     planned = {name: variant_config(base, name) for name in args.variants}
+    for config in planned.values():
+        config["training"]["epochs"] = args.epochs
+        config["evaluation"]["model_diagnostics"] = True
+        config["validation_only"] = True
     for name, config in planned.items():
-        if name != "full" and config["adaptive_gcl"] == planned["full"]["adaptive_gcl"]:
+        if name != "full" and config == planned["full"]:
             raise ValueError(
                 f"{name} equals full: choose a meaningful reference configuration"
             )
@@ -129,7 +155,7 @@ def run(args):
                 "sparsities": args.sparsities,
                 "validation_only": True,
                 "variants": {
-                    name: cfg["adaptive_gcl"] for name, cfg in planned.items()
+                    name: cfg for name, cfg in planned.items()
                 },
             },
             indent=2,
@@ -143,7 +169,7 @@ def run(args):
         output = resolve_output_root(args.output_dir, kind="ablation")
     else:
         stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
-        output = ROOT / "results" / "experiments" / "adaptivegcl_early_decline" / stamp
+        output = ROOT / "results" / "experiments" / "adaptivegcl_validation_upgrade" / stamp
     if output.exists():
         raise FileExistsError(f"Refusing to overwrite ablation output: {output}")
     configured_processed = Path(base["dataset"].get("processed_dir", "data/processed"))
@@ -193,6 +219,14 @@ def run(args):
         manifest_path=bundle.manifest_path if bundle is not None else None,
     )
     runner_hash = sha256_file(Path(__file__))
+    runtime = {
+        "python": platform.python_version(),
+        "torch": str(torch.__version__),
+        "cuda": torch.version.cuda,
+        "device": (
+            torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+        ),
+    }
     output.mkdir(parents=True, exist_ok=False)
     manifest_path = write_run_manifest(
         output,
@@ -216,6 +250,7 @@ def run(args):
             "code_sha256": code_hash,
             "runner_sha256": runner_hash,
             "data_sha256": data_hashes,
+            "runtime": runtime,
         }
     )
     manifest_path.write_text(
@@ -250,6 +285,7 @@ def run(args):
                     "code_sha256": code_hash,
                     "runner_sha256": runner_hash,
                     "data_sha256": data_hashes,
+                    "runtime": runtime,
                 }
                 fingerprint = hashlib.sha256(
                     json.dumps(identity, sort_keys=True).encode()
@@ -289,6 +325,7 @@ def run(args):
                     sparsity=ratio,
                     seed=seed,
                     fingerprint=fingerprint,
+                    learning_rate=config["training"]["learning_rate"],
                     fusion_mode=config["adaptive_gcl"].get("fusion_mode", "convex"),
                     residual_alpha=(
                         float(model.residual_alpha.item())
@@ -327,11 +364,14 @@ def _write_experiment_tables(output: Path, results: list[dict]) -> None:
                 "fusion_mode": result.get("fusion_mode"),
                 "residual_alpha": result.get("residual_alpha"),
                 "seed": result.get("seed"),
+                "learning_rate": result.get("learning_rate"),
                 "sparsity": result.get("sparsity"),
                 "best_epoch": result.get("best_epoch"),
                 "best_val_ndcg20": val.get("NDCG@20"),
                 "recall10": val.get("Recall@10"),
                 "ndcg10": val.get("NDCG@10"),
+                "recall20": val.get("Recall@20"),
+                "peak_cuda_mb": max((r.get("cuda_peak_allocated_mb", 0) or 0 for r in history), default=0),
                 "last_val_ndcg20": last.get("val_ndcg_20"),
                 "total_train_time": result.get("total_train_time"),
                 "fingerprint": result.get("fingerprint"),
@@ -347,14 +387,16 @@ def _write_experiment_tables(output: Path, results: list[dict]) -> None:
                     **{
                         key.removeprefix("diagnostic_"): value
                         for key, value in record.items()
-                        if key.startswith("diagnostic_")
+                        if key.startswith(("diagnostic_", "loss_", "lr_group_"))
                     },
                 }
             )
     pd.DataFrame(rows).to_csv(output / "comparison.csv", index=False)
     pd.DataFrame(diagnostic_rows).to_csv(output / "diagnostics.csv", index=False)
+    _write_validation_curves(output, results)
+    _write_decision_report(output, results)
     report = output / "cause_analysis.md"
-    lines = [
+    analysis_lines = [
         "# AdaptiveGCL early-decline evidence report",
         "",
         "This report is generated from validation-only runs. It does not claim a causal explanation by itself.",
@@ -370,7 +412,126 @@ def _write_experiment_tables(output: Path, results: list[dict]) -> None:
         "",
         "The runner records evidence only. Keep the full configuration unless a paired validation comparison supports a change; reserve test metrics for the locked candidate.",
     ]
-    report.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    report.write_text("\n".join(analysis_lines) + "\n", encoding="utf-8")
+
+
+def _write_validation_curves(output: Path, results: list[dict]) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
+
+    figure, axis = plt.subplots(figsize=(10, 6))
+    for result in results:
+        history = result.get("history", [])
+        if not history:
+            continue
+        axis.plot([row["epoch"] for row in history],
+                  [row.get("val_ndcg_20") for row in history],
+                  label=f"{result['variant']} seed={result['seed']} density={result['sparsity']}")
+    axis.set(xlabel="Epoch", ylabel="Validation NDCG@20")
+    if axis.lines:
+        axis.legend(fontsize="small")
+    axis.grid(alpha=0.25)
+    figure.tight_layout()
+    figure.savefig(output / "validation_curves.png", dpi=150)
+    plt.close(figure)
+
+
+def _write_decision_report(output: Path, results: list[dict]) -> None:
+    """Write a conservative paired decision report for the current results.
+
+    The report is deliberately non-causal: it only compares completed
+    validation rows at the same seed and sparsity. An incomplete run never
+    receives an automatic shortlist.
+    """
+    lines = [
+        "# AdaptiveGCL validation decision",
+        "",
+        "This report is generated from validation-only runs. It does not use test metrics and does not claim causality.",
+        "",
+    ]
+    if not results:
+        lines.extend(["Status: `no_results`", "", "No completed runs are available."])
+        (output / "decision.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return
+
+    complete = [
+        row for row in results
+        if row.get("val_metrics", {}).get("NDCG@20") is not None
+    ]
+    manifest_path = output / "run_manifest.json"
+    expected = set()
+    if manifest_path.is_file():
+        parameters = json.loads(manifest_path.read_text(encoding="utf-8"))["parameters"]
+        expected = {
+            (variant, seed, density)
+            for variant in parameters["variants"]
+            for seed in parameters["seeds"]
+            for density in parameters["densities"]
+        }
+    actual = {(r.get("variant"), r.get("seed"), r.get("sparsity")) for r in complete}
+    pending = len(expected - actual) if expected else len(results) - len(complete)
+    status = "unknown_plan" if not expected else ("incomplete" if pending else "complete")
+    lines.append(f"Status: `{status}` ({len(complete)} completed, {pending} pending)")
+    lines.extend(["", "## Paired validation deltas", ""])
+    controls = {
+        (row.get("seed"), row.get("sparsity")): row
+        for row in complete if row.get("variant") == "full"
+    }
+    candidates = []
+    for row in complete:
+        if row.get("variant") == "full":
+            continue
+        key = (row.get("seed"), row.get("sparsity"))
+        control = controls.get(key)
+        if control is None:
+            lines.append(
+                f"- `{row.get('variant')}` seed={key[0]} density={key[1]}: control row is missing."
+            )
+            continue
+        candidate_score = row["val_metrics"]["NDCG@20"]
+        control_score = control["val_metrics"]["NDCG@20"]
+        delta = candidate_score - control_score
+        candidates.append((delta, row))
+        lines.append(
+            f"- `{row.get('variant')}` seed={key[0]} density={key[1]}: "
+            f"NDCG@20 {candidate_score:.6f} vs control {control_score:.6f} "
+            f"(delta {delta:+.6f}); best epoch {row.get('best_epoch')}."
+        )
+
+    lines.extend(["", "## Keep/drop decision", ""])
+    if pending or not expected:
+        lines.append("- Keep/drop decision: **deferred** until every requested P1 run completes.")
+    elif not candidates:
+        lines.append("- Keep the control; no paired candidate result is available.")
+    else:
+        grouped = {}
+        for delta, row in candidates:
+            grouped.setdefault(row["variant"], []).append(delta)
+        for name, deltas in sorted(grouped.items()):
+            lines.append(f"- `{name}`: mean paired delta {sum(deltas) / len(deltas):+.6f}; "
+                         f"positive pairs {sum(d > 0 for d in deltas)}/{len(deltas)}.")
+        ranked = sorted(grouped, key=lambda name: sum(grouped[name]) / len(grouped[name]), reverse=True)
+        winners = [name for name in ranked if all(d > 0 for d in grouped[name])][:2]
+        if winners:
+            names = ", ".join(f"`{name}`" for name in winners)
+            lines.append(
+                f"- Provisional validation shortlist: {names}. Confirm with the multi-seed P3 round before changing defaults."
+            )
+        else:
+            lines.append("- Keep the control pending review; no candidate improves every observed pair.")
+    for row in complete:
+        history = row.get("history", [])
+        if row.get("variant") == "lr_0003" and len(history) >= 5:
+            recent = [r.get("val_ndcg_20", 0) for r in history[-5:]]
+            if recent[-1] > recent[0]:
+                lines.append("- Low-LR curve is still rising over its last five epochs: consider longer confirmation before dropping it.")
+    lines.extend([
+        "",
+        "A lower training loss, earlier stopping, or a single-seed gain is not sufficient evidence to change the default configuration.",
+    ])
+    (output / "decision.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def parse_args(argv=None):
@@ -379,16 +540,16 @@ def parse_args(argv=None):
     parser.add_argument("--config_dir", default="configs")
     parser.add_argument("--output_dir")
     parser.add_argument("--bundle", help="Bundle path or data/current.json")
-    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--seeds", nargs="+", type=int, default=[42])
     parser.add_argument(
-        "--sparsities", nargs="+", type=float, choices=[1.0, 0.25], default=[1.0, 0.25]
+        "--sparsities", nargs="+", type=float, choices=[1.0, 0.25], default=[1.0]
     )
     parser.add_argument(
         "--variants",
         nargs="+",
-        choices=list(VARIANTS),
-        default=["full", "no_ssl", "no_user_text", "no_item_text", "no_dislikes"],
+        choices=[*VARIANTS, *SECTION_VARIANTS],
+        default=list(P1_VARIANTS),
     )
     args = parser.parse_args(argv)
     if args.epochs < 1 or any(seed < 0 or seed >= 2**32 for seed in args.seeds):

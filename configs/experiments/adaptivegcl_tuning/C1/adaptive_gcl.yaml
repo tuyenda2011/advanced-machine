@@ -1,0 +1,21 @@
+model_name: adaptive_gcl
+adaptive_gcl:
+  text_policy: masked_text
+  feature_view: shared
+  fusion_mode: bounded_residual
+  residual_alpha_init: 0.1
+  residual_alpha_max: 1.0
+  text_dim: 384
+  use_item_text: true
+  user_semantic_weight: 0.5
+  user_semantic_gate: true
+  ssl_target: frozen_text
+  layer_aggregation: anchored
+  mlp_weight_decay: 0.0
+  ssl_temp: 0.2
+  ssl_reg: 0
+  dirichlet_reg: 0
+  node_dropout: 0.05
+  tau_plus: 0.0
+  hard_neg_alpha: 0.2
+  hard_neg_margin: 0.5

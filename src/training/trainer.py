@@ -579,6 +579,10 @@ class Trainer:
                 # display aliases above are rounded for backwards compatibility.
                 history_record[f"loss_{key}"] = loss_component_accum[key] / max(1, num_batches)
             history_record.update({f"diagnostic_{key}": value for key, value in diagnostics.items()})
+            history_record.update({
+                f"lr_group_{index}": float(group["lr"])
+                for index, group in enumerate(self.optimizer.param_groups)
+            })
             history_records.append(history_record)
 
             # Save epoch history CSV

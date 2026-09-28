@@ -1,0 +1,15 @@
+{
+  "checkpoint": "D:\\advanced-machine\\results\\runs\\train_adaptive_gcl_s100_seed42_20260909_135003\\checkpoints\\adaptive_gcl\\masked_text\\adaptive_gcl_s100_seed42.pt",
+  "checkpoint_sha256": "c1bfc4d27eaceabea231ab243a8f33fe10bc54c9f917695a60fa3bcd4cf9f67a",
+  "best_epoch": 12,
+  "best_score": 0.024564413360121225,
+  "cases": {
+    "C0": "full",
+    "C1": "no_ssl",
+    "C2": "ssl_0003",
+    "C3": "mlp_decay_1e4",
+    "C4": "lr_0003",
+    "C5": "no_dislikes"
+  },
+  "validation_only": true
+}
