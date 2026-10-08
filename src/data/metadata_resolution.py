@@ -6,7 +6,13 @@ import re
 from collections import Counter
 from pathlib import Path
 
-from src.data.preprocessing import clean_text, metadata_flags
+from src.data.preprocessing import (
+    CATEGORY_POLICY,
+    clean_text,
+    metadata_flags,
+    parse_categories,
+    parse_category_paths,
+)
 
 # A small, explicit allowlist is safer than accepting every short token in a
 # title. These brands are too short for the general frequency rule.
@@ -186,6 +192,10 @@ def resolve_metadata(item_metadata, raw_items, overrides_path):
         asin = meta["original_id"]
         source = raw.get(asin, {})
         matched += asin in raw
+        if "categories" in source:
+            meta["categories"] = parse_categories(source["categories"])
+            meta["category_paths"] = parse_category_paths(source["categories"])
+            meta["category_policy"] = CATEGORY_POLICY
         old_title = meta.get("title")
         if metadata_flags({"title": source.get("title"), "original_id": asin})["has_title"]:
             meta["title"], meta["title_source"] = clean_text(source["title"]), "metadata"

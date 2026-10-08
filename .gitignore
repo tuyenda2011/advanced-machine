@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 *.so
 .Python
+.venv/
 env/
 venv/
 ENV/
@@ -26,7 +27,22 @@ wheels/
 # PyTest / Coverage
 .pytest_cache/
 .coverage
+.coverage.*
 htmlcov/
+coverage.xml
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Local environment and secrets (keep shareable templates)
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+.streamlit/secrets.toml
 
 # Data & Artifacts (track manifest.json, ignore large data)
 data/raw/
@@ -34,15 +50,19 @@ data/cache/
 data/processed/
 data/source/
 data/versions/
+data/exported/
 data/.bundle.lock
 !data/manifest.json
 !data/current.json
-artifacts/checkpoints/
+artifacts/
 results/
+*.log
 *.pt
 *.pth
 *.parquet
 *.pkl
+*.npy
+*.npz
 
 # DVC
 .dvc/cache
@@ -60,12 +80,11 @@ results/
 .agents/
 
 # Documentation
-docs/*.md
-docs/**/*.md
+*.md
 
-# Local tests and test artifacts
-tests/
+# Local tests
 test/
+tests/
 
 # Local validation scratch
 .tmp/

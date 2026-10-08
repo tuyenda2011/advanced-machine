@@ -22,6 +22,7 @@ from src.data.provenance import sha256_file
 from src.data.sparsity import create_sparse_train_set
 from src.data.text_encoder import (
     build_user_history_features,
+    get_ssl_item_mask,
     load_text_view,
     load_training_text,
 )
@@ -107,6 +108,11 @@ def build_model(config, mappings, sparse, features, mask, ssl_mask=None):
     users, items = len(mappings["user2id"]), len(mappings["item2id"])
     profiles, user_mask = build_user_history_features(sparse, features, users, mask)
     ada = config["adaptive_gcl"]
+    if ada.get("ssl_eligibility", "view_default") != "view_default":
+        ssl_mask = get_ssl_item_mask(
+            mappings.get("item_metadata", {}), mask,
+            feature_view=ada.get("feature_view", "shared"), eligibility=ada["ssl_eligibility"],
+        )
     return AdaptiveGCL(
         users,
         items,

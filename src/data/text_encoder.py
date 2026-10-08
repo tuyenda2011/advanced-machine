@@ -113,14 +113,33 @@ def load_text_view(
         )
     try:
         sidecar = json.loads(metadata_path.read_text(encoding="utf-8"))
-        ssl_mask = torch.tensor(sidecar["ssl_item_mask"], dtype=torch.bool)
-        if ssl_mask.shape != item_mask.shape:
-            raise ValueError("invalid ssl_item_mask shape")
+        saved_mask = sidecar["ssl_item_mask"]
+        if not isinstance(saved_mask, list) or any(type(value) is not bool for value in saved_mask):
+            raise ValueError("ssl_item_mask must contain booleans")
+        ssl_mask = torch.tensor(saved_mask, dtype=torch.bool)
+        expected_mask = torch.tensor(semantic_ssl_mask(derived, len(item_mask)), dtype=torch.bool)
+        if not torch.equal(ssl_mask, expected_mask) or bool((ssl_mask & ~item_mask).any()):
+            raise ValueError("ssl_item_mask does not match metadata policy")
         if sidecar.get("feature_view") != "adaptivegcl_quality":
             raise ValueError("invalid AdaptiveGCL feature view metadata")
+        if sidecar.get("metadata_policy") != ADAPTIVE_TEXT_POLICY:
+            raise ValueError("invalid AdaptiveGCL metadata policy")
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError("AdaptiveGCL text view sidecar is invalid") from exc
     return tensor, item_mask, ssl_mask, sidecar
+
+
+def get_ssl_item_mask(item_metadata, item_mask, *, feature_view="shared", eligibility="view_default"):
+    """Choose SSL eligibility independently of the text used for fusion."""
+    if eligibility == "usable" or (eligibility == "view_default" and feature_view == "shared"):
+        return item_mask.clone()
+    if eligibility not in {"view_default", "item_specific"}:
+        raise ValueError(f"Unknown SSL eligibility policy: {eligibility}")
+    metadata = adaptive_text_metadata(item_metadata) if feature_view == "adaptivegcl_quality" else item_metadata
+    mask = item_mask.new_tensor(semantic_ssl_mask(metadata, len(item_mask)))
+    if bool((mask & ~item_mask).any()):
+        raise ValueError("SSL eligibility cannot exceed usable text coverage")
+    return mask
 
 
 def build_adaptivegcl_text_view(

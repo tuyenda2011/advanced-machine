@@ -347,7 +347,20 @@ python scripts/ablate_adaptive.py --epochs 10
 python scripts/ablate_adaptive.py --run --epochs 10
 ```
 
-The shared `item_text_embeddings.pt` remains the frozen evaluation/diversity view. The optional `adaptivegcl_quality` view excludes unverified title-derived brands from AdaptiveGCL text and excludes category-only rows from semantic SSL while retaining them for fusion and user history pooling. Ablation outputs are written under `results/experiments/adaptivegcl_early_decline/<timestamp>/`.
+The shared `item_text_embeddings.pt` remains the frozen evaluation/diversity view. The optional `adaptivegcl_quality` view excludes the extra brand field inferred from titles; the title itself remains intact. `ssl_eligibility: usable` or `item_specific` independently controls whether category-only rows form SSL targets. They always remain available for fusion and user-history pooling. `view_default` preserves the older behavior (usable for shared text, item-specific for quality text). Ablation outputs are written under `results/experiments/adaptivegcl_early_decline/<timestamp>/`.
+
+The October 2026 data repair preserves interaction files and IDs, keeps taxonomy paths separate, and checks artifact hashes for the active processed view. Metadata-only rebuilds include both shared and quality tensors in the immutable inventory. Source-supported brands and title-inferred brands remain distinguishable; source support does not certify manufacturer identity. Audit and optional feature-builder commands write to `.tmp/` by default so they do not alter a published bundle.
+
+```bash
+# Stream only metadata; rebuild and audit features without repartitioning interactions
+python scripts/rebuild_data_quality.py --output artifacts/my_data_rebuild.json
+
+# Validation-only 2x2 pilot: three paired seeds, 25% density, five epochs per run
+# Use a new output directory for each run. Test targets are not used.
+python scripts/compare_data_policies.py --output results/experiments/my_data_policy_pilot
+```
+
+The main protocol is warm-start on a fixed offline cohort, not a strict global future cutoff. Timestamps have day precision; same-day order is unknown. Dislikes use the full positive-train cutoff, including ties, and positive graph thinning does not remove that side information. There are 59 validation and 187 test cold-item targets excluded from the warm-start metric. Short pilots screen preprocessing choices; they cannot establish a final ranking gain. See [data repair report](data-quality-fix-report.md).
 
 For the residual architecture screening plan, use the paired 2×2 matrix without editing the active YAML between runs:
 

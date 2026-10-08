@@ -114,31 +114,34 @@ def summarize_metadata_quality(item_metadata: dict) -> dict:
     }
 
 
+CATEGORY_POLICY = "separate_category_paths_v1"
+
+
+def parse_category_paths(categories_raw: Any) -> list[list[str]]:
+    """Keep source taxonomy branches separate, normalized and deterministic."""
+    if not isinstance(categories_raw, list):
+        return []
+    branches = [item for item in categories_raw if isinstance(item, list)]
+    flat = [item for item in categories_raw if isinstance(item, str)]
+    if flat:
+        branches.append(flat)
+    paths = set()
+    for branch in branches:
+        path = []
+        for token in branch:
+            cleaned = clean_text(token)
+            if cleaned != UNKNOWN_PLACEHOLDER and (not path or path[-1] != cleaned):
+                path.append(cleaned)
+        if path:
+            paths.add(tuple(path))
+    return [list(path) for path in sorted(paths)]
+
+
 def parse_categories(categories_raw: Any) -> str:
-    """Parse nested category list and format into clear hierarchy string."""
-    if isinstance(categories_raw, list) and len(categories_raw) > 0:
-        flat_cats = []
-        for item in categories_raw:
-            if isinstance(item, list):
-                flat_cats.extend(
-                    [
-                        clean_text(c)
-                        for c in item
-                        if c and clean_text(c) != UNKNOWN_PLACEHOLDER
-                    ]
-                )
-            elif isinstance(item, str):
-                cleaned = clean_text(item)
-                if cleaned != UNKNOWN_PLACEHOLDER:
-                    flat_cats.append(cleaned)
-        if flat_cats:
-            # Deduplicate sequential identical categories while preserving order
-            unique_seq: list[str] = []
-            for c in flat_cats:
-                if not unique_seq or unique_seq[-1] != c:
-                    unique_seq.append(c)
-            return " > ".join(unique_seq[-3:])
-    return UNKNOWN_PLACEHOLDER
+    """Display the longest source path; break ties lexically, never merge branches."""
+    paths = parse_category_paths(categories_raw)
+    primary = min(paths, key=lambda path: (-len(path), tuple(path))) if paths else []
+    return " > ".join(primary[-3:]) if primary else UNKNOWN_PLACEHOLDER
 
 
 def preprocess_amazon_electronics(
@@ -295,6 +298,8 @@ def preprocess_amazon_electronics(
             "title": title_cleaned,
             "brand": brand_cleaned,
             "categories": categories_cleaned,
+            "category_paths": parse_category_paths(categories_raw),
+            "category_policy": CATEGORY_POLICY,
             "original_id": str(item_asin),
         }
         item_metadata[idx].update(metadata_flags(item_metadata[idx]))

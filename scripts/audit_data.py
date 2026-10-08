@@ -39,7 +39,6 @@ def main(processed_dir=None, manifest_path=None, bundle=None, report_dir=None) -
         bundle is None
         and processed_dir is None
         and (REPO_ROOT / "data" / "current.json").exists()
-        and not (REPO_ROOT / "data" / "processed").is_dir()
     ):
         bundle = REPO_ROOT / "data" / "current.json"
     if bundle is not None:
@@ -60,7 +59,7 @@ def main(processed_dir=None, manifest_path=None, bundle=None, report_dir=None) -
     report_dir = requested_report_dir or source_report_dir
     # Published bundles are immutable.  A re-audit must never invalidate the
     # pointer by rewriting files whose hashes are recorded in the manifest.
-    if resolved_bundle is not None and resolved_bundle.root.parent.name == "versions" and requested_report_dir is None:
+    if resolved_bundle is not None and requested_report_dir is None:
         report_dir = (
             REPO_ROOT / ".tmp" / "data-pipeline" / "audit" /
             resolved_bundle.build_id

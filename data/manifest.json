@@ -10,7 +10,7 @@
     {
       "path": "data/processed/item_text_embeddings.pt",
       "required": false,
-      "sha256": "18c245799acc28764bd4613e70155b788d80a533f7d15c7b27e4626ccbdd3075",
+      "sha256": "a179908d41174d6a57c26796f69bd43538771f2a6114f1bb950369f9146fb18d",
       "shape": [
         44843,
         384
@@ -20,7 +20,7 @@
     {
       "path": "data/processed/item_text_embeddings.pt.json",
       "required": false,
-      "sha256": "7a0254e2523a0748f66675793dd31007364d26f505382b4689adcb4e1adc8384",
+      "sha256": "9fd76286834a88cbde602d8b846d81ad748cc10228b8018887883de0214dc95a",
       "size_bytes": 493961
     },
     {
@@ -33,8 +33,8 @@
       ],
       "path": "data/processed/mappings.pkl",
       "required": true,
-      "sha256": "86c8a1370895b3372fbc83a719dcba952302c42c6643d49cbed90229401ce529",
-      "size_bytes": 15623889
+      "sha256": "d4dec432ccf2715fcceb1834a052bc6cdae6c60f9479d29610b553f9b5127879",
+      "size_bytes": 20499464
     },
     {
       "path": "data/processed/test.parquet",
@@ -67,7 +67,7 @@
     {
       "path": "data/processed/csv/export_manifest.json",
       "required": false,
-      "sha256": "2ded89af341ec831a17e5143ec88347de013f2cbb9c548b55c91fdd27631a192",
+      "sha256": "35f009b7e612d84dcbc3154da2e462480a2ff9fac39bb4334d17834a3d127ed0",
       "size_bytes": 2797
     },
     {
@@ -81,8 +81,8 @@
       "path": "data/processed/csv/metadata.csv",
       "required": false,
       "rows": 44843,
-      "sha256": "c0bfabd703ec2aa10910c721db1682262dc5126f557f97370bdaa83cae439a10",
-      "size_bytes": 10633635
+      "sha256": "d7692e86519db9ce16863bc259d38bf27b57b6f8272709079cbaf6aeb4bf2503",
+      "size_bytes": 16551531
     },
     {
       "path": "data/processed/csv/test.csv",
@@ -135,7 +135,7 @@
     {
       "path": "data/processed/reports/data_quality_report.json",
       "required": false,
-      "sha256": "ca8c8edd9cc8628686c1a671fafd861229c961f56862b1a6fcdd47432bf4759f",
+      "sha256": "62b92bb39b233ca12dd0c38d3a1774c51efcb9a720a979a591227e773cf94c5e",
       "size_bytes": 4810
     },
     {
@@ -153,7 +153,7 @@
       "size_bytes": 2294109
     }
   ],
-  "build_id": "build_ee08fe0c461c1970b84368bfeabe0420",
+  "build_id": "build_bed0f5b7efb9e7a0a148e2c071540e30",
   "build_options": {
     "bundle_layout_version": 3,
     "csv_max_rows": 500000,
@@ -216,13 +216,13 @@
       "weight_decay": 0.0001
     }
   },
-  "created_at": "2026-09-08T15:16:44.272779+00:00",
+  "created_at": "2026-10-08T16:48:32.544399+00:00",
   "dataset": "amazon-electronics",
   "encoder": {
     "model_name": "sentence-transformers/all-MiniLM-L6-v2",
     "revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
   },
-  "input_fingerprint": "ee08fe0c461c1970b84368bfeabe0420fb8dbebacad9c0388aa5793892e31738",
+  "input_fingerprint": "bed0f5b7efb9e7a0a148e2c071540e303591b07d7598718898b5f1c87d20a608",
   "metadata_policy": "metadata_policy_v2",
   "optional_artifacts": {
     "csv": "present",
@@ -482,13 +482,13 @@
     "backend": "sentence_transformers",
     "encoder": "sentence-transformers/all-MiniLM-L6-v2",
     "format_version": 3,
-    "input_fingerprint": "95ead11ac978acef918c1bb7d2f46c2cb4e6e7e5f8063f221a1ceb0cbca1f9c6",
+    "input_fingerprint": "b9fd24f67547af66475a59b6dadbfdde0db7c5fc96ffe1b188521fce4fd589b6",
     "metadata_policy": "title_or_brand_or_specific_category_v2",
     "model_name": "sentence-transformers/all-MiniLM-L6-v2",
     "normalized": "usable_rows_unit_norm; masked_rows_zero",
     "resolved_revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
     "revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
-    "sha256": "18c245799acc28764bd4613e70155b788d80a533f7d15c7b27e4626ccbdd3075",
+    "sha256": "a179908d41174d6a57c26796f69bd43538771f2a6114f1bb950369f9146fb18d",
     "shape": [
       44843,
       384

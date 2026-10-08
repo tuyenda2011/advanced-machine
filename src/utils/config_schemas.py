@@ -122,6 +122,7 @@ if PYDANTIC_AVAILABLE:
         """AdaptiveGCL-specific configuration schema."""
         text_policy: Literal["masked_text"] = "masked_text"
         feature_view: Literal["shared", "adaptivegcl_quality"] = "shared"
+        ssl_eligibility: Literal["view_default", "usable", "item_specific"] = "view_default"
         fusion_mode: Literal["convex", "residual", "bounded_residual"] = "convex"
         residual_alpha_init: float = Field(default=0.1, gt=0, allow_inf_nan=False)
         residual_alpha_max: float = Field(default=1.0, gt=0, allow_inf_nan=False)
@@ -239,6 +240,9 @@ def validate_model_config(config: dict[str, Any], model_name: str) -> dict[str, 
             raise ValueError("ssl_target must be projected or frozen_text")
         if ada_cfg.get("feature_view", "shared") not in {"shared", "adaptivegcl_quality"}:
             raise ValueError("feature_view must be shared or adaptivegcl_quality")
+        ada_cfg.setdefault("ssl_eligibility", "view_default")
+        if ada_cfg["ssl_eligibility"] not in {"view_default", "usable", "item_specific"}:
+            raise ValueError("ssl_eligibility must be view_default, usable or item_specific")
         if ada_cfg.get("fusion_mode", "convex") not in {"convex", "residual", "bounded_residual"}:
             raise ValueError("fusion_mode must be convex, residual or bounded_residual")
         alpha_init = ada_cfg.get("residual_alpha_init", 0.1)

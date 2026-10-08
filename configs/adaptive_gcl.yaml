@@ -3,6 +3,7 @@ model_name: "adaptive_gcl"
 adaptive_gcl:
   text_policy: "masked_text"
   feature_view: "shared" # shared evaluation text or adaptivegcl_quality derived view
+  ssl_eligibility: "usable" # independent of feature_view; item_specific excludes category-only targets
   fusion_mode: "bounded_residual" # cap item/user semantic norms relative to ID embeddings
   residual_alpha_init: 0.1 # learned residual scale initialization
   residual_alpha_max: 1.0 # upper bound for learned residual scale

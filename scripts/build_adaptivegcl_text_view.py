@@ -25,7 +25,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bundle", help="Bundle path or data/current.json")
     parser.add_argument(
         "--output_dir",
-        help="Directory for the derived files (default: active data/processed)",
+        help="Derived output directory (default: .tmp/adaptivegcl_text/<build_id>)",
     )
     parser.add_argument("--model_name", default=DEFAULT_ENCODER)
     parser.add_argument("--revision", default=PINNED_REVISION)
@@ -36,8 +36,6 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(exc))
     if args.output_dir:
         output = Path(args.output_dir).resolve()
-    elif bundle.legacy:
-        output = bundle.root
     else:
         output = ROOT / ".tmp" / "adaptivegcl_text" / bundle.build_id
     output.mkdir(parents=True, exist_ok=True)

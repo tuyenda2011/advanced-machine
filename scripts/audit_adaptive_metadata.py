@@ -107,7 +107,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bundle", help="Bundle path or data/current.json")
     parser.add_argument(
         "--output_dir",
-        help="Output root (default: active data/processed view)",
+        help="Output root (default: .tmp/adaptivegcl_metadata/<build_id>)",
     )
     args = parser.parse_args(argv)
     try:
@@ -116,7 +116,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(exc))
     processed = bundle.train_dir
     output = Path(args.output_dir).resolve() if args.output_dir else (
-        processed if bundle.legacy else ROOT / ".tmp" / "adaptivegcl_metadata" / bundle.build_id
+        ROOT / ".tmp" / "adaptivegcl_metadata" / bundle.build_id
     )
     output.mkdir(parents=True, exist_ok=True)
     with (processed / "mappings.pkl").open("rb") as stream:

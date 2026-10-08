@@ -18,6 +18,7 @@ from typing import Any
 
 import pandas as pd
 
+from src.data.adaptive_metadata import ADAPTIVE_TEXT_POLICY
 from src.data.bundle import (
     DATA_ROOT,
     BundleError,
@@ -34,11 +35,12 @@ from src.data.bundle import (
     write_manifest,
 )
 from src.data.export import export_bundle_csvs
-from src.data.metadata_resolution import resolve_metadata
-from src.data.preprocessing import summarize_metadata_quality
+from src.data.metadata_resolution import resolve_metadata, write_brand_review_queue
+from src.data.preprocessing import CATEGORY_POLICY, summarize_metadata_quality
 from src.data.provenance import sha256_file as source_sha256_file
 from src.data.text_encoder import (
     PINNED_REVISION,
+    build_adaptivegcl_text_view,
     encode_item_metadata,
 )
 
@@ -78,6 +80,8 @@ def input_fingerprint(
             "dataset_config": config_identity,
             "encoder": encoder,
             "revision": revision,
+            "category_policy": CATEGORY_POLICY,
+            "adaptive_text_policy": ADAPTIVE_TEXT_POLICY,
             "metadata_policy": policy_version,
             "build_options": build_options or {},
         }
@@ -171,6 +175,8 @@ def _metadata_fingerprint(
             "overrides": sha256_file(overrides_path) if overrides_path.exists() else None,
             "encoder": encoder,
             "revision": revision,
+            "category_policy": CATEGORY_POLICY,
+            "adaptive_text_policy": ADAPTIVE_TEXT_POLICY,
         }
     )
 
@@ -389,9 +395,21 @@ def _metadata_only_stage(
         model_name=encoder,
         revision=revision,
         save_path=str(stage / "train" / "item_text_embeddings.pt"),
+        batch_size=64,
     )
     text_provenance = json.loads(
         (stage / "train" / "item_text_embeddings.pt.json").read_text(encoding="utf-8")
+    )
+    build_adaptivegcl_text_view(
+        mappings["item_metadata"],
+        len(mappings["item2id"]),
+        model_name=encoder,
+        revision=revision,
+        save_path=str(stage / "train" / "adaptivegcl_text_embeddings.pt"),
+        batch_size=64,
+    )
+    quality_provenance = json.loads(
+        (stage / "train" / "adaptivegcl_text_embeddings.pt.json").read_text(encoding="utf-8")
     )
     fingerprint = stable_fingerprint(
         {
@@ -400,6 +418,8 @@ def _metadata_only_stage(
             "overrides": sha256_file(overrides_path) if overrides_path.exists() else None,
             "encoder": encoder,
             "revision": revision,
+            "category_policy": CATEGORY_POLICY,
+            "adaptive_text_policy": ADAPTIVE_TEXT_POLICY,
         }
     )
     train = pd.read_parquet(stage / "train" / "train.parquet")
@@ -416,6 +436,15 @@ def _metadata_only_stage(
         "ordered_id_fingerprint": base.manifest.get("ordered_id_fingerprint"),
     }
     build_id = make_build_id(fingerprint)
+    queue_stats = write_brand_review_queue(
+        mappings["item_metadata"], raw_items,
+        train["i_idx"].value_counts().to_dict(),
+        stage / "reports" / "brand_review_queue.csv",
+        sample_path=stage / "reports" / "brand_review_sample.csv",
+    )
+    queue_stats["path"] = "reports/brand_review_queue.csv"
+    queue_stats["sample_path"] = "reports/brand_review_sample.csv"
+    quality["brand_review_queue"] = queue_stats
     export_bundle_csvs(
         bundle_root=stage,
         train=train,
@@ -451,6 +480,13 @@ def _metadata_only_stage(
         "config": _manifest_config(base.manifest.get("config", {})),
         "encoder": {"model_name": encoder, "revision": revision},
         "metadata_only": True,
+        "category_policy": CATEGORY_POLICY,
+        "feature_views": {
+            "adaptivegcl_quality": {
+                key: quality_provenance[key]
+                for key in ("metadata_policy", "input_fingerprint", "sha256", "shape")
+            }
+        },
         "base_build_id": base.build_id,
         "ordered_id_fingerprint": base.manifest.get("ordered_id_fingerprint"),
         "optional_artifacts": {

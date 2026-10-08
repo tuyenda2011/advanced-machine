@@ -13,6 +13,7 @@ import os
 import pickle
 import shutil
 import tempfile
+import warnings
 from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import deepcopy
@@ -168,7 +169,8 @@ class DatasetBundle:
 
     @property
     def reports_dir(self) -> Path:
-        return self.root / "reports" if not self.legacy else self.root
+        nested = self.root / "reports"
+        return nested if not self.legacy or nested.is_dir() else self.root
 
     def artifact(self, name: str, *, required: bool = True) -> Path:
         """Resolve an artifact by its stable filename."""
@@ -212,6 +214,23 @@ def _read_json(path: Path) -> dict[str, Any]:
     return value
 
 
+def _inventory_path(bundle: DatasetBundle, relative: str) -> Path:
+    """Map archived and flattened processed inventories into the pinned root."""
+    relative = relative.replace("\\", "/")
+    if not relative or Path(relative).is_absolute() or ".." in Path(relative).parts:
+        raise BundleError(f"Unsafe manifest artifact path: {relative}")
+    if bundle.legacy:
+        if relative.startswith("data/processed/"):
+            relative = relative[len("data/processed/"):]
+        elif relative.startswith("train/"):
+            relative = relative[len("train/"):]
+    root = bundle.root.resolve()
+    path = (root / relative).resolve()
+    if root not in path.parents or not path.is_file():
+        raise BundleError(f"Manifest artifact path is missing or escapes bundle: {relative}")
+    return path
+
+
 def verify_bundle(
     bundle: DatasetBundle,
     *,
@@ -219,42 +238,48 @@ def verify_bundle(
     require_build_dir: bool = True,
 ) -> None:
     """Verify layout, schema and manifest artifact checksums."""
+    if "schema_version" in bundle.manifest and bundle.manifest["schema_version"] != BUNDLE_SCHEMA_VERSION:
+        raise BundleError(f"Unsupported bundle schema: {bundle.manifest['schema_version']}")
     if bundle.legacy:
         required = [bundle.root / name for name in REQUIRED_TRAIN_ARTIFACTS]
         missing = [str(path) for path in required if not path.is_file()]
         if missing:
             raise BundleError(f"Legacy processed data is incomplete: {missing}")
-        return
-
-    if bundle.manifest.get("schema_version") != BUNDLE_SCHEMA_VERSION:
+    elif bundle.manifest.get("schema_version") != BUNDLE_SCHEMA_VERSION:
         raise BundleError(
             f"Unsupported bundle schema: {bundle.manifest.get('schema_version')}"
         )
-    if require_build_dir and bundle.manifest.get("build_id") != bundle.root.name:
+    if not bundle.legacy and require_build_dir and bundle.manifest.get("build_id") != bundle.root.name:
         raise BundleError("Bundle build_id does not match its directory name")
-    for directory in ("train", "csv", "reports"):
-        if not (bundle.root / directory).is_dir():
-            raise BundleError(f"Bundle directory is missing: {directory}")
+    if not bundle.legacy:
+        for directory in ("train", "csv", "reports"):
+            if not (bundle.root / directory).is_dir():
+                raise BundleError(f"Bundle directory is missing: {directory}")
     for name in REQUIRED_TRAIN_ARTIFACTS:
-        if not (bundle.root / "train" / name).is_file():
+        if not (bundle.train_dir / name).is_file():
             raise BundleError(f"Required train artifact is missing: {name}")
     if not check_hashes:
         return
-    entries = {str(entry.get("path")): entry for entry in bundle.manifest.get("artifacts", [])}
+    inventory = bundle.manifest.get("artifacts")
+    if inventory is None and bundle.legacy and "schema_version" not in bundle.manifest:
+        warnings.warn("Legacy manifest has no inventory; artifact integrity is unverified", RuntimeWarning, stacklevel=2)
+        return
+    if not isinstance(inventory, list) or not inventory:
+        raise BundleError("Manifest has no artifact inventory")
+    entries = {}
+    for entry in inventory:
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            raise BundleError("Invalid manifest inventory entry")
+        path = _inventory_path(bundle, entry["path"])
+        if path in entries:
+            raise BundleError(f"Duplicate manifest artifact: {entry['path']}")
+        entries[path] = entry
     for name in REQUIRED_TRAIN_ARTIFACTS:
-        relative = f"train/{name}"
-        entry = entries.get(relative)
-        if entry is None:
-            raise BundleError(f"Manifest has no inventory entry for {relative}")
-        path = bundle.root / relative
+        if (bundle.train_dir / name).resolve() not in entries:
+            raise BundleError(f"Manifest has no inventory entry for {name}")
+    for path, entry in entries.items():
         if sha256_file(path) != entry.get("sha256"):
-            raise BundleError(f"Artifact checksum mismatch: {relative}")
-    for relative, entry in entries.items():
-        path = (bundle.root / relative).resolve()
-        if bundle.root not in path.parents or not path.is_file():
-            raise BundleError(f"Manifest artifact path is missing or escapes bundle: {relative}")
-        if sha256_file(path) != entry.get("sha256"):
-            raise BundleError(f"Artifact checksum mismatch: {relative}")
+            raise BundleError(f"Artifact checksum mismatch: {entry['path']}")
 
 
 def _bundle_from_root(
@@ -299,10 +324,9 @@ def materialize_processed_view(
     if temporary.exists():
         shutil.rmtree(temporary, ignore_errors=True)
     temporary.mkdir(parents=True, exist_ok=True)
-    for name in ("train.parquet", "val.parquet", "test.parquet", "mappings.pkl", "disliked_interactions.parquet", "item_text_embeddings.pt", "item_text_embeddings.pt.json"):
-        source = bundle.train_dir / name
+    for source in bundle.train_dir.iterdir():
         if source.is_file():
-            shutil.copy2(source, temporary / name)
+            shutil.copy2(source, temporary / source.name)
     for directory in ("csv", "reports"):
         source = bundle.root / directory
         if source.is_dir():
@@ -523,6 +547,8 @@ def publish_bundle(
     versions = data / "versions"
     versions.mkdir(parents=True, exist_ok=True)
     destination = versions / build_id
+    if staging.parent == versions:
+        raise BundleError("Published bundles are immutable; use rollback_bundle to reactivate")
     with writer_lock(data):
         if destination.exists():
             existing = _bundle_from_root(destination, check_hashes=True)

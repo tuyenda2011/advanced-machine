@@ -25,6 +25,7 @@ from src.data.provenance import sha256_file
 from src.data.sparsity import create_sparse_train_set
 from src.data.text_encoder import (
     build_user_history_features,
+    get_ssl_item_mask,
     load_text_view,
     load_training_text,
 )
@@ -375,6 +376,10 @@ def main():
                 manifest_path=bundle.manifest_path if bundle is not None else None,
             )
         text_dim = text_features.shape[1]
+        ssl_item_mask = get_ssl_item_mask(
+            mappings.get("item_metadata", {}), item_text_mask,
+            feature_view=feature_view, eligibility=ada_cfg.get("ssl_eligibility", "view_default"),
+        )
         user_history_features, user_text_mask = build_user_history_features(
             train_df_sparse, text_features, num_users, item_text_mask
         )

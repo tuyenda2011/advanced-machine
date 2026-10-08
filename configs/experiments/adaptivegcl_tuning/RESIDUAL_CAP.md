@@ -8,7 +8,8 @@ Neither change is a validated accuracy improvement yet.
 Run the existing P1 before choosing P2. For the independent P2 screen:
 
 ```powershell
-.venv-adaptive/Scripts/python.exe scripts/ablate_adaptive.py --config_dir configs/experiments/adaptivegcl_tuning/C0 --variants full residual_cap_03 mean_layers --epochs 30 --seeds 42 --sparsities 1.0
+conda activate AML
+python scripts/ablate_adaptive.py --config_dir configs/experiments/adaptivegcl_tuning/C0 --variants full residual_cap_03 mean_layers --epochs 30 --seeds 42 --sparsities 1.0
 ```
 
 Add `--run` to execute. Do not reuse an existing output directory. Keep the

@@ -115,6 +115,8 @@ def metadata_frame_for_export(mappings: dict[str, Any]) -> pd.DataFrame:
                 "title": _text(meta.get("title")),
                 "brand": _text(meta.get("brand")),
                 "category": _text(meta.get("categories")),
+                "category_paths": json.dumps(meta.get("category_paths", []), ensure_ascii=False),
+                "category_policy": _text(meta.get("category_policy")),
                 **{f"{key}": bool(value) for key, value in flags.items()},
                 "title_source": _text(meta.get("title_source")),
                 "brand_source": _text(meta.get("brand_source")),
